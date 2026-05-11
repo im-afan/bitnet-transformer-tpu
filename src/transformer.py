@@ -19,9 +19,15 @@ class MultiHeadAttention(nn.Module):
 
         self.softmax = nn.Softmax(dim=2)
 
+    def mask_attention(self, mat):
+        mask = torch.triu(torch.ones_like(mat) * -1e9, diagonal=1)
+        return mat + mask
+        # return mat
+
     def scaled_dot_product_attention(self, Q, K, V):
         K_T = torch.transpose(K, dim0=1, dim1=2)
-        return self.softmax(Q @ K_T / self.d_k ** 0.5) @ V
+        mat = Q @ K_T / self.d_k ** 0.5
+        return self.softmax(self.mask_attention(mat)) @ V
 
     def forward(self, X):
         head_outputs = []
@@ -41,17 +47,19 @@ class Transformer(nn.Module):
         super().__init__()
 
         self.attention = MultiHeadAttention(d_model, d_k, d_v, heads);
+        self.norm1 = nn.LayerNorm(d_model)
         self.relu = nn.ReLU()
         self.fc1 = nn.Linear(d_model, d_ff)
         self.fc2 = nn.Linear(d_ff, d_model)
+        self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, X):
-        X = X + self.attention(X)
-        X_ff = self.fc1(X)
+        X = self.norm1(X + F.dropout(self.attention(X)))
+        X_ff = F.dropout(self.fc1(X))
         X_ff = self.relu(X_ff)
-        X_ff = self.fc2(X_ff)
+        X_ff = F.dropout(self.fc2(X_ff))
 
-        return X + X_ff
+        return self.norm2(X + X_ff)
 
 class Model(nn.Module):
     def __init__(self, vocab_size, embedding_dim, n_transformers):
@@ -60,17 +68,17 @@ class Model(nn.Module):
         self.embedding_dim = embedding_dim
 
         self.d_model = embedding_dim
-        self.heads = 12
+        self.heads = 8
         self.d_k = self.d_model // self.heads # does not necessarily have to be like this
         self.d_v = self.d_model // self.heads
-        self.d_ff = 1024
+        self.d_ff = 512 
 
+        self.dropout = nn.Dropout()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.transformers = []
-
-        for i in range(n_transformers):
-            self.transformers.append(
-                Transformer(self.d_model, self.d_k, self.d_v, self.heads, self.d_ff))
+        self.transformers = nn.ModuleList([
+            Transformer(self.d_model, self.d_k, self.d_v, self.heads, self.d_ff)
+            for i in range(n_transformers)
+        ])
 
         self.fc = nn.Linear(self.d_model, self.vocab_size)
         self.softmax = nn.Softmax(dim=-1)
@@ -85,17 +93,22 @@ class Model(nn.Module):
 
         return pe
 
-    def forward(self, inputs):
+    def forward(self, inputs, pred_idx=None):
         pe = self.positional_encoding(inputs.shape[1])
-        X = self.embedding(inputs) + pe
+        X = self.dropout(self.embedding(inputs) + pe)
         for transformer in self.transformers:
             X = transformer(X)
 
-        prediction = self.fc(X[:, -1, :])
-        return self.softmax(prediction)
+        # prediction = self.fc(X[:, -1, :])
+        if(pred_idx == None):
+            prediction = self.fc(X)
+        else:
+            prediction = self.fc(X[:, pred_idx, :])
 
-    def predict_token(self, prediction):
-        distribution = Categorical(probs=prediction)
+        return prediction
+
+    def predict_token(self, logits):
+        distribution = Categorical(logits=logits)
         return distribution.sample()
 
 
