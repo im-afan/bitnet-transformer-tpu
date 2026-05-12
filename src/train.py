@@ -13,7 +13,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 context_size = 32
 train_dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
 train_dataset = train_dataset.with_format("torch")
-train_dataloader = DataLoader(train_dataset, batch_size=64)
+train_dataloader = DataLoader(train_dataset, batch_size=32)
 transform = Tokenize()
 
 # for batch in train_dataloader:
@@ -27,7 +27,7 @@ if(tokenizer.pad_token is None):
 pad_token_idx = tokenizer.vocab_size-1
 
 
-model = Model(tokenizer.vocab_size, 512, 8)
+model = Model(tokenizer.vocab_size, 256, 8)
 
 epochs = 1
 optim = Adam(model.parameters(), lr=0.001)

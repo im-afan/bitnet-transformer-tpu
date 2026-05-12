@@ -72,7 +72,7 @@ class Model(nn.Module):
         self.heads = 8
         self.d_k = self.d_model // self.heads # does not necessarily have to be like this
         self.d_v = self.d_model // self.heads
-        self.d_ff = 512 
+        self.d_ff = 256 
 
         self.dropout = nn.Dropout()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
