@@ -13,7 +13,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 context_size = 32
 train_dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
 train_dataset = train_dataset.with_format("torch")
-train_dataloader = DataLoader(train_dataset, batch_size=16)
+train_dataloader = DataLoader(train_dataset, batch_size=64)
 transform = Tokenize()
 
 # for batch in train_dataloader:
@@ -27,7 +27,7 @@ if(tokenizer.pad_token is None):
 pad_token_idx = tokenizer.vocab_size-1
 
 
-model = Model(tokenizer.vocab_size, 256, 4)
+model = Model(tokenizer.vocab_size, 512, 8)
 
 epochs = 1
 optim = Adam(model.parameters(), lr=0.001)
@@ -35,6 +35,9 @@ loss_fn = CrossEntropyLoss(ignore_index=pad_token_idx)
 
 model = model.to(device)
 # train_dataloader = train_dataloader.to(device) 
+
+avg_loss = 0
+steps = 0
 
 for i in range(epochs):
     for batch in train_dataloader:
@@ -53,11 +56,15 @@ for i in range(epochs):
         y = y.flatten(0, 1)
         # print(pred.shape, y.shape)
         loss = loss_fn(pred, y)
+        avg_loss += loss
 
         loss.backward()
         optim.step()
 
-        torch.save(model.state_dict(), "./saved/test_model.pt")
-        print(f"Epoch {i} training loss: {loss}")
-
+        if(steps % 20 == 19):
+            avg_loss /= 20
+            torch.save(model.state_dict(), "./saved/test_model.pt")
+            print(f"Epoch {i} training loss: {avg_loss}")
+            avg_loss = 0
+  
         
