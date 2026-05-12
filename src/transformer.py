@@ -20,7 +20,8 @@ class MultiHeadAttention(nn.Module):
         self.softmax = nn.Softmax(dim=2)
 
     def mask_attention(self, mat):
-        mask = torch.triu(torch.ones_like(mat) * -1e9, diagonal=1)
+        device = next(self.parameters()).device
+        mask = torch.triu(torch.ones_like(mat) * -1e9, diagonal=1).to(device)
         return mat + mask
         # return mat
 
@@ -84,6 +85,7 @@ class Model(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def positional_encoding(self, n_tokens):
+        device = next(self.parameters()).device
         div = torch.exp(torch.arange(0, self.embedding_dim, 2) * math.log(1/10000) * 1/self.embedding_dim)
         pos_tensor = torch.arange(n_tokens).unsqueeze(1)
 
@@ -91,7 +93,7 @@ class Model(nn.Module):
         pe[:, :, 0::2] = torch.sin(pos_tensor * div) 
         pe[:, :, 1::2] = torch.cos(pos_tensor * div) 
 
-        return pe
+        return pe.to(device)
 
     def forward(self, inputs, pred_idx=None):
         pe = self.positional_encoding(inputs.shape[1])
