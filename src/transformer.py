@@ -63,13 +63,13 @@ class Transformer(nn.Module):
         return self.norm2(X + X_ff)
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, n_transformers):
+    def __init__(self, vocab_size, embedding_dim, n_transformers, heads=8):
         super().__init__()
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
 
         self.d_model = embedding_dim
-        self.heads = 8
+        self.heads = heads
         self.d_k = self.d_model // self.heads # does not necessarily have to be like this
         self.d_v = self.d_model // self.heads
         self.d_ff = 256 

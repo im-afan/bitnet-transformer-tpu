@@ -1,3 +1,4 @@
+import argparse
 from torch.utils.data import DataLoader
 import torch
 import torch.nn.functional as F
@@ -8,12 +9,19 @@ from transformer import Model
 from datasets import load_dataset
 from data import Tokenize
 
+parser = argparse.ArgumentParser(description='Train Transformer')
+parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
+parser.add_argument('--embed_dim', type=int, default=256, help='Embedding dimension')
+parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+parser.add_argument('--num_transformers', type=int, default=8, help='Number of transformer layers')
+args = parser.parse_args()
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 context_size = 32
 train_dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
 train_dataset = train_dataset.with_format("torch")
-train_dataloader = DataLoader(train_dataset, batch_size=32)
+train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size)
 transform = Tokenize()
 
 # for batch in train_dataloader:
@@ -27,7 +35,7 @@ if(tokenizer.pad_token is None):
 pad_token_idx = tokenizer.vocab_size-1
 
 
-model = Model(tokenizer.vocab_size, 256, 8)
+model = Model(tokenizer.vocab_size, args.embed_dim, args.num_transformers, args.num_heads)
 
 epochs = 1
 optim = Adam(model.parameters(), lr=0.001)
