@@ -6,17 +6,17 @@ from torch.optim import Adam
 from transformers import AutoTokenizer
 from transformer import Model
 
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained("georgeyw/TinyStories-tokenizer-10k")
 
 if(tokenizer.pad_token is None):
     tokenizer.pad_token = tokenizer.eos_token
 
 
-model = Model(tokenizer.vocab_size, 1024, 2)
-model.load_state_dict(torch.load("saved/test_model.pt", weights_only=False))
+model = Model(tokenizer.vocab_size, embedding_dim=128, n_transformers=4, heads=4)
+model.load_state_dict(torch.load("saved/test_model_20260513_042742(2).pt", map_location="cpu", weights_only=True))
 model.eval()
 
-text = "The quick brown fox jumps"
+text = "One day "
 
 inputs = tokenizer(
     text,

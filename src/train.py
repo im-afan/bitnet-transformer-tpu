@@ -12,11 +12,11 @@ from datasets import load_dataset
 from data import Tokenize
 
 parser = argparse.ArgumentParser(description='Train Transformer')
-parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
+parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
 parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
 parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
 parser.add_argument('--mini_batch_size', type=int, default=16, help='Mini batch size')
-parser.add_argument('--num_transformers', type=int, default=4, help='Number of transformer layers')
+parser.add_argument('--num_transformers', type=int, default=6, help='Number of transformer layers')
 args = parser.parse_args()
 
 device = torch.device("cpu")
@@ -86,8 +86,8 @@ for i in range(epochs):
             optim.step()
             optim.zero_grad()
 
-        if(steps % 20 == 0):
-            avg_loss /= 20
+        if(steps % 200 == 0):
+            avg_loss /= 200
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = f"./saved/test_model_{timestamp}.pt"
             torch.save(model.state_dict(), filepath)
