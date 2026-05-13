@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import os
 from torch.utils.data import DataLoader
 import torch
 import torch.nn.functional as F
@@ -31,14 +32,14 @@ context_size = 128
 train_dataset = load_dataset("roneneldan/TinyStories", name="default", split="train")
 train_dataset = train_dataset.with_format("torch")
 train_dataloader = DataLoader(train_dataset, batch_size=args.mini_batch_size)
-transform = Tokenize()
+transform = Tokenize(max_length=context_size)
 
 # for batch in train_dataloader:
 #     # print(len(batch['text']))
 #     tokenized = transform(batch)
 #     print(tokenized['text'])
 
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained("georgeyw/TinyStories-tokenizer-10k")
 if(tokenizer.pad_token is None):
     tokenizer.pad_token = tokenizer.eos_token
 pad_token_idx = tokenizer.vocab_size-1
@@ -58,6 +59,7 @@ model = model.to(device)
 avg_loss = 0
 steps = 0
 batch_steps = 0
+saved_models = []
 
 for i in range(epochs):
     for batch in train_dataloader:
@@ -87,7 +89,15 @@ for i in range(epochs):
         if(steps % 20 == 0):
             avg_loss /= 20
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            torch.save(model.state_dict(), f"./saved/test_model_{timestamp}.pt")
+            filepath = f"./saved/test_model_{timestamp}.pt"
+            torch.save(model.state_dict(), filepath)
+            
+            saved_models.append(filepath)
+            if len(saved_models) > 3:
+                old_model = saved_models.pop(0)
+                if os.path.exists(old_model):
+                    os.remove(old_model)
+                    
             print(f"Epoch {i} training loss: {avg_loss}")
             avg_loss = 0
   
