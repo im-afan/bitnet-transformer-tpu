@@ -30,7 +30,7 @@ context_size = 128
 # train_dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
 train_dataset = load_dataset("roneneldan/TinyStories", name="default", split="train")
 train_dataset = train_dataset.with_format("torch")
-train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size)
+train_dataloader = DataLoader(train_dataset, batch_size=args.mini_batch_size)
 transform = Tokenize()
 
 # for batch in train_dataloader:
@@ -74,13 +74,13 @@ for i in range(epochs):
         pred = pred.flatten(0, 1)
         y = y.flatten(0, 1)
         loss = loss_fn(pred, y)
-        avg_loss += loss
+        avg_loss += loss.item()
 
         loss.backward()
         
         steps += 1
         batch_steps += 1
-        if(batch_steps % steps_per_batch):
+        if(batch_steps % steps_per_batch == 0):
             optim.step()
             optim.zero_grad()
 
