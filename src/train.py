@@ -17,6 +17,7 @@ parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimens
 parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
 parser.add_argument('--mini_batch_size', type=int, default=16, help='Mini batch size')
 parser.add_argument('--num_transformers', type=int, default=6, help='Number of transformer layers')
+parser.add_argument('--d_ff', type=int, default=256, help='Size of hidden layer in transformer feedforward')
 args = parser.parse_args()
 
 device = torch.device("cpu")
@@ -45,7 +46,7 @@ if(tokenizer.pad_token is None):
 pad_token_idx = tokenizer.vocab_size-1
 
 
-model = Model(tokenizer.vocab_size, args.embed_dim, args.num_transformers, args.num_heads)
+model = Model(tokenizer.vocab_size, args.embed_dim, args.num_transformers, args.num_heads, args.d_ff)
 
 steps_per_batch = args.batch_size // args.mini_batch_size
 

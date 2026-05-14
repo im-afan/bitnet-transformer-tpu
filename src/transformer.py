@@ -19,6 +19,10 @@ class MultiHeadAttention(nn.Module):
 
         self.softmax = nn.Softmax(dim=2)
 
+        # inference only
+        # self.k_cache = torch.tensor()
+        # self.v_cache = torch.tensor()
+
     def mask_attention(self, mat):
         device = next(self.parameters()).device
         mask = torch.triu(torch.ones_like(mat) * -1e9, diagonal=1).to(device)
@@ -63,7 +67,7 @@ class Transformer(nn.Module):
         return self.norm2(X + X_ff)
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, n_transformers, heads=8):
+    def __init__(self, vocab_size, embedding_dim, n_transformers, heads=8, d_ff=256):
         super().__init__()
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
@@ -72,7 +76,7 @@ class Model(nn.Module):
         self.heads = heads
         self.d_k = self.d_model // self.heads # does not necessarily have to be like this
         self.d_v = self.d_model // self.heads
-        self.d_ff = 256 
+        self.d_ff = d_ff 
 
         self.dropout = nn.Dropout()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
@@ -109,9 +113,20 @@ class Model(nn.Module):
 
         return prediction
 
-    def predict_token(self, logits):
-        distribution = Categorical(logits=logits)
+    def predict_token(self, logits, temperature=20):
+        distribution = Categorical(logits=logits*temperature)
         return distribution.sample()
+
+    def inference(self, tokens, max_len=128, temperature=20):
+        while(tokens.shape[-1] < max_len):
+            logits = self(tokens, -1)
+            token = self.predict_token(logits, temperature=temperature).unsqueeze(1)
+            print(logits.shape, tokens.shape, token.shape)
+            tokens = torch.cat([tokens, token], dim=1)
+
+        return tokens
+
+        
 
 
 

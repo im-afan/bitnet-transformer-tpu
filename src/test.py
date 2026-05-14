@@ -12,11 +12,11 @@ if(tokenizer.pad_token is None):
     tokenizer.pad_token = tokenizer.eos_token
 
 
-model = Model(tokenizer.vocab_size, embedding_dim=128, n_transformers=4, heads=4)
-model.load_state_dict(torch.load("saved/test_model_20260513_042742(2).pt", map_location="cpu", weights_only=True))
+model = Model(tokenizer.vocab_size, embedding_dim=256, n_transformers=12, heads=16)
+model.load_state_dict(torch.load("saved/test_model_20260513_195047.pt", map_location="cpu", weights_only=True))
 model.eval()
 
-text = "One day "
+text = "It was"
 
 inputs = tokenizer(
     text,
@@ -27,7 +27,7 @@ inputs = tokenizer(
 )
 input_tokens = inputs["input_ids"]
 
-probs = model(input_tokens)
+model_out = model.inference(input_tokens, max_len=256, temperature=5)
 
-print(probs)
-print(tokenizer.decode(model.predict_token(probs)))
+print(model_out)
+print(tokenizer.decode(model_out))
