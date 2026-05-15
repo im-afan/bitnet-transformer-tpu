@@ -1,0 +1,120 @@
+#include "kernels.cuh"
+#include <cmath.h>
+
+__host__ void matmul_batch(const float *A, const float *B, float *C, int M,
+                           int N, int K, int batch_size) {
+  // assume n_tokens = 1 during inference
+  dim3 threadsPerBlock(16, 16, 16);
+  dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                     (N + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                     (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+  matmul_kernel<<<blocksPerGrid, threadsPerBlock>>>(A_ptr, B_ptr, C_ptr, M, N,
+                                                    K, batch_size);
+  cudaDeviceSynchronize();
+}
+
+__host__ void attention_softmax(const float *A, int batch_size, int n_tokens,
+                                float scale) { // A: batch_size x T
+  float *sum;
+  float *exp_A;
+  cudaMalloc((void **)&sum, batch_size);
+  cudaMalloc((void **)&exp_A, batch_size * n_tokens);
+
+  mult_kernel<<<256, n_tokens * batch_size / 256>>>(A, &scale);
+  cudaDeviceSynchronize();
+  exp_kernel<<<256, n_tokens * batch_size / 256>>>(A, batch_size * n_tokens);
+  cudaDeviceSynchronize();
+
+  for (int row = 0; row < batch_size; row++) {
+    float *sum_ptr = sum + row;
+    float *A_ptr = A + n_tokens * row;
+    sum_kernel<<<256, n_tokens / 256>>>(A_ptr, sum_ptr, n_tokens);
+    cudaDeviceSynchronize();
+    mult_kernel<<<256, n_tokens / 256>>>(A_ptr, sum_ptr, n_tokens);
+    cudaDeviceSynchronize();
+  }
+}
+
+__host__ void
+multi_head_attention(const float *embedding, float *K_cache, float *V_cache,
+                     const float *W_K, const float *W_Q, const float *W_V,
+                     const float *W_O, const float *B_K, const float *B_Q,
+                     const float *B_V, const float *B_O, float *output,
+                     int n_tokens, int batch_size, int embedding_dim,
+                     int n_heads, int max_tokens) {
+  float *K;
+  float *Q;
+  float *V;
+  float *attention;
+  float *attention_row;
+  cudaMalloc((void **)&K, batch_size * embedding_dim);
+  cudaMalloc((void **)&Q, batch_size * embedding_dim);
+  cudaMalloc((void **)&attention, batch_size * n_tokens * n_heads);
+  cudaMalloc((void **)&attention_row, batch_size * n_tokens);
+
+  dim2 add_batch_threads_per_block(16, 16);
+  dim2 add_batch_blocks_per_grid(batch_size * embedding_dim / 16,
+                                 batch_size / 16);
+
+  matmul_batch(embedding, W_K, K, 1, embedding_dim, embedding_dim, batch_size);
+  add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
+      K, B_K, K, embedding_dim, batch_size);
+  cudaDeviceSynchronize();
+  matmul_batch(embedding, W_V, V, 1, embedding_dim, embedding_dim, batch_size);
+  add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
+      V, B_V, V, embedding_dim, batch_size);
+  cudaDeviceSynchronize();
+
+  // store K_cache and V_cache heads-first
+  // each head stored will be B x T x (d/h)
+  for (int i = 0; i < n_heads; i++) {
+    for (int j = 0; j < batch_size; j++) {
+      float *K_ptr = K + i * batch_size * embedding_dim / n_heads +
+                     j * embedding_dim / n_heads;
+      float *V_ptr = V + i * batch_size * embedding_dim / n_heads +
+                     j * embedding_dim / n_heads;
+      float *K_cache_ptr =
+          K_cache + i * batch_size * embedding_dim / n_heads * max_tokens +
+          j * embedding_dim / n_heads;
+      float *V_cache_ptr =
+          V_cache + i * batch_size * embedding_dim / n_heads * max_tokens +
+          j * embedding_dim / n_heads;
+
+      cudaMemcpy(K_cache_ptr, K_ptr, embedding_dim / n_heads);
+      cudaMemcpy(V_cache_ptr, V_ptr, embedding_dim / n_heads);
+    }
+  }
+
+  matmul_batch(embedding, W_Q, Q, 1, embedding_dim, embedding_dim, batch_size);
+  add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
+      Q, B_Q, Q, embedding_dim, batch_size);
+
+  float attention_scale = std::sqrt((float)embedding_dim / n_heads);
+
+  for (int i = 0; i < n_heads; i++) {
+    float *K_cache_ptr =
+        K_cache + i * batch_size * embedding_dim / n_heads * max_tokens;
+    float *V_cache_ptr =
+        V_cache + i * batch_size * embedding_dim / n_heads * max_tokens;
+
+    matmul_batch(K_cache_ptr, Q, attention_row, n_tokens, 1,
+                 embedding_dim / n_heads, batch_size);
+    attention_softmax(attention_row, batch_size, n_tokens, attention_scale);
+    matmul_batch(attention_row, V_cache_ptr, 1, embedding_dim / n_heads,
+                 n_tokens, batch_size);
+
+    for (int j = 0; j < batch_size; j++) {
+      float *attention_ptr = attention + i * n_tokens * n_heads + j * n_heads;
+      float *attention_row_ptr = attention_row + j * n_tokens;
+      cudaMemcpy(attention_ptr, attention_row_ptr, n_tokens);
+    }
+  }
+
+  matmul_batch(attention, W_O, output, 1, embedding_dim, embedding_dim,
+               batch_size);
+  add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
+      output, B_O, output, embedding_dim, batch_size);
+  add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
+      output, embedding, output, embedding_dim, batch_size);
+  cudaDeviceSynchronize();
+}
