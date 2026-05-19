@@ -8,7 +8,7 @@ __host__ void matmul_batch(const float *A, const float *B, float *C, int M,
   dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
                      (N + threadsPerBlock.y - 1) / threadsPerBlock.y,
                      (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
-  matmul_kernel<<<blocksPerGrid, threadsPerBlock>>>(A_ptr, B_ptr, C_ptr, M, N,
+  matmul_kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N,
                                                     K, batch_size);
   cudaDeviceSynchronize();
 }
@@ -52,9 +52,9 @@ multi_head_attention(const float *embedding, float *K_cache, float *V_cache,
   cudaMalloc((void **)&attention, batch_size * n_tokens * n_heads);
   cudaMalloc((void **)&attention_row, batch_size * n_tokens);
 
-  dim2 add_batch_threads_per_block(16, 16);
-  dim2 add_batch_blocks_per_grid(batch_size * embedding_dim / 16,
-                                 batch_size / 16);
+  dim3 add_batch_threads_per_block(16, 16);
+  dim3 add_batch_blocks_per_grid((embedding_dim + 15) / 16,
+                                 (batch_size + 15) / 16);
 
   matmul_batch(embedding, W_K, K, 1, embedding_dim, embedding_dim, batch_size);
   add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
@@ -114,7 +114,22 @@ multi_head_attention(const float *embedding, float *K_cache, float *V_cache,
                batch_size);
   add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
       output, B_O, output, embedding_dim, batch_size);
+  dim3 add_threads(256);
+  dim3 add_blocks((batch_size * embedding_dim + 255) / 256);
+  add_kernel<<<add_blocks, add_threads>>>(
+      output, embedding, output, batch_size * embedding_dim);
+  cudaDeviceSynchronize();
+}
+
+__host__ void linear(const float *embedding, const float *W, const float *B,
+                     float *output, int embedding_dim, int batch_size) {
+  matmul_batch(embedding, W, output, 1, embedding_dim, embedding_dim,
+               batch_size);
+  dim3 add_batch_threads_per_block(16, 16);
+  dim3 add_batch_blocks_per_grid((embedding_dim + 15) / 16,
+                                 (batch_size + 15) / 16);
+  
   add_batch_kernel<<<add_batch_blocks_per_grid, add_batch_threads_per_block>>>(
-      output, embedding, output, embedding_dim, batch_size);
+      output, B, output, embedding_dim, batch_size);
   cudaDeviceSynchronize();
 }

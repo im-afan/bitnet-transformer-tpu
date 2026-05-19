@@ -16,10 +16,10 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
 __global__ void add_batch_kernel(const float *A, const float *B, float *C,
                                  int n, int batch_size) {
   int batch = blockIdx.y * blockDim.y + threadIdx.y;
-  int idx = blockIdx.x + blockDim.x + threadIdx.x;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (batch < batch_size && idx < n) {
-    C[idx] = A[idx + batch * n] + B[idx];
+    C[idx + batch * n] = A[idx + batch * n] + B[idx];
   }
 }
 
@@ -83,3 +83,4 @@ __global__ void variance_kernel(float *x, float *mean, float *output, int n) {
     output[0] /= n;
   }
 }
+

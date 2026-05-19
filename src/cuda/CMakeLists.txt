@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Create an executable target named 'test_exec' from test.cu
-add_executable(test_exec test.cu core.cuh kernels.cuh)
+add_executable(test_exec test.cu)
 
 # Enable separable compilation for CUDA
 set_target_properties(test_exec PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
