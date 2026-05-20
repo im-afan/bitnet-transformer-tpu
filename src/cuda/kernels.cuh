@@ -66,7 +66,7 @@ __global__ void layer_norm_kernel(float *x, float *gamma, float *beta,
   }
 }
 
-__global__ void sum(float *x, float *output, int n) {
+__global__ void sum_kernel(float *x, float *output, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
@@ -84,3 +84,15 @@ __global__ void variance_kernel(float *x, float *mean, float *output, int n) {
   }
 }
 
+__global__ void softmax_scale(const float *x, float *output, float *sum,
+                              float scale, int batch_size, int n_tokens) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int batch_idx = idx / n_tokens;
+
+  if (idx < batch_idx * n_tokens) {
+    output[idx] = exp(x[idx] * scale);
+    atomicAdd(sum + batch_idx, output[idx]);
+    __syncthreads();
+    output[idx] = output[idx] / sum[batch_idx];
+  }
+}
