@@ -1,4 +1,5 @@
 #include "core.cuh"
+#include "kernels.cuh"
 #include <torch/extension.h>
 
 #define CHECK_CUDA(x)                                                          \
@@ -38,6 +39,29 @@ torch::Tensor attention_softmax(torch::Tensor KQ_row, float scale) {
   attention_softmax(KQ_row.data_ptr<float>(), output.data_ptr<float>(), scale,
                     batch_size, n_tokens);
   return output;
+}
+
+torch::Tensor softmax_scale(torch::Tensor x, float scale) {
+  int batch_size = x.size(0);
+  int n_tokens = x.size(1);
+  auto output = torch::empty({batch_size, n_tokens}, x.options());
+
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (batch_size + threadsPerBlock - 1) / threadsPerBlock;
+  softmax_scale_kernel<<<blocksPerGrid, threadsPerBlock>>>(x.data_ptr<float>(), output.data_ptr<float>(), scale, batch_size, n_tokens);
+  cudaDeviceSynchronize();
+}
+
+torch::Tensor layer_norm(torch::Tensor x, float gamma, float beta, float epsilon) {
+  int batch_size = x.size(0);
+  int embedding_dim = x.size(1);
+  auto output = torch::empty({batch_size, embedding_dim}, x.options());
+
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (batch_size + threadsPerBlock - 1) / threadsPerBlock;
+  layer_norm_kernel<<<blocksPerGrid, threadsPerBlock>>>(x.data_ptr<float>(), output.data_ptr<float>(), gamma, beta, batch_size, embedding_dim, epsilon);
+  cudaDeviceSynchronize();
+
 }
 
 // torch::Tensor multi_head_attention_forward(
