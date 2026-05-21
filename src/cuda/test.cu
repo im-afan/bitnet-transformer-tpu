@@ -48,9 +48,26 @@ void test_layernorm(int batch_size = 64, int embedding_dim = 1024) {
     printf("LayerNorm test max difference: %f\n", max_diff);
 }
 
+void test_multi_head_attention(int batch_size = 64, int n_tokens = 512, int max_tokens = 1024, int embedding_dim = 768, int n_heads = 12) {
+    at::Tensor embedding = at::randn({batch_size, embedding_dim});
+    at::Tensor W_K = at::randn({embedding_dim, embedding_dim});
+    at::Tensor W_Q = at::randn({embedding_dim, embedding_dim});
+    at::Tensor W_V = at::randn({embedding_dim, embedding_dim});
+    at::Tensor B_K = at::randn({embedding_dim});
+    at::Tensor B_Q = at::randn({embedding_dim});
+    at::Tensor B_V = at::randn({embedding_dim});
+    at::Tensor W_O = at::randn({embedding_dim, embedding_dim});
+    at::Tensor B_O = at::randn({embedding_dim});
+
+    at::Tensor K_cache = at::empty({batch_size, n_heads, max_tokens, embedding_dim / n_heads});
+    at::Tensor V_cache = at::empty({batch_size, n_heads, max_tokens, embedding_dim / n_heads});
+    at::Tensor output_gpu = at::empty({batch_size, n_heads, n_tokens});
+}
+
 int main(int argc, char* argv[]) {
     test_softmax_scale(64, 1024);
     test_layernorm(64, 1024);
+    test_multi_head_attention(64, 512, 1024, 768, 12);
 
     return 0;
 }
