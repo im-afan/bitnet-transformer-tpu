@@ -54,8 +54,17 @@ __global__ void relu_kernel(float* x, int n) {
   }
 }
 
-__global__ void layer_norm_kernel(float* x, float* output, float gamma,
-  float beta, int batch_size, int embedding_dim,
+__device__ void reduction(float* smem) {
+  for (int i = 128; i > 0; i >>= 1) {
+    if (threadIdx.x < i) {
+      smem[threadIdx.x] += smem[threadIdx.x + i];
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void layer_norm_kernel(float* x, float* output, float* gamma,
+  float* beta, int batch_size, int embedding_dim,
   float epsilon) {
   // 1 block = 1 batch
   __shared__ float mean_smem[256];
@@ -69,44 +78,38 @@ __global__ void layer_norm_kernel(float* x, float* output, float gamma,
     }
     __syncthreads();
 
-    for (int idx = threadIdx.x; idx < n_tokens; idx += blockDim.x) {
-      mean_smem[idx % 256] += x[batch_idx * n_tokens + idx];
+    for (int idx = threadIdx.x; idx < embedding_dim; idx += blockDim.x) {
+      mean_smem[idx % 256] += x[batch_idx * embedding_dim + idx];
     }
     __syncthreads();
-    for (int i = 128; i > 1; i >>= 1) {
-      if (idx < i) {
-        mean_smem[idx] += mean_smem[idx + i]
-      }
-      __syncthreads();
-    }
+    reduction(mean_smem);
     if (threadIdx.x == 0) {
       mean_smem[0] /= embedding_dim;
     }
+    __syncthreads();
 
-    for (int idx = threadIdx.x; idx < n_tokens; idx += blockDim.x) {
-      var_smem[idx % 256] +=
-        pow(x[batch_idx * n_tokens + idx] - mean_smem[0], 2);
+    for (int idx = threadIdx.x; idx < embedding_dim; idx += blockDim.x) {
+      float x_i = x[batch_idx * embedding_dim + idx];
+      var_smem[idx % 256] += (x_i - mean_smem[0]) * (x_i - mean_smem[0]);
     }
     __syncthreads();
-    for (int i = 128; i > 1; i >>= 1) {
-      if (idx < i) {
-        var_smem[idx] += var_smem[idx + i]
-      }
-      __syncthreads();
-    }
+    reduction(var_smem);
     if (threadIdx.x == 0) {
       var_smem[0] /= embedding_dim;
     }
+    __syncthreads();
 
-    for (int idx = threadIdx.x; idx < n_tokens; idx += blockDim.x) {
-      float x_i = output[batch_idx * n_tokens + idx];
-      output[batch_idx * n_tokens + idx] =
-        (x_i - mean_smem[0]) / sqrt(var_smem[0] + epsilon) * gamma + beta;
+    for (int idx = threadIdx.x; idx < embedding_dim; idx += blockDim.x) {
+      float x_i = x[batch_idx * embedding_dim + idx];
+      float gamma_i = gamma[idx];
+      float beta_i = beta[idx];
+      output[batch_idx * embedding_dim + idx] =
+        (x_i - mean_smem[0]) / sqrt(var_smem[0] + epsilon) * gamma_i + beta_i;
     }
   }
 }
 
-__global__ void softmax_scale_kernel(const float* x, float* output, float scale,
+__global__ void softmax_scale(const float* x, float* output, float scale,
   int batch_size, int n_tokens) {
   // 1 block = 1 batch
   __shared__ float smem[256];
@@ -123,15 +126,75 @@ __global__ void softmax_scale_kernel(const float* x, float* output, float scale,
     }
     __syncthreads();
 
-    for (int i = 128; i > 1; i >>= 1) {
-      if (idx < i) {
-        smem[idx] += smem[idx + i]
-      }
-      __syncthreads();
-    }
+    reduction(smem);
 
     for (int idx = threadIdx.x; idx < n_tokens; idx += blockDim.x) {
-      output[idx] = exp(x[batch_idx * n_tokens] + idx) / smem[0];
+      output[batch_idx * n_tokens + idx] = exp(x[batch_idx * n_tokens + idx]) / smem[0];
     }
   }
+}
+
+// W_K, W_Q, W_V: embedding_dim x embedding_dim <=> n_heads x (embedding_dim / n_heads) x embedding_dim
+// B_K, B_Q, B_V: embedding_dim x 1 <=> n_heads x (embedding_dim / n_heads)
+// K, Q, V = W_K, W_Q, W_V * embedding + B_K, B_Q, B_V => batch_size x embedding_dim
+// W_O: embedding_dim x embedding_dim
+// B_O: embedding_dim
+// K_cache, V_cache: batch_size x n_heads x max_tokens x (embedding_dim / n_heads)
+// embedding: batch_size x embedding_dim
+__global__ void multi_head_attention_kernel(const float* embedding, const float* W_K, const float* W_Q,
+  const float* W_V, const float* W_O, const float* B_K, const float* B_Q,
+  const float* B_V, const float* B_O, float* K_cache, float* V_cache,
+  float* output, int n_tokens, int batch_size, int embedding_dim, int n_heads,
+  int max_tokens) {
+
+  __shared__ float K_smem[64]; // = embedding_dim / n_heads
+  __shared__ float V_smem[64];
+  __shared__ float Q_smem[64];
+  __shared__ float dot_smem[64];
+
+  int head_idx = blockIdx.x;
+  int batch_idx = blockIdx.y;
+
+  if (batch_idx < batch_size && head_idx < n_heads) {
+    int head_offset = head_idx * (embedding_dim / n_heads);
+    int idx_in_vec = threadIdx.x % (embedding_dim / n_heads);
+    int vec_idx = threadIdx.x / (embedding_dim / n_heads);
+
+    // todo: do only one of K, V, Q in a thread depending on thread idx
+    // would not cause divergence because all threads in a warp do the same thing
+    if(threadIdx.x < embedding_dim / n_heads) {
+      // 1: compute Q, K, V
+      K_smem[idx_in_vec] = B_K[head_offset + idx_in_vec];
+      V_smem[idx_in_vec] = B_V[head_offset + idx_in_vec];
+      Q_smem[idx_in_vec] = B_Q[head_offset + idx_in_vec];
+      __syncthreads();
+
+      int real_idx = head_offset + idx_in_vec;
+      for (int i = 0; i < embedding_dim; i++) {
+          K_smem[idx_in_vec] += W_K[i * embedding_dim + real_idx] * embedding[batch_idx * embedding_dim + i];
+          V_smem[idx_in_vec] += W_V[i * embedding_dim + real_idx] * embedding[batch_idx * embedding_dim + i];
+          Q_smem[idx_in_vec] += W_Q[i * embedding_dim + real_idx] * embedding[batch_idx * embedding_dim + i];
+      }
+
+      __syncthreads();
+
+      // 2: write K, V to cache
+      K_cache[batch_idx * n_heads * max_tokens * (embedding_dim / n_heads)
+        + head_idx * max_tokens * (embedding_dim / n_heads) 
+        + n_tokens * (embedding_dim / n_heads) + idx_in_vec] = K_smem[idx_in_vec];
+      V_cache[batch_idx * n_heads * max_tokens * (embedding_dim / n_heads)
+        + head_idx * max_tokens * (embedding_dim / n_heads) 
+        + n_tokens * (embedding_dim / n_heads) + idx_in_vec] = V_smem[idx_in_vec];
+      
+      dot_smem[idx_in_vec] = 0;
+      __syncthreads();
+      // 3: compute attention
+      for(int i = 0; i < n_tokens; i++) {
+        dot_smem[idx_in_vec] += Q_smem[idx_in_vec] * K_cache[batch_idx * n_heads * max_tokens * (embedding_dim / n_heads)
+          + head_idx * max_tokens * (embedding_dim / n_heads) 
+          + i * (embedding_dim / n_heads) + idx_in_vec];
+      }
+      __syncthreads();
+      
+    }
 }

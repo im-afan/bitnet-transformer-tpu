@@ -8,11 +8,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Export compile commands for clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Set CUDA architecture
+set(CMAKE_CUDA_ARCHITECTURES 75)
+
+# add ATen library
+set(Torch_DIR "../../.venv/lib/python3.12/site-packages/torch/share/cmake/Torch")
+find_package(Torch REQUIRED)
+include_directories(${TORCH_INCLUDE_DIRS})
+
 # Create an executable target named 'test_exec' from test.cu
 add_executable(test_exec test.cu)
 
 # Enable separable compilation for CUDA
 set_target_properties(test_exec PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+target_link_libraries(test_exec "${TORCH_LIBRARIES}")
 
 # Optional: Add any required CUDA architectures (e.g., native)
 # set_target_properties(test_exec PROPERTIES CUDA_ARCHITECTURES "native")

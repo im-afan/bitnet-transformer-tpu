@@ -1,0 +1,1 @@
+-isystem "/home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include" -isystem "/home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include" -isystem "/usr/local/cuda-13.0/include"

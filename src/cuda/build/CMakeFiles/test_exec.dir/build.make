@@ -70,10 +70,11 @@ include CMakeFiles/test_exec.dir/progress.make
 include CMakeFiles/test_exec.dir/flags.make
 
 CMakeFiles/test_exec.dir/test.cu.o: CMakeFiles/test_exec.dir/flags.make
+CMakeFiles/test_exec.dir/test.cu.o: CMakeFiles/test_exec.dir/includes_CUDA.rsp
 CMakeFiles/test_exec.dir/test.cu.o: /home/andrew/Desktop/transformer/src/cuda/test.cu
 CMakeFiles/test_exec.dir/test.cu.o: CMakeFiles/test_exec.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/andrew/Desktop/transformer/src/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CUDA object CMakeFiles/test_exec.dir/test.cu.o"
-	/usr/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/test_exec.dir/test.cu.o -MF CMakeFiles/test_exec.dir/test.cu.o.d -x cu -rdc=true -c /home/andrew/Desktop/transformer/src/cuda/test.cu -o CMakeFiles/test_exec.dir/test.cu.o
+	/usr/local/cuda-13.0/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/test_exec.dir/test.cu.o -MF CMakeFiles/test_exec.dir/test.cu.o.d -x cu -rdc=true -c /home/andrew/Desktop/transformer/src/cuda/test.cu -o CMakeFiles/test_exec.dir/test.cu.o
 
 CMakeFiles/test_exec.dir/test.cu.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CUDA source to CMakeFiles/test_exec.dir/test.cu.i"
@@ -92,6 +93,13 @@ test_exec_EXTERNAL_OBJECTS =
 
 CMakeFiles/test_exec.dir/cmake_device_link.o: CMakeFiles/test_exec.dir/test.cu.o
 CMakeFiles/test_exec.dir/cmake_device_link.o: CMakeFiles/test_exec.dir/build.make
+CMakeFiles/test_exec.dir/cmake_device_link.o: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libtorch.so
+CMakeFiles/test_exec.dir/cmake_device_link.o: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10.so
+CMakeFiles/test_exec.dir/cmake_device_link.o: /usr/local/cuda-13.0/lib64/libnvrtc.so
+CMakeFiles/test_exec.dir/cmake_device_link.o: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10_cuda.so
+CMakeFiles/test_exec.dir/cmake_device_link.o: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10_cuda.so
+CMakeFiles/test_exec.dir/cmake_device_link.o: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10.so
+CMakeFiles/test_exec.dir/cmake_device_link.o: /usr/local/cuda-13.0/lib64/libcudart.so
 CMakeFiles/test_exec.dir/cmake_device_link.o: CMakeFiles/test_exec.dir/deviceLinkLibs.rsp
 CMakeFiles/test_exec.dir/cmake_device_link.o: CMakeFiles/test_exec.dir/deviceObjects1.rsp
 CMakeFiles/test_exec.dir/cmake_device_link.o: CMakeFiles/test_exec.dir/dlink.txt
@@ -111,6 +119,13 @@ test_exec_EXTERNAL_OBJECTS =
 
 test_exec: CMakeFiles/test_exec.dir/test.cu.o
 test_exec: CMakeFiles/test_exec.dir/build.make
+test_exec: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libtorch.so
+test_exec: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10.so
+test_exec: /usr/local/cuda-13.0/lib64/libnvrtc.so
+test_exec: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10_cuda.so
+test_exec: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10_cuda.so
+test_exec: /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/lib/libc10.so
+test_exec: /usr/local/cuda-13.0/lib64/libcudart.so
 test_exec: CMakeFiles/test_exec.dir/cmake_device_link.o
 test_exec: CMakeFiles/test_exec.dir/linkLibs.rsp
 test_exec: CMakeFiles/test_exec.dir/objects1.rsp
