@@ -2,5 +2,6 @@
     "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
     "python.analysis.extraPaths": [
         "${workspaceFolder}/.venv/lib/python3.12/site-packages"
-    ]
+    ],
+    "cmake.sourceDirectory": "/home/andrew/Desktop/transformer/src/cuda"
 }

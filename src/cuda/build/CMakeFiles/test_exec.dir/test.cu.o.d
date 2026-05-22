@@ -5342,4 +5342,5 @@ CMakeFiles/test_exec.dir/test.cu.o : /home/andrew/Desktop/transformer/src/cuda/t
     /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/Version.h \
     /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/core/Scalar.h \
     /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/core/UnsafeFromTH.h \
-    /home/andrew/Desktop/transformer/src/cuda/kernels.cuh
+    /home/andrew/Desktop/transformer/src/cuda/kernels.cuh \
+    /home/andrew/Desktop/transformer/src/cuda/kernels_cpu.cpp

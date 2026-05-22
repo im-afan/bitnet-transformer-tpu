@@ -4525,6 +4525,7 @@ CMakeFiles/test_exec.dir/test.cu.o: /home/andrew/Desktop/transformer/src/cuda/te
   /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/torch/headeronly/util/quint4x2.h \
   /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/torch/headeronly/util/quint8.h \
   /home/andrew/Desktop/transformer/src/cuda/kernels.cuh \
+  /home/andrew/Desktop/transformer/src/cuda/kernels_cpu.cpp \
   /usr/include/alloca.h \
   /usr/include/asm-generic/errno-base.h \
   /usr/include/asm-generic/errno.h \
@@ -8238,6 +8239,12 @@ CMakeFiles/test_exec.dir/test.cu.o: /home/andrew/Desktop/transformer/src/cuda/te
 
 /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/triu_native.h:
 
+/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl/cuda/std/__iterator/projected.h:
+
+/home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/logical_xor.h:
+
+/home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/_dimV_native.h:
+
 /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/_dyn_quant_pack_4bit_weight.h:
 
 /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/_functional_sym_constrain_range_for_size.h:
@@ -11195,6 +11202,8 @@ CMakeFiles/test_exec.dir/test.cu.o: /home/andrew/Desktop/transformer/src/cuda/te
 /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/fmod_meta.h:
 
 /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/torch/headeronly/util/Float8_e4m3fn.h:
+
+/home/andrew/Desktop/transformer/src/cuda/kernels_cpu.cpp:
 
 /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/_sparse_csc_tensor_unsafe_native.h:
 
@@ -15899,12 +15908,6 @@ CMakeFiles/test_exec.dir/test.cu.o: /home/andrew/Desktop/transformer/src/cuda/te
 /home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/_test_serialization_subcmul_native.h:
 
 /usr/local/cuda-13.0/targets/x86_64-linux/include/cccl/cuda/std/__cmath/abs.h:
-
-/home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/logical_xor.h:
-
-/home/andrew/Desktop/transformer/.venv/lib/python3.12/site-packages/torch/include/ATen/ops/_dimV_native.h:
-
-/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl/cuda/std/__iterator/projected.h:
 
 /usr/local/cuda-13.0/targets/x86_64-linux/include/cccl/cuda/std/__cmath/copysign.h:
 

@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/andrew/Desktop/transformer/build",
+  "command": "/usr/local/cuda-13.0/bin/nvcc -forward-unknown-to-host-compiler -DUSE_C10D_GLOO -DUSE_C10D_NCCL -DUSE_DISTRIBUTED -DUSE_NVSHMEM -DUSE_RPC -DUSE_TENSORPIPE --options-file CMakeFiles/test_exec.dir/includes_CUDA.rsp  -DONNX_NAMESPACE=onnx_c2 -gencode arch=compute_75,code=sm_75 -Xcudafe --diag_suppress=cc_clobber_ignored,--diag_suppress=field_without_dll_interface,--diag_suppress=base_class_has_different_dll_interface,--diag_suppress=dll_interface_conflict_none_assumed,--diag_suppress=dll_interface_conflict_dllexport_assumed,--diag_suppress=bad_friend_decl --expt-relaxed-constexpr --expt-extended-lambda -g -std=c++17 -x cu -rdc=true -c /home/andrew/Desktop/transformer/src/cuda/test.cu -o CMakeFiles/test_exec.dir/test.cu.o",
+  "file": "/home/andrew/Desktop/transformer/src/cuda/test.cu",
+  "output": "CMakeFiles/test_exec.dir/test.cu.o"
+}
+]

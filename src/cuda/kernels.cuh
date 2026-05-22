@@ -186,6 +186,8 @@ __global__ void multi_head_attention_kernel_phase1(const float* embedding, const
       V_cache[batch_idx * n_heads * max_tokens * (embedding_dim / n_heads)
         + head_idx * max_tokens * (embedding_dim / n_heads) 
         + n_tokens * (embedding_dim / n_heads) + idx_in_vec] = V_smem[idx_in_vec];
+
+      __syncthreads();
       
       // 3: compute attention
       for(int i = 0; i < n_tokens; i++) {
