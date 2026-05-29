@@ -74,6 +74,6 @@ def train(
     
 if __name__ == '__main__':
     vocab_size = len(numbers_data.VOCAB)
-    model = Model(vocab_size)
-    optim = Adam(model.parameters())
-    train(model, optim)
+    model = Model(vocab_size, d=128, f=512, layers=6, q_heads=8, kv_heads=8)
+    optim = Adam(model.parameters(), lr=1e-3)
+    train(model, optim, save_freq=50, mini_batch_size=256, batch_size=512)
