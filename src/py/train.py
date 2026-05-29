@@ -6,19 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from torch.optim import Adam
-from transformers import AutoTokenizer
 from transformer import Model
-from datasets import load_dataset
-from data import Tokenize
-
-parser = argparse.ArgumentParser(description='Train Transformer')
-parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
-parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
-parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
-parser.add_argument('--mini_batch_size', type=int, default=16, help='Mini batch size')
-parser.add_argument('--num_transformers', type=int, default=6, help='Number of transformer layers')
-parser.add_argument('--d_ff', type=int, default=256, help='Size of hidden layer in transformer feedforward')
-args = parser.parse_args()
+import numbers_data 
 
 device = torch.device("cpu")
 if(torch.cuda.is_available()):
@@ -26,80 +15,65 @@ if(torch.cuda.is_available()):
 elif(torch.backends.mps.is_available() and torch.backends.mps.is_built()):
     device = torch.device("mps")
 
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train(
+        model: Model,
+        optim,
+        epochs = 100,
+        batches = 10000,
+        mini_batch_size = 32,
+        batch_size = 32,
+        max_tokens = 32,
+        save_freq = 100
+    ):
+    model = model.to(device)
 
-context_size = 128
-# train_dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-train_dataset = load_dataset("roneneldan/TinyStories", name="default", split="train")
-train_dataset = train_dataset.with_format("torch")
-train_dataloader = DataLoader(train_dataset, batch_size=args.mini_batch_size)
-transform = Tokenize(max_length=context_size)
+    steps_per_batch = batch_size // mini_batch_size
 
-# for batch in train_dataloader:
-#     # print(len(batch['text']))
-#     tokenized = transform(batch)
-#     print(tokenized['text'])
+    steps = 0
+    avg_loss = 0
+    batch_steps = 0
+    saved_models = []
 
-tokenizer = AutoTokenizer.from_pretrained("georgeyw/TinyStories-tokenizer-10k")
-if(tokenizer.pad_token is None):
-    tokenizer.pad_token = tokenizer.eos_token
-pad_token_idx = tokenizer.vocab_size-1
+    for i in range(epochs):
+        for j in range(batches):
+            batch, tokens, attn_mask = numbers_data.create_addition_batch(mini_batch_size, max_tokens)
+            tokens = torch.tensor(tokens).to(device)
+            # print(attn_mask)
+            attn_mask = torch.stack(attn_mask).to(device)
 
+            pred = model(tokens, attn_mask) # (B, T, vocab)
 
-model = Model(tokenizer.vocab_size, args.embed_dim, args.num_transformers, args.num_heads, args.d_ff)
+            ans_pos = numbers_data.EQUALS_POS
+            pred = pred[:, ans_pos-1:-1].flatten(0, 1)
+            y = tokens[:, ans_pos:].flatten(0, 1)
+            loss = F.cross_entropy(pred, y)
+            avg_loss += loss.item()
 
-steps_per_batch = args.batch_size // args.mini_batch_size
-
-epochs = 5
-optim = Adam(model.parameters(), lr=0.001)
-loss_fn = CrossEntropyLoss(ignore_index=pad_token_idx)
-
-model = model.to(device)
-# train_dataloader = train_dataloader.to(device) 
-
-avg_loss = 0
-steps = 0
-batch_steps = 0
-saved_models = []
-
-for i in range(epochs):
-    for batch in train_dataloader:
-        tokens = transform(batch)['text']
-
-        x = tokens[:, :-1]
-        y = tokens[:, 1:]
-
-        x = x.to(device)
-        y = y.to(device)
-
-
-        pred = model(x)
-        pred = pred.flatten(0, 1)
-        y = y.flatten(0, 1)
-        loss = loss_fn(pred, y)
-        avg_loss += loss.item()
-
-        loss.backward()
-        
-        steps += 1
-        batch_steps += 1
-        if(batch_steps % steps_per_batch == 0):
-            optim.step()
-            optim.zero_grad()
-
-        if(steps % 200 == 0):
-            avg_loss /= 200
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filepath = f"./saved/test_model_{timestamp}.pt"
-            torch.save(model.state_dict(), filepath)
+            loss.backward()
             
-            saved_models.append(filepath)
-            if len(saved_models) > 3:
-                old_model = saved_models.pop(0)
-                if os.path.exists(old_model):
-                    os.remove(old_model)
-                    
-            print(f"Epoch {i} training loss: {avg_loss}")
-            avg_loss = 0
-  
-        
+            steps += 1
+            batch_steps += 1
+            if(batch_steps % steps_per_batch == 0):
+                optim.step()
+                optim.zero_grad()
+
+            if(steps % save_freq == 0):
+                avg_loss /= save_freq
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filepath = f"./saved/test_model_{timestamp}.pt"
+                torch.save(model.state_dict(), filepath)
+                
+                saved_models.append(filepath)
+                if len(saved_models) > 3:
+                    old_model = saved_models.pop(0)
+                    if os.path.exists(old_model):
+                        os.remove(old_model)
+                        
+                print(f"Epoch {i} training loss: {avg_loss}")
+                avg_loss = 0
+    
+if __name__ == '__main__':
+    vocab_size = len(numbers_data.VOCAB)
+    model = Model(vocab_size)
+    optim = Adam(model.parameters())
+    train(model, optim)

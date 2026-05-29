@@ -4,134 +4,129 @@ import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 import math
 
+device = torch.device("cpu")
+if(torch.cuda.is_available()):
+    device = torch.device("cuda")
+elif(torch.backends.mps.is_available() and torch.backends.mps.is_built()):
+    device = torch.device("mps")
+
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, d_k, d_v, heads):
+    def __init__(self, d, q_heads, kv_heads, head_dim):
         super().__init__()
-        self.d_model = d_model
-        self.d_k = d_k
-        self.d_v = d_v
-        self.heads = heads
 
-        self.Wq = nn.ModuleList([nn.Linear(d_model, d_k) for i in range(heads)])
-        self.Wk = nn.ModuleList([nn.Linear(d_model, d_k) for i in range(heads)])
-        self.Wv = nn.ModuleList([nn.Linear(d_model, d_v) for i in range(heads)])
-        self.Wo = nn.Linear(heads * d_v, d_model)
+        assert(q_heads % kv_heads == 0)
 
-        self.softmax = nn.Softmax(dim=2)
+        self.q_heads = q_heads
+        self.kv_heads = kv_heads
+        self.d = d
+        self.heads_per_q = q_heads // kv_heads
+        self.head_dim = head_dim
 
-        # inference only
-        # self.k_cache = torch.tensor()
-        # self.v_cache = torch.tensor()
+        self.Wq = nn.Linear(d, q_heads * self.head_dim) 
+        self.Wk = nn.Linear(d, kv_heads * self.head_dim)
+        self.Wv = nn.Linear(d, kv_heads * self.head_dim)
+        self.Wo = nn.Linear(q_heads * self.head_dim, d)
+    
+    def forward(self, X, attn_mask):
+        batch_size = X.shape[0]
+        n_tokens = X.shape[1]
 
-    def mask_attention(self, mat):
-        device = next(self.parameters()).device
-        mask = torch.triu(torch.ones_like(mat) * -1e9, diagonal=1).to(device)
-        return mat + mask
-        # return mat
+        Q = self.Wq(X)
+        K = self.Wk(X)
+        V = self.Wv(X)
 
-    def scaled_dot_product_attention(self, Q, K, V):
-        K_T = torch.transpose(K, dim0=1, dim1=2)
-        mat = Q @ K_T / self.d_k ** 0.5
-        return self.softmax(self.mask_attention(mat)) @ V
+        Q = torch.reshape(Q, [batch_size, n_tokens, self.kv_heads, self.heads_per_q, self.head_dim])
+        K = torch.reshape(K, [batch_size, n_tokens, self.kv_heads, self.head_dim])
+        V = torch.reshape(V, [batch_size, n_tokens, self.kv_heads, self.head_dim])
 
-    def forward(self, X):
-        head_outputs = []
-        for i in range(self.heads):
-            attention = self.scaled_dot_product_attention(
-                self.Wq[i](X),
-                self.Wk[i](X),
-                self.Wv[i](X)
-            )
-            head_outputs.append(attention)
+        mask = torch.triu(torch.ones([n_tokens, n_tokens]) * -1e9, diagonal=1).reshape([1, n_tokens, n_tokens, 1, 1])
+        # attn_mask = attn_mask.repeat(1, 1, n_tokens)
+        # print(attn_mask.shape, n_tokens)
+        # attn_mask = attn_mask + attn_mask.T
+        # print(attn_mask.shape)
+        mask = mask.to(device)# + attn_mask.reshape([batch_size, n_tokens, n_tokens, 1, 1])
 
-        head_outputs = torch.cat(head_outputs, dim=2) 
-        return self.Wo(head_outputs)
+        attention_scores = torch.einsum("btkgh,bskh->btskg", Q, K) / math.sqrt(self.head_dim)
+        attention_scores = F.softmax(attention_scores + mask, dim=2) # btskg
+        A = torch.einsum("btskg,bskh->btkgh", attention_scores, V).reshape([batch_size, n_tokens, self.q_heads * self.head_dim])
+
+        O = self.Wo(A) 
+        return O + X
 
 class Transformer(nn.Module):
-    def __init__(self, d_model, d_k, d_v, heads, d_ff):
+    def __init__(self, d, f, q_heads, kv_heads, head_dim):
         super().__init__()
 
-        self.attention = MultiHeadAttention(d_model, d_k, d_v, heads);
-        self.norm1 = nn.LayerNorm(d_model)
-        self.relu = nn.ReLU()
-        self.fc1 = nn.Linear(d_model, d_ff)
-        self.fc2 = nn.Linear(d_ff, d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.attention = MultiHeadAttention(d, q_heads, kv_heads, head_dim);
+        self.norm1 = nn.LayerNorm(d)
+        self.fc1 = nn.Linear(d, f)
+        self.fc2 = nn.Linear(f, d)
+        self.norm2 = nn.LayerNorm(d)
+        self.dropout = nn.Dropout(p=0.1)
 
-    def forward(self, X):
-        X = self.norm1(X + F.dropout(self.attention(X)))
-        X_ff = F.dropout(self.fc1(X))
-        X_ff = self.relu(X_ff)
-        X_ff = F.dropout(self.fc2(X_ff))
+    def forward(self, X, attn_mask):
+        X = self.norm1(X + self.dropout(self.attention(X, attn_mask)))
+        X_ff = self.dropout(self.fc1(X))
+        X_ff = F.gelu(X_ff)
+        X_ff = self.dropout(self.fc2(X_ff))
 
         return self.norm2(X + X_ff)
 
 class Model(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, n_transformers, heads=8, d_ff=256):
+    def __init__(
+        self, 
+        vocab_size, 
+        d=128, 
+        f=256,
+        layers=8, 
+        q_heads=8, 
+        kv_heads=8,
+        head_dim=None):
         super().__init__()
         self.vocab_size = vocab_size
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = d
 
-        self.d_model = embedding_dim
-        self.heads = heads
-        self.d_k = self.d_model // self.heads # does not necessarily have to be like this
-        self.d_v = self.d_model // self.heads
-        self.d_ff = d_ff 
+        if(head_dim == None):
+            head_dim = d // q_heads
 
-        self.dropout = nn.Dropout()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.transformers = nn.ModuleList([
-            Transformer(self.d_model, self.d_k, self.d_v, self.heads, self.d_ff)
-            for i in range(n_transformers)
+        self.d = d
+        self.f = f 
+        self.q_heads = q_heads
+        self.kv_heads = kv_heads
+        self.head_dim = head_dim
+        self.layers = layers
+
+
+        self.embedding = nn.Embedding(vocab_size, d)
+        self.layers = nn.ModuleList([
+            Transformer(self.d, self.f, self.q_heads, self.kv_heads, self.head_dim)
+            for i in range(layers)
         ])
-
-        self.fc = nn.Linear(self.d_model, self.vocab_size)
-        self.softmax = nn.Softmax(dim=-1)
+        self.fc = nn.Linear(self.d, self.vocab_size)
+        self.dropout = nn.Dropout(p=0.1)
 
     def positional_encoding(self, n_tokens):
         device = next(self.parameters()).device
-        div = torch.exp(torch.arange(0, self.embedding_dim, 2) * math.log(1/10000) * 1/self.embedding_dim)
+        div = torch.exp(torch.arange(0, self.d, 2) * math.log(1/10000) * 1/self.d)
         pos_tensor = torch.arange(n_tokens).unsqueeze(1)
 
-        pe = torch.zeros((1, n_tokens, self.embedding_dim))
+        pe = torch.zeros((1, n_tokens, self.d))
         pe[:, :, 0::2] = torch.sin(pos_tensor * div) 
         pe[:, :, 1::2] = torch.cos(pos_tensor * div) 
 
         return pe.to(device)
 
-    def forward(self, inputs, pred_idx=None):
+    def forward(self, inputs, attn_mask):
         pe = self.positional_encoding(inputs.shape[1])
         X = self.dropout(self.embedding(inputs) + pe)
-        for transformer in self.transformers:
-            X = transformer(X)
+        for layer in self.layers:
+            X = layer(X, attn_mask)
 
-        # prediction = self.fc(X[:, -1, :])
-        if(pred_idx == None):
-            prediction = self.fc(X)
-        else:
-            prediction = self.fc(X[:, pred_idx, :])
-
-        return prediction
-
-    def predict_token(self, logits, temperature=20):
-        distribution = Categorical(logits=logits*temperature)
-        return distribution.sample()
-
-    def inference(self, tokens, max_len=128, temperature=20):
-        while(tokens.shape[-1] < max_len):
-            logits = self(tokens, -1)
-            token = self.predict_token(logits, temperature=temperature).unsqueeze(1)
-            print(logits.shape, tokens.shape, token.shape)
-            tokens = torch.cat([tokens, token], dim=1)
-
-        return tokens
-
-        
-
-
-
-
-
-
-
-        
+        return self.fc(X) 
+    
+    def sample_pred(self, logits):
+        dist = Categorical(logits=logits)
+        return dist.sample()
+    
+    def sample_pred_best(self, logits: torch.Tensor):
+        return logits.argmax(dim=-1)

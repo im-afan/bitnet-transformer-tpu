@@ -16,7 +16,7 @@ if(tokenizer.pad_token is None):
     tokenizer.pad_token = tokenizer.eos_token
 
 
-model = Model(tokenizer.vocab_size, embedding_dim=384, n_transformers=8, heads=12, d_ff=512)
+model = Model(tokenizer.vocab_size, d=384, layers=8, q_heads=12, f=512)
 model.load_state_dict(torch.load("saved/test_model_20260514_154722.pt", map_location="cpu", weights_only=True))
 model.eval()
 
