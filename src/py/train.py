@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from torch.optim import Adam
 from transformer import Model
+import transformer
 import numbers_data 
 
 device = torch.device("cpu")
@@ -73,7 +74,18 @@ def train(
                 avg_loss = 0
     
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--arch', choices=['vanilla', 'gqa'], default='vanilla', help='Which adder architecture to use')
+    parser.add_argument('--save_freq', type=int, default=50)
+    parser.add_argument('--mini_batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=512)
+    args = parser.parse_args()
+
     vocab_size = len(numbers_data.VOCAB)
-    model = Model(vocab_size, d=128, f=512, layers=6, q_heads=8, kv_heads=8)
+    if args.arch == 'gqa':
+        model = transformer.adder_gqa()
+    else:
+        model = transformer.adder_vanilla()
+
     optim = Adam(model.parameters(), lr=1e-3)
-    train(model, optim, save_freq=50, mini_batch_size=256, batch_size=512)
+    train(model, optim, save_freq=args.save_freq, mini_batch_size=args.mini_batch_size, batch_size=args.batch_size)

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 import math
+import numbers_data
 
 device = torch.device("cpu")
 # if(torch.cuda.is_available()):
@@ -130,3 +131,12 @@ class Model(nn.Module):
     
     def sample_pred_best(self, logits: torch.Tensor):
         return logits.argmax(dim=-1)
+    
+
+def adder_vanilla():
+    model = Model(len(numbers_data.VOCAB), d=128, f=512, layers=6, q_heads=8, kv_heads=8)
+    return model
+
+def adder_gqa():
+    model = Model(len(numbers_data.VOCAB), d=128, f=512, layers=6, q_heads=8, kv_heads=2)
+    return model

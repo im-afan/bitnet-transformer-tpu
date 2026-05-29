@@ -1,4 +1,5 @@
 import torch
+import transformer
 from transformer import Model
 import numbers_data
 
@@ -8,8 +9,20 @@ import numbers_data
 # elif(torch.backends.mps.is_available() and torch.backends.mps.is_built()):
 #     device = torch.device("mps")
 
-model = Model(len(numbers_data.VOCAB), d=128, f=512, layers=6, q_heads=8, kv_heads=8)
-model.load_state_dict(torch.load("saved/really_good_model_colab.pt", map_location="cpu", weights_only=True))
+# choose architecture
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--arch', choices=['vanilla', 'gqa'], default='vanilla', help='Which adder architecture to use')
+parser.add_argument('--model-path', type=str, default='saved/really_good_model_colab.pt')
+args = parser.parse_args()
+
+if args.arch == 'gqa':
+	model = transformer.adder_gqa()
+else:
+	model = transformer.adder_vanilla()
+
+state = torch.load(args.model_path, map_location="cpu")
+model.load_state_dict(state)
 model.eval()
 # model = model.to(device)
 
