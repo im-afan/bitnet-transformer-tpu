@@ -1,4 +1,3 @@
 *__pycache__
-src/logs*
-src/py/saved*
+src/py/saved/test_*
 .venv*

@@ -9,7 +9,7 @@ import numbers_data
 #     device = torch.device("mps")
 
 model = Model(len(numbers_data.VOCAB), d=128, f=512, layers=6, q_heads=8, kv_heads=8)
-model.load_state_dict(torch.load("saved/good_model_colab.pt", map_location="cpu", weights_only=True))
+model.load_state_dict(torch.load("saved/really_good_model_colab.pt", map_location="cpu", weights_only=True))
 model.eval()
 # model = model.to(device)
 
