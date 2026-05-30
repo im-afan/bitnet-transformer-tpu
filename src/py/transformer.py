@@ -8,8 +8,7 @@ import numbers_data
 device = torch.device("cpu")
 if(torch.cuda.is_available()):
     device = torch.device("cuda")
-elif(torch.backends.mps.is_available() and torch.backends.mps.is_built()):
-    device = torch.device("mps")
+
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, d, q_heads, kv_heads, head_dim):
