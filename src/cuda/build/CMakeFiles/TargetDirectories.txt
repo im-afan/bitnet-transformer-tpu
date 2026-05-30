@@ -1,3 +1,0 @@
-/home/andrew/Desktop/transformer/src/cuda/build/CMakeFiles/test_exec.dir
-/home/andrew/Desktop/transformer/src/cuda/build/CMakeFiles/edit_cache.dir
-/home/andrew/Desktop/transformer/src/cuda/build/CMakeFiles/rebuild_cache.dir
