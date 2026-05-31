@@ -4,11 +4,39 @@ import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 import math
 import numbers_data
+from torch.utils.cpp_extension import load
 
 device = torch.device("cpu")
 if(torch.cuda.is_available()):
     device = torch.device("cuda")
 
+mha_cuda = load(name='mha_cuda', sources=["../cuda/kernels.cu", "../cuda/bindings.cpp"], verbose=True)
+
+def slow_mha_cuda(Q, K, V):
+    batch_size = Q.shape[0]
+    n_tokens = Q.shape[1]
+    q_heads = Q.shape[2] * Q.shape[3]
+    head_dim = Q.shape[4]
+
+    out, _ = mha_cuda.mha_custom(Q, K, V)
+    out = out.reshape([batch_size, n_tokens, q_heads*head_dim])
+    return out
+
+def mha_torch(Q, K, V):
+    batch_size = Q.shape[0]
+    n_tokens = Q.shape[1]
+    q_heads = Q.shape[2] * Q.shape[3]
+    head_dim = Q.shape[4]
+
+    mask = torch.triu(torch.ones([n_tokens, n_tokens]) * -1e9, diagonal=1).reshape([1, n_tokens, n_tokens, 1, 1])
+    mask = mask.to(device)
+
+    attention_scores = torch.einsum("btkgh,bskh->btskg", Q, K) / math.sqrt(head_dim)
+
+    attention_scores = F.softmax(attention_scores + mask, dim=2) # btskg
+    A = torch.einsum("btskg,bskh->btkgh", attention_scores, V).reshape([batch_size, n_tokens, q_heads * head_dim])
+    
+    return A
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, d, q_heads, kv_heads, head_dim):
@@ -26,8 +54,8 @@ class MultiHeadAttention(nn.Module):
         self.Wk = nn.Linear(d, kv_heads * self.head_dim)
         self.Wv = nn.Linear(d, kv_heads * self.head_dim)
         self.Wo = nn.Linear(q_heads * self.head_dim, d)
-    
-    def forward(self, X, attn_mask):
+
+    def forward(self, X, attn_mask, use_custom_attention=False):
         batch_size = X.shape[0]
         n_tokens = X.shape[1]
 
@@ -39,16 +67,11 @@ class MultiHeadAttention(nn.Module):
         K = torch.reshape(K, [batch_size, n_tokens, self.kv_heads, self.head_dim])
         V = torch.reshape(V, [batch_size, n_tokens, self.kv_heads, self.head_dim])
 
-        mask = torch.triu(torch.ones([n_tokens, n_tokens]) * -1e9, diagonal=1).reshape([1, n_tokens, n_tokens, 1, 1])
-        # attn_mask = attn_mask.repeat(1, 1, n_tokens)
-        # print(attn_mask.shape, n_tokens)
-        # attn_mask = attn_mask + attn_mask.T
-        # print(attn_mask.shape)
-        mask = mask.to(device)# + attn_mask.reshape([batch_size, n_tokens, n_tokens, 1, 1])
-
-        attention_scores = torch.einsum("btkgh,bskh->btskg", Q, K) / math.sqrt(self.head_dim)
-        attention_scores = F.softmax(attention_scores + mask, dim=2) # btskg
-        A = torch.einsum("btskg,bskh->btkgh", attention_scores, V).reshape([batch_size, n_tokens, self.q_heads * self.head_dim])
+        A = None
+        if(use_custom_attention):
+            A = slow_mha_cuda(Q, K, V)
+        else:
+            A = mha_torch(Q, K, V)
 
         O = self.Wo(A) 
         return O + X
@@ -64,8 +87,8 @@ class Transformer(nn.Module):
         self.norm2 = nn.LayerNorm(d)
         self.dropout = nn.Dropout(p=0.1)
 
-    def forward(self, X, attn_mask):
-        X = self.norm1(X + self.dropout(self.attention(X, attn_mask)))
+    def forward(self, X, attn_mask, use_custom_attention=False):
+        X = self.norm1(X + self.dropout(self.attention(X, attn_mask, use_custom_attention)))
         X_ff = self.dropout(self.fc1(X))
         X_ff = F.gelu(X_ff)
         X_ff = self.dropout(self.fc2(X_ff))
@@ -116,11 +139,11 @@ class Model(nn.Module):
 
         return pe.to(device)
 
-    def forward(self, inputs, attn_mask):
+    def forward(self, inputs, attn_mask, use_custom_attention=False):
         pe = self.positional_encoding(inputs.shape[1])
         X = self.dropout(self.embedding(inputs) + pe)
         for layer in self.layers:
-            X = layer(X, attn_mask)
+            X = layer(X, attn_mask, use_custom_attention=use_custom_attention)
 
         return self.fc(X) 
     

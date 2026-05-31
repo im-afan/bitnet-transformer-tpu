@@ -27,13 +27,17 @@ __global__ void slow_mha(const float* Q, const float* K, const float* V, float* 
             // iterate through each element in column (each kv token)
             for(int y = tid_y; y < s; y += blockDim.y) {
                 int atn_idx = batch_idx * t * s * q_heads + x * s * q_heads + y * q_heads + q_head_idx;
-                atn_scores[atn_idx] = 0;
-                for(int i = 0; i < head_dim; i++) {
-                    int Q_idx = batch_idx * t * q_heads * head_dim + x * q_heads * head_dim + q_head_idx * head_dim + i;
-                    int K_idx = batch_idx * s * kv_heads * head_dim + y * kv_heads * head_dim + kv_head_idx * head_dim + i;
+                if(y <= x) {
+                    atn_scores[atn_idx] = 0;
+                    for(int i = 0; i < head_dim; i++) {
+                        int Q_idx = batch_idx * t * q_heads * head_dim + x * q_heads * head_dim + q_head_idx * head_dim + i;
+                        int K_idx = batch_idx * s * kv_heads * head_dim + y * kv_heads * head_dim + kv_head_idx * head_dim + i;
 
-                    // printf("atn_scores[%d][%d][%d][%d] += Q[%d][%d][%d][%d] + ")
-                    atn_scores[atn_idx] += Q[Q_idx] * K[K_idx] / scale;
+                        // printf("atn_scores[%d][%d][%d][%d] += Q[%d][%d][%d][%d] + ")
+                        atn_scores[atn_idx] += Q[Q_idx] * K[K_idx] / scale;
+                    }
+                } else {
+                    atn_scores[atn_idx] = -1e9;
                 }
             }
         }
@@ -113,6 +117,8 @@ __global__ void slow_mha(const float* Q, const float* K, const float* V, float* 
 }
 
 __host__ std::tuple<torch::Tensor, torch::Tensor> mha_custom(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    torch::Device device(torch::kCUDA);
+
     int b = Q.size(0);
     int t = Q.size(1);
     int s = K.size(1);
@@ -121,8 +127,8 @@ __host__ std::tuple<torch::Tensor, torch::Tensor> mha_custom(torch::Tensor Q, to
     int head_dim = K.size(3);
     int g = q_heads / kv_heads;
 
-    torch::Tensor atn_scores = torch::empty({b, t, s, kv_heads, g});
-    torch::Tensor output = torch::zeros({b, t, q_heads, head_dim});
+    torch::Tensor atn_scores = torch::empty({b, t, s, kv_heads, g}).to(device);
+    torch::Tensor output = torch::zeros({b, t, q_heads, head_dim}).to(device);
 
     dim3 block_dim(16, 16);
     dim3 grid_dim(b, q_heads);
