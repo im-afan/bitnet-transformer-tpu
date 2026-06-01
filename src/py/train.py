@@ -22,6 +22,7 @@ def train(
         mini_batch_size = 32,
         batch_size = 32,
         max_tokens = 32,
+        max_digits = 5,
         save_freq = 100
     ):
     model = model.to(device)
@@ -35,7 +36,7 @@ def train(
 
     for i in range(epochs):
         for j in range(batches):
-            batch, tokens, attn_mask = numbers_data.create_addition_batch(mini_batch_size, max_tokens)
+            batch, tokens, attn_mask = numbers_data.create_addition_batch(mini_batch_size, max_tokens, max_digits=max_digits)
             tokens = torch.tensor(tokens).to(device)
             # print(attn_mask)
             attn_mask = torch.stack(attn_mask).to(device)
@@ -77,6 +78,8 @@ if __name__ == '__main__':
     parser.add_argument('--save_freq', type=int, default=50)
     parser.add_argument('--mini_batch_size', type=int, default=256)
     parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--max_tokens', type=int, default=32, help='Context length (sequence length)')
+    parser.add_argument('--max_digits', type=int, default=5, help='Max digits per operand in addition expressions')
     args = parser.parse_args()
 
     vocab_size = len(numbers_data.VOCAB)
@@ -86,4 +89,4 @@ if __name__ == '__main__':
         model = transformer.adder_vanilla()
 
     optim = Adam(model.parameters(), lr=1e-3)
-    train(model, optim, save_freq=args.save_freq, mini_batch_size=args.mini_batch_size, batch_size=args.batch_size)
+    train(model, optim, save_freq=args.save_freq, mini_batch_size=args.mini_batch_size, batch_size=args.batch_size, max_tokens=args.max_tokens, max_digits=args.max_digits)

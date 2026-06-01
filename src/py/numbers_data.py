@@ -32,10 +32,18 @@ def detokenize(token_ids: List[int]) -> str:
     return ''.join(INV_VOCAB[token_id] for token_id in token_ids if token_id != PAD_ID)
 
 
+def _sample_number(max_digits: int) -> int:
+    """Sample an integer where each digit-length 1..max_digits is equally likely."""
+    n_digits = random.randint(1, max_digits)
+    lo = 10 ** (n_digits - 1) if n_digits > 1 else 0
+    hi = 10 ** n_digits - 1
+    return random.randint(lo, hi)
+
+
 def generate_addition_expression(max_digits: int = 5, max_length: int = 32) -> str:
-    """Generate a random addition expression using integers up to max_digits digits."""
-    left = random.randint(0, 10**max_digits - 1)
-    right = random.randint(0, 10**max_digits - 1)
+    """Generate a random addition expression where each operand length is equally likely."""
+    left = _sample_number(max_digits)
+    right = _sample_number(max_digits)
     expr = f"{left}+{right}"
     expr += PAD_TOKEN * (EQUALS_POS - len(expr) - 1)
     expr += f"={left+right}" 
@@ -43,7 +51,7 @@ def generate_addition_expression(max_digits: int = 5, max_length: int = 32) -> s
     return expr
 
 
-def create_addition_batch(batch_size: int, max_tokens: int) -> Tuple[List[str], List[List[int]]]:
+def create_addition_batch(batch_size: int, max_tokens: int, max_digits: int = 5) -> Tuple[List[str], List[List[int]]]:
     """Create a batch of addition expressions and corresponding token id sequences."""
     if max_tokens < MIN_TOKEN_LENGTH:
         raise ValueError(f"max_tokens must be at least {MIN_TOKEN_LENGTH}")
@@ -54,7 +62,7 @@ def create_addition_batch(batch_size: int, max_tokens: int) -> Tuple[List[str], 
 
     for _ in range(batch_size):
         while True:
-            expr = generate_addition_expression(max_digits=5, max_length=max_tokens)
+            expr = generate_addition_expression(max_digits=max_digits, max_length=max_tokens)
             if len(expr) <= max_tokens:
                 break
         expressions.append(expr)
