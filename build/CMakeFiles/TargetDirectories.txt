@@ -1,3 +1,0 @@
-/home/andrew/Desktop/transformer/build/CMakeFiles/test_exec.dir
-/home/andrew/Desktop/transformer/build/CMakeFiles/edit_cache.dir
-/home/andrew/Desktop/transformer/build/CMakeFiles/rebuild_cache.dir

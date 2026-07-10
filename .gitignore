@@ -1,3 +1,21 @@
 *__pycache__
-src/py/saved/test_*
 .venv*
+.claude
+
+# --- model artifacts ---
+model/saved/test_*
+
+# --- hardware: simulation artifacts ---
+accel/tpu/sim/obj_dir/
+accel/tpu/sim/*.vcd
+accel/tpu/sim/*.fst
+accel/tpu/sim/*.wdb
+accel/tpu/sim/*.vvp
+accel/tpu/sim/*.out
+
+# --- hardware: synthesis / place-and-route / bitstreams ---
+accel/tpu/synth/build/
+*.bit
+*.bin
+*.jou
+*.log

@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "CUDA-PyTorch-Setup",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/include",
+                "path/to/your/env/Lib/site-packages/torch/include",
+                "path/to/your/env/Lib/site-packages/torch/include/torch/csrc/api/include"
+            ],
+            "defines": [
+                "__CUDACC__",
+                "TORCH_EXTENSION_NAME=gpu_extension"
+            ],
+            "compilerPath": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nvcc.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}
