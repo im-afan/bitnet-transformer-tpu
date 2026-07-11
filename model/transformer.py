@@ -72,7 +72,7 @@ class RoundClip(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (input,) = ctx.saved_tensors
-        return grad_output * (1 - torch.tanh(input) ** 2)
+        return grad_output * (input.abs() <= 1)
 
 
 class TernaryLinear(nn.Module):
@@ -90,7 +90,7 @@ class TernaryLinear(nn.Module):
 
         nn.init.kaiming_uniform_(self.w, a=math.sqrt(5))
         if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.w)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
