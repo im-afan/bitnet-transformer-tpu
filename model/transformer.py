@@ -96,7 +96,7 @@ class TernaryLinear(nn.Module):
 
     def forward(self, x):
         scale = self.w.abs().mean() + self.eps
-        w_quant = RoundClip.apply(self.w / scale)
+        w_quant = RoundClip.apply(self.w / scale) * self.w.abs().mean()
         out = x @ w_quant
         if self.bias is not None:
             out = out + self.bias
