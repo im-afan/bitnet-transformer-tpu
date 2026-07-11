@@ -15,16 +15,16 @@ if torch.cuda.is_available():
 
 # CUDA reference accelerator now lives under accel/cuda/. Resolve its sources
 # relative to the repo root so the extension loads regardless of cwd.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_CUDA_DIR = os.path.join(_REPO_ROOT, "accel", "cuda")
-mha_cuda = load(
-    name="mha_cuda",
-    sources=[
-        os.path.join(_CUDA_DIR, "kernels.cu"),
-        os.path.join(_CUDA_DIR, "bindings.cpp"),
-    ],
-    verbose=True,
-)
+# _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# _CUDA_DIR = os.path.join(_REPO_ROOT, "accel", "cuda")
+# mha_cuda = load(
+#    name="mha_cuda",
+#    sources=[
+#        os.path.join(_CUDA_DIR, "kernels.cu"),
+#        os.path.join(_CUDA_DIR, "bindings.cpp"),
+#    ],
+#    verbose=True,
+# )
 
 
 def slow_mha_cuda(Q, K, V):
@@ -85,9 +85,14 @@ class TernaryLinear(nn.Module):
     def __init__(self, in_dim, out_dim, bias=True, eps=1e-5):
         super().__init__()
         self.w = nn.Parameter(torch.empty(in_dim, out_dim))
-        nn.init.normal_(self.w, std=0.02)
         self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
         self.eps = eps
+
+        nn.init.kaiming_uniform_(self.w, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
         scale = self.w.abs().mean() + self.eps
@@ -312,9 +317,9 @@ def adder_vanilla():
         len(numbers_data.VOCAB),
         d=128,
         f=512,
-        layers=6,
-        q_heads=8,
-        kv_heads=8,
+        layers=4,
+        q_heads=4,
+        kv_heads=4,
         use_moe=False,
     )
     return model

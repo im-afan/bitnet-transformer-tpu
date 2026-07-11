@@ -65,7 +65,7 @@ def train(
             if steps % save_freq == 0:
                 avg_loss /= save_freq
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                filepath = f"./saved/test_model_{timestamp}.pt"
+                filepath = f"model/saved/test_model_{timestamp}.pt"
                 torch.save(model.state_dict(), filepath)
 
                 saved_models.append(filepath)
@@ -120,4 +120,3 @@ if __name__ == "__main__":
         max_tokens=args.max_tokens,
         max_digits=args.max_digits,
     )
-
