@@ -28,12 +28,18 @@ We will use DMA to access RAM and load into a specific address in our scratchpad
 ### 2. MXU
 
 The MXU is a weight-stationary systolic array. It will load the ternary weights from scratchpad memory into registers in each PE.
-Then, it loads activations from the scratchpad into the activation buffer and feeds them into the systolic array in a staggered order. The scratchpad should consist of enough BRAM blocks to fully load 1 column of activations in 1 clock.
+Then, it loads activations from the scratchpad into the activation buffer and feeds them into the systolic array in a staggered order. 
+The scratchpad should consist of enough BRAM blocks to fully load 1 column of activations in 1 clock.
 The MXU output immediately gets written to another address in scratchpad memory.
 
 ### 3. VPU
 
-The VPU performs all other important pointwise vector operations using SIMD, such as activations (relu, gelu, etc), vector add, dot product, and reductions. It contains multiple ALUs that act on data from a single scratchpad memory access.
+The VPU performs all other important pointwise vector operations using SIMD, such as activations (relu, gelu, etc), vector add, dot product, and reductions. 
+It contains multiple ALUs that act on data from a single scratchpad memory access.
+
+### Requant unit
+
+All tensors outputted by the MXU or VPU need to be requantized according to a channelwise scaling M, determined during model quantization. 
 
 ### 4. Communication interface
 

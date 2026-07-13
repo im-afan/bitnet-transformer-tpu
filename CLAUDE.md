@@ -75,3 +75,10 @@ the last 3 (these are gitignored; committed checkpoints like `colab_vanilla_mha.
 When touching attention numerics, keep the three implementations in sync: `mha_torch`
 (reference), the CUDA kernel, and any future TPU block — they all implement the same 5-D layout
 and masking convention.
+
+## Coding Practices
+
+- **Do**: read files to gain a good understanding of code, ask questions when design choices are unclear,
+and write code. Plan out anything in markdown files when it is a large task.
+- **Don't**: run code or any other commands (such as checking for packages, etc) unless otherwise told to do so.
+If extra context is needed about my development environment or feedback is needed for your code, please ask.

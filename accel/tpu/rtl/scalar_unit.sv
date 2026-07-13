@@ -117,6 +117,12 @@ module scalar_unit #(
         OP_WRMEM   = 6'h06,  // DMA : scratch r[src0] -> DRAM r[src1]
         OP_RDMEM   = 6'h07,  // DMA : DRAM r[src0] -> scratch r[dst]
         OP_WRNEIGH = 6'h08,  // LINK: DRAM r[src0] -> neighbor DRAM r[src1], dir=flags
+        OP_REQUANT = 6'h09,  // VPU : r[dst] = requant(r[src0], {n,m0}=r[src1])
+        OP_VECEMUL = 6'h0A,  // VPU : r[dst] = r[src0] (.) r[src1]   (elementwise mul)
+        OP_SQUARE  = 6'h0B,  // VPU : r[dst] = r[src0]^2             (LayerNorm var)
+        OP_EXP     = 6'h0C,  // VPU : r[dst] = exp_lut(r[src0])      (softmax)
+        OP_REDMAX  = 6'h0D,  // VPU : r[dst] = max_i r[src0][i]      (softmax/stats)
+        OP_REDSUM  = 6'h0E,  // VPU : r[dst] = Σ_i r[src0][i]       (softmax/LN mean)
         OP_ADDS    = 6'h10,  // r[dst] = r[src0] + r[src1]
         OP_SUBS    = 6'h11,  // r[dst] = r[src0] - r[src1]   (support op)
         OP_MULS    = 6'h12,  // r[dst] = r[src0] * r[src1]   (low XLEN bits)
@@ -130,9 +136,11 @@ module scalar_unit #(
         OP_WAIT    = 6'h1A,  // block on unit flags{0:MXU,1:VPU,2:DMA,3:LINK}
         OP_HALT    = 6'h1F;  // stop, raise `done`
 
-    // VPU op selector values driven on vpu_op (vpu.md §4 sequences).
+    // VPU op selector values driven on vpu_op (must match vpu.sv VOP_* codes).
     localparam logic [3:0]
-        VOP_DOT = 4'd0, VOP_ADD = 4'd1, VOP_MUL = 4'd2, VOP_RELU = 4'd3, VOP_GELU = 4'd4;
+        VOP_DOT = 4'd0, VOP_ADD = 4'd1, VOP_MUL = 4'd2, VOP_RELU = 4'd3, VOP_GELU = 4'd4,
+        VOP_SQUARE = 4'd5, VOP_EXP = 4'd6, VOP_REDUCEMAX = 4'd7, VOP_REDUCESUM = 4'd8,
+        VOP_ELEMENT_MUL = 4'd9, VOP_REQUANT = 4'd10;
 
     // Named config registers (host- or SETCFG-written; scalar_unit.md §6).
     localparam logic [CFG_AW-1:0]
@@ -229,16 +237,22 @@ module scalar_unit #(
 
     assign vpu_src0   = r_src0[ADDR_W-1:0];
     assign vpu_src1   = r_src1[ADDR_W-1:0];
-    assign vpu_scalar = r_src1[ADDR_W-1:0];   // VECMUL broadcast scalar
+    assign vpu_scalar = r_src1[ADDR_W-1:0];   // VECMUL scalar / REQUANT {n,m0} addr
     assign vpu_dst    = r_dst [ADDR_W-1:0];
     always_comb begin
         unique case (opc)
-            OP_VECDOT: vpu_op = VOP_DOT;
-            OP_VECADD: vpu_op = VOP_ADD;
-            OP_VECMUL: vpu_op = VOP_MUL;
-            OP_RELU:   vpu_op = VOP_RELU;
-            OP_GELU:   vpu_op = VOP_GELU;
-            default:   vpu_op = VOP_DOT;
+            OP_VECDOT:  vpu_op = VOP_DOT;
+            OP_VECADD:  vpu_op = VOP_ADD;
+            OP_VECMUL:  vpu_op = VOP_MUL;
+            OP_RELU:    vpu_op = VOP_RELU;
+            OP_GELU:    vpu_op = VOP_GELU;
+            OP_SQUARE:  vpu_op = VOP_SQUARE;
+            OP_EXP:     vpu_op = VOP_EXP;
+            OP_REDMAX:  vpu_op = VOP_REDUCEMAX;
+            OP_REDSUM:  vpu_op = VOP_REDUCESUM;
+            OP_VECEMUL: vpu_op = VOP_ELEMENT_MUL;
+            OP_REQUANT: vpu_op = VOP_REQUANT;   // in=r[src0], {n,m0}=r[src1], out=r[dst]
+            default:    vpu_op = VOP_DOT;
         endcase
     end
 
@@ -251,27 +265,29 @@ module scalar_unit #(
     assign nb_src_addr = r_src0[ADDR_W-1:0];
     assign nb_dst_addr = r_src1[ADDR_W-1:0];
 
-    // Is this opcode a compute/comms dispatch (assert start, then wait on done)?
-    function automatic logic is_dispatch(input logic [5:0] o);
-        return (o == OP_MATMUL) || (o == OP_VECDOT) || (o == OP_VECMUL) ||
-               (o == OP_VECADD) || (o == OP_RELU)   || (o == OP_GELU)   ||
-               (o == OP_WRMEM)  || (o == OP_RDMEM)  || (o == OP_WRNEIGH);
+    // Every op that dispatches to the VPU (declared first: is_dispatch and
+    // dispatch_unit below both call it).
+    function automatic logic is_vpu_op(input logic [5:0] o);
+        return (o == OP_VECDOT)  || (o == OP_VECMUL)  || (o == OP_VECADD)   ||
+               (o == OP_RELU)    || (o == OP_GELU)    || (o == OP_SQUARE)   ||
+               (o == OP_EXP)     || (o == OP_REDMAX)  || (o == OP_REDSUM)   ||
+               (o == OP_VECEMUL) || (o == OP_REQUANT);
     endfunction
 
-    function automatic logic is_vpu_op(input logic [5:0] o);
-        return (o == OP_VECDOT) || (o == OP_VECMUL) || (o == OP_VECADD) ||
-               (o == OP_RELU)   || (o == OP_GELU);
+    // Is this opcode a compute/comms dispatch (assert start, then wait on done)?
+    function automatic logic is_dispatch(input logic [5:0] o);
+        return is_vpu_op(o) || (o == OP_MATMUL) ||
+               (o == OP_WRMEM) || (o == OP_RDMEM) || (o == OP_WRNEIGH);
     endfunction
 
     // Which unit a dispatch opcode targets.
     function automatic logic [1:0] dispatch_unit(input logic [5:0] o);
-        unique case (o)
-            OP_MATMUL:                                  dispatch_unit = U_MXU;
-            OP_VECDOT, OP_VECMUL, OP_VECADD,
-            OP_RELU,   OP_GELU:                         dispatch_unit = U_VPU;
-            OP_WRMEM,  OP_RDMEM:                        dispatch_unit = U_DMA;
-            OP_WRNEIGH:                                 dispatch_unit = U_LINK;
-            default:                                     dispatch_unit = U_MXU;
+        unique case (1'b1)
+            is_vpu_op(o):                               dispatch_unit = U_VPU;
+            (o == OP_MATMUL):                           dispatch_unit = U_MXU;
+            (o == OP_WRMEM), (o == OP_RDMEM):           dispatch_unit = U_DMA;
+            (o == OP_WRNEIGH):                          dispatch_unit = U_LINK;
+            default:                                    dispatch_unit = U_MXU;
         endcase
     endfunction
 

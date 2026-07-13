@@ -53,6 +53,12 @@ where noted. Fixed-size operands are implied by config registers (array size, `d
 | `VectorAdd` | `vec0, vec1, out`                 | `out = vec0 + vec1` (residuals)                        |
 | `ReLU`      | `vec, out`                        | `out = max(vec, 0)`                                    |
 | `GeLU`      | `vec, out`                        | `out = gelu(vec)` (VPU LUT)                            |
+| `VectorEMul`| `vec0, vec1, out`                 | `out[i] = vec0[i]·vec1[i]` (elementwise)              |
+| `Square`    | `vec, out`                        | `out[i] = vec[i]²` (LayerNorm variance)               |
+| `Exp`       | `vec, out`                        | `out = exp(vec)` (VPU LUT; softmax)                   |
+| `ReduceMax` | `vec, out`                        | `out = max_i vec[i]` → scalar                         |
+| `ReduceSum` | `vec, out`                        | `out = Σ_i vec[i]` → scalar                           |
+| `Requant`   | `vec(int32), param, out(int8)`    | `out = clip((vec·m0+rnd)>>n)`, `{n,m0}=param` (VPU)    |
 
 ### Comms / Memory
 
