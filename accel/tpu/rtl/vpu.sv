@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // vpu.sv — TPU SIMD vector unit
 //
@@ -127,7 +128,7 @@ module vpu #(
     // -------------------------------------------------------------------------
     // FSM.
     // -------------------------------------------------------------------------
-    typedef enum logic [2:0] {
+    typedef enum logic [3:0] {
         S_IDLE, S_RD0, S_RD0D, S_RD1, S_RD1D, S_RDS, S_RDSD, S_EXEC, S_WB, S_DONE
     } state_t;
     state_t state, state_n;
@@ -170,11 +171,17 @@ module vpu #(
     logic        [7:0]       res8  [0:LANES-1];    // int8 requant result
     logic signed [ACC_W-1:0] red_val [0:LANES-1];  // per-lane value into reduction
 
+    logic signed [7:0]       a8;
+    logic signed [7:0]       b8;
+    logic        [7:0]       idx8;    // unsigned byte for LUT indexing
+    logic signed [ACC_W-1:0] a32;
     always_comb begin
+        a8 = '0; b8 = '0; idx8 = '0; a32 = '0;
         for (int l = 0; l < LANES; l++) begin
-            automatic logic signed [7:0]       a8  = V_data0[l*8  +: 8];
-            automatic logic signed [7:0]       b8  = V_data1[l*8  +: 8];
-            automatic logic signed [ACC_W-1:0] a32 = V_data0[l*32 +: 32];
+            a8   = V_data0[l*8  +: 8];
+            b8   = V_data1[l*8  +: 8];
+            idx8 = V_data0[l*8  +: 8];
+            a32  = V_data0[l*32 +: 32];
             lane_active[l] = (l < chunk_active);
             res32[l] = '0;
             res8[l]  = '0;
@@ -185,8 +192,8 @@ module vpu #(
                 VOP_SCALAR_MUL:  res32[l] = a8 * $signed(scalar_reg);
                 VOP_RELU:        res32[l] = (a8 > 0) ? ACC_W'(a8) : '0;
                 VOP_SQUARE:      res32[l] = a8 * a8;
-                VOP_GELU:        res32[l] = ACC_W'(gelu_rom[V_data0[l*8 +: 8]]);
-                VOP_EXP:         res32[l] = ACC_W'(exp_rom [V_data0[l*8 +: 8]]);
+                VOP_GELU:        res32[l] = ACC_W'(gelu_rom[idx8]);
+                VOP_EXP:         res32[l] = ACC_W'(exp_rom [idx8]);
                 VOP_REQUANT:     res8[l]  = requant8(a32, rq_m0, rq_n);
                 VOP_DOT:         red_val[l] = a8 * b8;
                 VOP_REDUCESUM:   red_val[l] = ACC_W'(a8);
@@ -268,19 +275,28 @@ module vpu #(
     always_comb begin
         state_n = state;
         unique case (state)
-            S_IDLE:  if (vpu_start) state_n = (vpu_vlen == 0) ? S_DONE : S_RD0;
-            S_RD0:   state_n = S_RD0D;
-            S_RD0D:  state_n = needs_src1(op_r) ? S_RD1
-                             : (needs_scalar(op_r) && !scalar_loaded) ? S_RDS
-                             : S_EXEC;
-            S_RD1:   state_n = S_RD1D;
-            S_RD1D:  state_n = S_EXEC;
-            S_RDS:   state_n = S_RDSD;
-            S_RDSD:  state_n = S_EXEC;
-            S_EXEC:  if (last_chunk) state_n = is_reduction(op_r) ? S_WB : S_DONE;
-                     else            state_n = S_RD0;
-            S_WB:    state_n = S_DONE;
-            S_DONE:  state_n = S_IDLE;
+            S_IDLE: if (vpu_start) begin
+                        if (vpu_vlen == 0) state_n = S_DONE;
+                        else               state_n = S_RD0;
+                    end
+            S_RD0:  state_n = S_RD0D;
+            S_RD0D: begin
+                        if (needs_src1(op_r))                          state_n = S_RD1;
+                        else if (needs_scalar(op_r) && !scalar_loaded) state_n = S_RDS;
+                        else                                           state_n = S_EXEC;
+                    end
+            S_RD1:  state_n = S_RD1D;
+            S_RD1D: state_n = S_EXEC;
+            S_RDS:  state_n = S_RDSD;
+            S_RDSD: state_n = S_EXEC;
+            S_EXEC: begin
+                        if (last_chunk) begin
+                            if (is_reduction(op_r)) state_n = S_WB;
+                            else                    state_n = S_DONE;
+                        end else state_n = S_RD0;
+                    end
+            S_WB:   state_n = S_DONE;
+            S_DONE: state_n = S_IDLE;
             default: state_n = S_IDLE;
         endcase
     end

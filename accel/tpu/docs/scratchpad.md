@@ -92,7 +92,50 @@ scratchpad therefore needs to hold **one layer of weights + a couple activation 
 (~56 KB) at once; the full 288 KB lives in DRAM and is double-buffered per layer so DMA
 of layer *n+1*'s weights overlaps compute of layer *n*.
 
-## 6. Open questions
+## 6. RTL implementation (`rtl/scratchpad.sv`)
+
+`scratchpad.sv` is the single owner of the on-chip storage. It exposes the typed
+ports from §4 with exactly the signal names the compute units already drive, so a
+top-level wires them straight through:
+
+| Port  | Direction | Driven by                                   |
+| ----- | --------- | ------------------------------------------- |
+| `A_rd`| read      | `mxu.sv` `A_re / A_raddr / A_rdata`         |
+| `W_rd`| read      | `mxu.sv` `W_re / W_raddr / W_rdata`         |
+| `C_rw`| read/write| `mxu.sv` `C_re… / C_we…` (result + accumulate readback) |
+| `V_rw`| read/write| `vpu.sv` `V_re… / V_we…`                    |
+| `S_rw`| read/write| `scalar_unit.sv` `s_re / s_we / s_addr…` (shared read/write address) |
+| `DMA` | read/write| DMA engine (future block)                   |
+
+**Contract.** Byte-addressed; each port gathers/scatters its own byte width
+(parameters `A_BYTES`, `W_BYTES`, `C_BYTES`, `V_BYTES`, `S_BYTES`, `DMA_BYTES`,
+defaulting to a 128×128 array). Reads are **synchronous** — `*_rdata` valid the
+cycle after `*_re` — and all read ports are independent, so the MXU can read
+`A_rd`, `W_rd` and `C_rw` in the same cycle. Writes are single-cycle under a
+per-byte strobe. A read and write to the same byte in one cycle returns the
+**old** value (read-first). This matches every unit and the inline TB memory
+models. Same-byte concurrent *writes* are not expected under the §4 static
+arbitration; the module resolves them C < V < S < DMA (last wins).
+
+**Registers vs BRAM.** The `MEM_STYLE` parameter selects the storage primitive at
+elaboration, with identical functional/timing behaviour either way (the rest of
+the TPU is agnostic):
+
+| `MEM_STYLE` | `ram_style` hint | Inferred primitive            | Use when                     |
+| ----------- | ---------------- | ----------------------------- | ---------------------------- |
+| `"BRAM"` (default) | `block`   | FPGA block RAM                | large regions (weight tiles) |
+| `"REG"`     | `registers`      | flip-flop / distributed RAM   | small, very-wide, many-read scratch |
+
+A full block-RAM mapping of the whole multi-read/multi-write port set needs the
+per-bank replication in §3; until a board is fixed in `constraints/`, the
+behavioural model plus the `ram_style` hint captures both synthesis targets.
+
+Verify with `make TEST=scratchpad sim` (`tb/scratchpad_tb.sv` instantiates the
+`"BRAM"` and `"REG"` variants side by side and checks both against a byte-array
+reference, covering strobed writes, cross-port coherence, concurrent multiport
+reads, and read-first).
+
+## 7. Open questions
 
 - BRAM primitive width on the chosen board (36 Kb vs 18 Kb blocks) sets the real
   `NBANK_A`; revisit once a board is fixed in `constraints/`.

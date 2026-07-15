@@ -6,3 +6,4 @@ is validated against the PyTorch golden model.
 - **`cuda/`** — custom CUDA MHA/GQA kernel loaded into PyTorch via `torch.utils.cpp_extension`.
   Serves as the GPU reference and correctness baseline.
 - **`tpu/`** — custom SystemVerilog TPU targeting an FPGA. See `tpu/README.md`.
+- **`compile/`** - compiles torch expressions into TPU instructions.

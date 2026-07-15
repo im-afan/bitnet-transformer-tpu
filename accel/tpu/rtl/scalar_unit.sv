@@ -69,8 +69,10 @@ module scalar_unit #(
     output logic [ADDR_W-1:0]    mxu_act_addr,
     output logic [ADDR_W-1:0]    mxu_weight_addr,
     output logic [ADDR_W-1:0]    mxu_out_addr,
+    output logic [ADDR_W-1:0]    mxu_scalar_addr, // requant {M0,N} word (config reg)
     output logic [5:0]           mxu_t_len,      // token columns (config reg)
-    output logic                 mxu_accumulate, // tiling accumulate (instr flag)
+    output logic                 mxu_accumulate, // tiling accumulate (instr flag[0])
+    output logic                 mxu_requant,    // narrow store int32->int8 (instr flag[1])
     input  logic                 mxu_busy,
     input  logic                 mxu_done,
 
@@ -108,7 +110,9 @@ module scalar_unit #(
     // "leaving room for future fused ops").
     // -------------------------------------------------------------------------
     localparam logic [5:0]
-        OP_MATMUL  = 6'h00,  // MXU : act=r[src0], weight=r[src1], out=r[dst]
+        OP_MATMUL  = 6'h00,  // MXU : act=r[src0], weight=r[src1], out=r[dst];
+                             //       flags[0]=accumulate, flags[1]=requant,
+                             //       requant {M0,N} word addr from cfg[CFG_SCALAR]
         OP_VECDOT  = 6'h01,  // VPU : out=r[dst] = Σ r[src0]·r[src1]
         OP_VECMUL  = 6'h02,  // VPU : r[dst] = r[src0] × scalar r[src1]
         OP_VECADD  = 6'h03,  // VPU : r[dst] = r[src0] + r[src1]
@@ -144,9 +148,10 @@ module scalar_unit #(
 
     // Named config registers (host- or SETCFG-written; scalar_unit.md §6).
     localparam logic [CFG_AW-1:0]
-        CFG_TLEN = 'd0,   // MXU token count T -> mxu_t_len
-        CFG_VLEN = 'd1,   // VPU vector length -> vpu_vlen
-        CFG_LEN  = 'd2;   // DMA / WriteNeighbor byte length
+        CFG_TLEN   = 'd0, // MXU token count T -> mxu_t_len
+        CFG_VLEN   = 'd1, // VPU vector length -> vpu_vlen
+        CFG_LEN    = 'd2, // DMA / WriteNeighbor byte length
+        CFG_SCALAR = 'd3; // MXU requant {M0,N} word address -> mxu_scalar_addr
 
     // Dispatch-target selector (also the WAIT flags encoding).
     localparam logic [1:0] U_MXU = 2'd0, U_VPU = 2'd1, U_DMA = 2'd2, U_LINK = 2'd3;
@@ -211,10 +216,11 @@ module scalar_unit #(
             cfg[a_dst[CFG_AW-1:0]] <= {{(XLEN-16){1'b0}}, imm16};
     end
 
-    assign mxu_t_len = cfg[CFG_TLEN][5:0];
-    assign vpu_vlen  = cfg[CFG_VLEN][9:0];
-    assign dma_len   = cfg[CFG_LEN][15:0];
-    assign nb_len    = cfg[CFG_LEN][15:0];
+    assign mxu_t_len      = cfg[CFG_TLEN][5:0];
+    assign mxu_scalar_addr = cfg[CFG_SCALAR][ADDR_W-1:0];
+    assign vpu_vlen       = cfg[CFG_VLEN][9:0];
+    assign dma_len        = cfg[CFG_LEN][15:0];
+    assign nb_len         = cfg[CFG_LEN][15:0];
 
     // -------------------------------------------------------------------------
     // Instruction memory (BRAM), synchronous read + host write port.
@@ -234,6 +240,7 @@ module scalar_unit #(
     assign mxu_weight_addr = r_src1[ADDR_W-1:0];
     assign mxu_out_addr    = r_dst [ADDR_W-1:0];
     assign mxu_accumulate  = flags[0];
+    assign mxu_requant     = flags[1];
 
     assign vpu_src0   = r_src0[ADDR_W-1:0];
     assign vpu_src1   = r_src1[ADDR_W-1:0];

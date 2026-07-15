@@ -37,10 +37,6 @@ The MXU output immediately gets written to another address in scratchpad memory.
 The VPU performs all other important pointwise vector operations using SIMD, such as activations (relu, gelu, etc), vector add, dot product, and reductions. 
 It contains multiple ALUs that act on data from a single scratchpad memory access.
 
-### Requant unit
-
-All tensors outputted by the MXU or VPU need to be requantized according to a channelwise scaling M, determined during model quantization. 
-
 ### 4. Communication interface
 
 Furthermore, we implement an inter-TPU interface that allows a TPU to receive requests to write to the RAM of its neighbors. For now, we implement a 2d connection scheme (4 neighbors).

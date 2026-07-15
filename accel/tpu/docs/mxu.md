@@ -86,8 +86,13 @@ output column per clock once the pipeline is full.
 - **Requantize on store.** BitNet-style: the reference folds a per-tensor
   `scale = mean(|W|)` into the ternary weights, so the int32 accumulator is multiplied
   by `scale` (and any activation scale) then rounded/clipped back to int8 on the way to
-  scratchpad. Scale factors are per-tensor constants supplied by the host and applied by
-  the store-path requantizer (a shift-multiply-round), **not** inside the PEs.
+  scratchpad. The rescale is a fixed-point `clip((acc*M0 + round) >> N)` (same math as
+  `requant.sv` / the VPU's `VOP_REQUANT`); the per-tensor `{M0, N}` word is read once
+  from `scalar_addr`. It is applied by the store-path requantizer, **not** inside the PEs.
+  Requant is gated by the `requant` input: assert it to narrow the store to int8; leave
+  it clear to write int32 — the mode intermediate contraction tiles use so `accumulate`
+  can keep running int32 partials in the result bank (§6), with only the final tile
+  asserting `requant`.
 - Bias add (projections have bias) is folded into the requantizer as an int32 add before
   rounding.
 
@@ -110,11 +115,16 @@ one hardware `Matmul`.
 | `start`       | in  | 1         | begin matmul (from scalar unit)      |
 | `act_addr`    | in  | addr      | activation tile base                 |
 | `weight_addr` | in  | addr      | ternary weight tile base             |
-| `out_addr`    | in  | addr      | int32 result base                    |
+| `out_addr`    | in  | addr      | result base (int32, or int8 if requant) |
+| `scalar_addr` | in  | addr      | requant `{M0, N}` word (used if requant) |
 | `t_len`       | in  | 6         | number of token columns (`T`)        |
-| `accumulate`  | in  | 1         | add into existing result (tiling)    |
+| `accumulate`  | in  | 1         | add into existing int32 result (tiling) |
+| `requant`     | in  | 1         | narrow store int32→int8 via `{M0, N}` |
 | `busy`        | out | 1         | high during load/feed/drain          |
 | `done`        | out | 1         | pulse when result fully written      |
+
+The store uses a per-byte `C_wstrb`, so an int8 requant row (COLS bytes) writes only its
+lanes and does not clobber the neighbouring int32-width result bytes.
 
 ## 8. Open questions
 

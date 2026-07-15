@@ -80,6 +80,13 @@ class TernaryLinear(nn.Module):
 
     Weights are scaled by their absmean and rounded/clipped to {-1, 0, 1}.
     RoundClip provides a straight-through estimator for the backward pass.
+
+    Activations feeding the matmul can optionally be quantized to symmetric
+    int8 with a single per-tensor scalar. The scalar is populated offline by
+    ``calibrate_activations`` (absmax over a calibration set, ``scale =
+    absmax / 127``) and stored in ``act_scale``. An uncalibrated layer keeps
+    ``act_scale`` at NaN and passes activations through untouched, so existing
+    checkpoints load and run exactly as before.
     """
 
     def __init__(self, in_dim, out_dim, bias=True, eps=1e-5):
@@ -88,13 +95,36 @@ class TernaryLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
         self.eps = eps
 
+        # Per-tensor symmetric int8 activation scale. NaN => not calibrated.
+        self.register_buffer("act_scale", torch.tensor(float("nan")))
+        # Running absmax accumulated while calibrating (not persisted).
+        self.register_buffer("_act_absmax", torch.zeros(()), persistent=False)
+        self.calibrating = False
+
         nn.init.kaiming_uniform_(self.w, a=math.sqrt(5))
         if self.bias is not None:
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.w)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
+    def quantize_activations(self, x):
+        """Fake-quantize activations to symmetric per-tensor int8.
+
+        During calibration, tracks the running absmax instead of quantizing so a
+        single scalar can be derived once the pass finishes.
+        """
+        if self.calibrating:
+            self._act_absmax = torch.maximum(
+                self._act_absmax, x.detach().abs().max()
+            )
+            return x
+        if torch.isnan(self.act_scale):
+            return x
+        x_int = torch.round(x / self.act_scale).clamp_(-127, 127)
+        return x_int * self.act_scale
+
     def forward(self, x):
+        x = self.quantize_activations(x)
         scale = self.w.abs().mean() + self.eps
         w_quant = RoundClip.apply(self.w / scale) * self.w.abs().mean()
         out = x @ w_quant
@@ -107,6 +137,50 @@ def make_linear(in_dim, out_dim, use_ternary=False, bias=True):
     if use_ternary:
         return TernaryLinear(in_dim, out_dim, bias=bias)
     return nn.Linear(in_dim, out_dim, bias=bias)
+
+
+@torch.no_grad()
+def calibrate_activations(model, run_forward):
+    """Calibrate per-tensor symmetric int8 activation scales for a ternary model.
+
+    ``run_forward(model)`` should push the whole calibration set through the model
+    (looping over batches internally, with whatever masks/args the model needs)
+    while every ``TernaryLinear`` records the absmax of its input activations across
+    all those forward passes. Afterwards each
+    layer's ``act_scale`` is set to ``absmax / 127`` — one scalar per layer, so the
+    activation entering that matmul quantizes to symmetric int8 [-127, 127].
+
+    Returns a dict mapping module name -> calibrated scale.
+    """
+    layers = [m for m in model.modules() if isinstance(m, TernaryLinear)]
+    if not layers:
+        raise ValueError("model has no TernaryLinear layers to calibrate")
+
+    was_training = model.training
+    model.eval()  # disable dropout so calibration matches inference
+    for layer in layers:
+        layer.calibrating = True
+        layer._act_absmax.zero_()
+        # Ignore any previously calibrated scale while recording absmax.
+        layer.act_scale = torch.tensor(float("nan"), device=layer.act_scale.device)
+
+    try:
+        run_forward(model)
+    finally:
+        for layer in layers:
+            layer.calibrating = False
+        if was_training:
+            model.train()
+
+    scales = {}
+    name_of = {m: n for n, m in model.named_modules()}
+    for layer in layers:
+        # A zero absmax (activations never nonzero) would make an unusable 0
+        # scale; leave such a layer uncalibrated (NaN => passthrough) instead.
+        if layer._act_absmax > 0:
+            layer.act_scale = layer._act_absmax / 127.0
+        scales[name_of[layer]] = layer.act_scale.item()
+    return scales
 
 
 class MultiHeadAttention(nn.Module):
