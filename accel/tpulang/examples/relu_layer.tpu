@@ -1,0 +1,42 @@
+; relu_layer.tpu — one ternary NN layer + activation, the shape the adder model runs.
+;
+;     Y = requant(A @ W)      MXU: int8 activations x ternary weights, int32
+;                             accumulate, requantized int32->int8 on store
+;     Z = relu(Y)             VPU activation over the int8 layer output
+;
+; This is the exact program hand-encoded in accel/tpu/tb/tpu_top_tb.sv, written in
+; tpulang. Assembling it and comparing to that testbench's load_program() is the
+; assembler's golden check:
+;
+;     python ../assembler.py relu_layer.tpu --listing
+;
+; Geometry (must match the DUT / testbench): T=4 tokens, COLS=8  => NELEM=32.
+; The host preloads A, W and the requant {m0,n} word into scratchpad first.
+
+.equ ACT    0x0000      ; A[t][i] int8, row-major
+.equ WGT    0x1000      ; W[i][j] ternary, column-major 2-bit packed
+.equ OUT    0x3000      ; Y[t][j] int8   (requant store target)
+.equ RLU    0x5000      ; Z[t][j] int32  (relu output)
+.equ RQW    0x7000      ; requant {m0,n} word (int32)
+
+.equ T      4           ; token rows
+.equ COLS   8
+.equ NELEM  T * COLS    ; flat layer-output length = 32
+
+.reg act    r1
+.reg wgt    r2
+.reg out    r3
+.reg rlu    r4
+
+    setcfg  tlen,   T           ; MXU token count
+    setcfg  vlen,   NELEM       ; VPU vector length
+    setcfg  scalar, RQW         ; MXU requant {m0,n} word address
+
+    li      act, ACT
+    li      wgt, WGT
+    li      out, OUT
+    li      rlu, RLU
+
+    matmul.rq  out, act, wgt    ; Y = requant(A @ W)   (flags: requant only)
+    relu       rlu, out         ; Z = relu(Y), reading Y back from scratchpad
+    halt

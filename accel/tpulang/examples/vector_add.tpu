@@ -1,0 +1,25 @@
+; vector_add.tpu — the residual add C = A + B, the smallest useful VPU program.
+;
+; Demonstrates: config setup (vector length) + a single elementwise VPU op.
+; VectorAdd is how the model adds residual streams (O + X, X + ff(X)).
+;
+;     python ../assembler.py vector_add.tpu -o vector_add.hex
+;
+; The host preloads A and B (N int32 elements each) into scratchpad first, then
+; reads C back after HALT.
+
+.equ A  0x0000      ; input vector A (int32)
+.equ B  0x0400      ; input vector B (int32)
+.equ C  0x0800      ; output vector C = A + B (int32)
+.equ N  64          ; elements
+
+.reg a  r1
+.reg b  r2
+.reg c  r3
+
+    setcfg  vlen, N     ; VPU processes N elements
+    li      a, A
+    li      b, B
+    li      c, C
+    vecadd  c, a, b     ; C[i] = A[i] + B[i]
+    halt

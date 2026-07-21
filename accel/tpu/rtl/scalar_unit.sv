@@ -127,6 +127,8 @@ module scalar_unit #(
         OP_EXP     = 6'h0C,  // VPU : r[dst] = exp_lut(r[src0])      (softmax)
         OP_REDMAX  = 6'h0D,  // VPU : r[dst] = max_i r[src0][i]      (softmax/stats)
         OP_REDSUM  = 6'h0E,  // VPU : r[dst] = Σ_i r[src0][i]       (softmax/LN mean)
+        OP_SADD    = 6'h0F,  // VPU : r[dst] = r[src0] + scalar r[src1]  (x-max / x-mean)
+        OP_SDIV    = 6'h1B,  // VPU : r[dst] = r[src0] / scalar r[src1]  (Q15; softmax/LN)
         OP_ADDS    = 6'h10,  // r[dst] = r[src0] + r[src1]
         OP_SUBS    = 6'h11,  // r[dst] = r[src0] - r[src1]   (support op)
         OP_MULS    = 6'h12,  // r[dst] = r[src0] * r[src1]   (low XLEN bits)
@@ -144,7 +146,8 @@ module scalar_unit #(
     localparam logic [3:0]
         VOP_DOT = 4'd0, VOP_ADD = 4'd1, VOP_MUL = 4'd2, VOP_RELU = 4'd3, VOP_GELU = 4'd4,
         VOP_SQUARE = 4'd5, VOP_EXP = 4'd6, VOP_REDUCEMAX = 4'd7, VOP_REDUCESUM = 4'd8,
-        VOP_ELEMENT_MUL = 4'd9, VOP_REQUANT = 4'd10;
+        VOP_ELEMENT_MUL = 4'd9, VOP_REQUANT = 4'd10, VOP_SCALAR_ADD = 4'd11,
+        VOP_SCALAR_DIV = 4'd12;
 
     // Named config registers (host- or SETCFG-written; scalar_unit.md §6).
     localparam logic [CFG_AW-1:0]
@@ -244,7 +247,8 @@ module scalar_unit #(
 
     assign vpu_src0   = r_src0[ADDR_W-1:0];
     assign vpu_src1   = r_src1[ADDR_W-1:0];
-    assign vpu_scalar = r_src1[ADDR_W-1:0];   // VECMUL scalar / REQUANT {n,m0} addr
+    assign vpu_scalar = r_src1[ADDR_W-1:0];   // VECMUL/SADD scalar, SDIV divisor,
+                                              // REQUANT {n,m0} addr
     assign vpu_dst    = r_dst [ADDR_W-1:0];
     always_comb begin
         unique case (opc)
@@ -259,6 +263,8 @@ module scalar_unit #(
             OP_REDSUM:  vpu_op = VOP_REDUCESUM;
             OP_VECEMUL: vpu_op = VOP_ELEMENT_MUL;
             OP_REQUANT: vpu_op = VOP_REQUANT;   // in=r[src0], {n,m0}=r[src1], out=r[dst]
+            OP_SADD:    vpu_op = VOP_SCALAR_ADD; // in=r[src0], scalar=r[src1], out=r[dst]
+            OP_SDIV:    vpu_op = VOP_SCALAR_DIV; // in=r[src0], divisor=r[src1], out=r[dst]
             default:    vpu_op = VOP_DOT;
         endcase
     end
@@ -278,7 +284,8 @@ module scalar_unit #(
         return (o == OP_VECDOT)  || (o == OP_VECMUL)  || (o == OP_VECADD)   ||
                (o == OP_RELU)    || (o == OP_GELU)    || (o == OP_SQUARE)   ||
                (o == OP_EXP)     || (o == OP_REDMAX)  || (o == OP_REDSUM)   ||
-               (o == OP_VECEMUL) || (o == OP_REQUANT);
+               (o == OP_VECEMUL) || (o == OP_REQUANT) || (o == OP_SADD)     ||
+               (o == OP_SDIV);
     endfunction
 
     // Is this opcode a compute/comms dispatch (assert start, then wait on done)?

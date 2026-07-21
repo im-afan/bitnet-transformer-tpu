@@ -1,0 +1,55 @@
+; softmax_row.tpu — softmax over one attention-score row, as a VPU micro-sequence.
+;
+; softmax has no single instruction; the scalar unit decomposes it into VPU
+; primitives (scalar_unit.md §5, vpu.md §Operations):
+;
+;     m   = max_i x[i]                 redmax
+;     s   = x - m                      sadd  (broadcast add of a negated scalar)
+;     e   = exp(s)                     exp   (LUT)
+;     D   = Σ e[i]                     redsum
+;     p   = round(e * 2^15 / D)        sdiv  (Q15 normalize)
+;
+; It also shows the scalar<->vector interplay: redmax writes its scalar result to
+; scratchpad, which we load into a register, negate, and store back so sadd can
+; broadcast it. (A real compile would insert a REQUANT before `exp` to land `s`
+; in the exp table's input scale; omitted here to keep the primitive chain clear.)
+;
+;     python ../assembler.py softmax_row.tpu --listing
+
+.equ X      0x0000      ; input score row (int8), N elements
+.equ MAXA   0x0100      ; scalar: max_i x[i]        (int32)
+.equ NEGA   0x0110      ; scalar: -max              (int32)
+.equ SHIFT  0x0200      ; x - max                   (int32)
+.equ EXPA   0x0400      ; exp(x - max)              (int8, exp-table scale)
+.equ DENA   0x0600      ; scalar: Σ exp             (int32)
+.equ PROB   0x0700      ; probabilities, Q15        (int32)
+.equ N      16          ; row length (== #keys attended)
+
+.reg x      r1
+.reg maxa   r2
+.reg nega   r3
+.reg shift  r4
+.reg expa   r5
+.reg dena   r6
+.reg prob   r7
+.reg t      r8          ; scalar scratch
+
+    setcfg  vlen, N
+
+    li  x,     X
+    li  maxa,  MAXA
+    li  nega,  NEGA
+    li  shift, SHIFT
+    li  expa,  EXPA
+    li  dena,  DENA
+    li  prob,  PROB
+
+    redmax  maxa, x         ; scratch[MAXA] = max_i x[i]
+    loads   t, maxa         ; t = max
+    subs    t, r0, t        ; t = 0 - max = -max
+    stores  nega, t         ; scratch[NEGA] = -max
+    sadd    shift, x, nega  ; shift[i] = x[i] + (-max)
+    exp     expa, shift     ; e[i] = exp(shift[i])
+    redsum  dena, expa      ; scratch[DENA] = Σ e[i]
+    sdiv    prob, expa, dena ; p[i] = round(e[i] * 2^15 / D)   (Q15)
+    halt

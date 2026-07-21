@@ -59,6 +59,8 @@ where noted. Fixed-size operands are implied by config registers (array size, `d
 | `ReduceMax` | `vec, out`                        | `out = max_i vec[i]` → scalar                         |
 | `ReduceSum` | `vec, out`                        | `out = Σ_i vec[i]` → scalar                           |
 | `Requant`   | `vec(int32), param, out(int8)`    | `out = clip((vec·m0+rnd)>>n)`, `{n,m0}=param` (VPU)    |
+| `ScalarAdd` | `vec, scalar, out`                | `out[i] = vec[i] + scalar` (broadcast; `x−max`/`x−mean`)|
+| `ScalarDiv` | `vec, scalar, out`                | `out[i] = round(vec[i]·2¹⁵ / scalar)` (Q15; softmax/LN)|
 
 ### Comms / Memory
 
@@ -101,8 +103,10 @@ loop h in 0..q_heads:
   loop i in 0..T:            ; query token
     loop j in 0..i:          ; causal: keys 0..i
       VectorDot @Q[h,i], @K[h,j], @S[i,j]   ; QK^T / sqrt(d) folded into scale
-    ; softmax over row S[i, 0..i]  (VPU: max, exp-LUT, sum, reciprocal-mul)
-    VectorMul  @S[i], @recip, @P[i]
+    ; softmax over row S[i, 0..i]:
+    ;   ReduceMax @S[i] -> m;  ScalarAdd @S[i], -m -> shifted (x-max)
+    ;   Exp (LUT) -> e;  ReduceSum @e -> D;  ScalarDiv @e, D -> @P[i]
+    ScalarDiv  @e[i], @D, @P[i]   ; p = e / Σe, in Q15 (no separate @recip needed)
     loop j in 0..i:
       VectorMul @P[i,j], @V[h,j], @acc      ; weighted V
       VectorAdd @acc, @A[h,i], @A[h,i]

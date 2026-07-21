@@ -44,9 +44,10 @@ softmax denominators, and LayerNorm mean/variance.
 ## Operations
 
 The op is selected by the 4-bit `vpu_op` field driven by the scalar unit. Codes 0–4
-match the `VOP_*` values the scalar unit already emits (`scalar_unit.sv`); 5–9 extend
+match the `VOP_*` values the scalar unit already emits (`scalar_unit.sv`); 5–12 extend
 the set for the softmax / LayerNorm / attention micro-sequences that the ISA builds out
-of these primitives.
+of these primitives (`SCALAR_ADD`/`SCALAR_DIV` are the broadcast subtract and normalize
+those reductions need).
 
 | `vpu_op` | Name          | Kind        | Operands used             | Result                                  |
 | -------- | ------------- | ----------- | ------------------------- | --------------------------------------- |
@@ -61,11 +62,56 @@ of these primitives.
 | `8`      | `REDUCESUM`   | reduction   | `src0`                    | scalar `Σ src0[i]` → `dst`             |
 | `9`      | `ELEMENT_MUL` | elementwise | `src0`, `src1`            | `dst[i] = src0[i] · src1[i]`           |
 | `10`     | `REQUANT`     | requant     | `src0`(int32), `scalar`   | `dst[i] = clip((src0[i]·m0 + rnd) >> n)`|
+| `11`     | `SCALAR_ADD`  | elementwise | `src0`, `scalar`          | `dst[i] = src0[i] + scalar`            |
+| `12`     | `SCALAR_DIV`  | scalar div  | `src0`, `scalar`          | `dst[i] = round(src0[i]·2^15 / scalar)`|
 
 `REDUCEMAX`/`REDUCESUM`/`DOT` collapse the whole vector to one int32 scalar; the other
 compute ops produce a same-length vector. `GELU`/`EXP` are 256-entry int8→int8 LUTs
-indexed by the signed input byte, generated on the host from the reference activation
-(`$readmemh` at init).
+indexed by the signed input byte, a fixed hardware artifact loaded once (`$readmemh` at
+init) — see [Activation LUTs](#activation-luts).
+
+`SCALAR_ADD` broadcasts one int32 word from the `scalar` address over every lane — the
+`x - max` (softmax) and `x - mean` (LayerNorm) subtracts, done by adding a negated
+scalar. `SCALAR_DIV` divides by a **runtime** scalar (softmax's `Σexp`, LayerNorm's
+variance) — see [Divide](#divide).
+
+### Divide
+
+A runtime divisor cannot be a compile-time `{m0, n}` like `REQUANT`, so `SCALAR_DIV`
+reciprocates it once and reuses the lanes' multipliers. When the scalar loads, a single
+shared restoring divider computes `R = floor(2^RECIP_Q / |d|)` (`RECIP_Q = 31`, so
+`RECIP_Q + 1 = 32` cycles, amortized over the whole vector). Each lane then forms
+
+```
+dst[i] = sign(d) · round( (src0[i] · R) >> (RECIP_Q − DIV_Q) )      (DIV_Q = 15)
+       = round( src0[i] · 2^DIV_Q / d )
+```
+
+reusing the `SCALAR_MUL` 8×32 multiplier. The result is emitted in a **fixed** Q15
+format, so even though the divisor is only known at run time the result's scale is
+`scale(src0) / scale(d) · 2^−15` — a compile-time constant the compiler requantizes
+like any other int32 buffer. A zero divisor saturates `R` to all-ones (the compiler
+guarantees a nonzero divisor: `Σexp ≥ 1`, `var > 0`).
+
+For softmax this makes the normalize exact-in-format: `p_i = e_i / D` becomes
+`q_i = round(e_i · 2^15 / D)` in Q15, and a following `REQUANT` with `{m0 = 127, n = 15}`
+lands the probabilities on int8's `±127`.
+
+### Activation LUTs
+
+`gelu_rom` / `exp_rom` are the VPU's only activation tables — one each, loaded at init
+from `GELU_INIT` / `EXP_INIT`. Because the table *is* the op's numerics
+(`res32 = gelu_rom[idx8]`), its scales are a **fixed** hardware choice, not per-program;
+`accel/compiler/luts.py` pins them and generates the `$readmemh` files:
+
+| Table  | Input range | `in_scale` | `out_scale` | Notes                                             |
+| ------ | ----------- | ---------- | ----------- | ------------------------------------------------- |
+| `gelu` | `[-8, 8)`   | `1/16`     | `1/16`      | ≈ identity for `x ≳ 2`; keeps the dip near `-0.75`|
+| `exp`  | `[-8, 0]`   | `1/16`     | `1/127`     | softmax's `x − max` is ≤ 0; `exp(0) = 1 → 127`, `exp(-8) → 0`. Positive indices (unreachable after `x − max`) saturate at 127 |
+
+An operand reaches a table in its `in_scale` by an ordinary `REQUANT` the compiler
+inserts ahead of the op (`legalize._required_int8_scale`) — getting into the table's
+scale is the compiler's job, not the hardware's.
 
 ### Datatypes and requant
 

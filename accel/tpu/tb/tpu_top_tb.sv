@@ -3,37 +3,51 @@
 // tpu_top_tb.sv — end-to-end testbench for accel/tpu/rtl/tpu_top.sv
 //
 // Exercises the fully integrated core (scalar_unit + mxu + vpu + scratchpad,
-// BRAM working memory) the way a host actually drives it: preload the scratchpad
-// through the top-level host memory port, load a program into instruction BRAM,
-// pulse host_run, then read the results back out of BRAM — no direct poking of
-// any unit's internal ports.
+// BRAM working memory) the way a host actually drives it: load an *assembled*
+// program and sample input tensors from $readmemh memory files, stream them into
+// the DUT over the top-level host ports, pulse host_run, then read the results
+// back out of BRAM and compare — no direct poking of any unit's internal ports.
 //
-// The program simulates one ternary NN layer followed by an activation, the
-// shape the adder model runs (TernaryLinear projection, then a pointwise
-// nonlinearity):
+// The golden reference is produced entirely outside the RTL: accel/tpulang
+// assembles a .tpu program (assembler.py) and simulates the instruction set in
+// Python (iss.py) against the same input tensors, and gen_vectors.py exports
 //
-//     Y  = A @ W            MXU matmul: int8 activations × ternary weights,
-//                           int32 accumulate, requantized int32→int8 on store
-//     Z  = relu(Y)          VPU activation over the int8 layer output (int32 out)
+//     tpu_prog.hex      the assembled program        (imem words, dense)
+//     tpu_spad_in.hex   the input tensors            (scratchpad bytes, sparse)
+//     tpu_spad_exp.hex  the ISS-computed outputs     (scratchpad bytes, sparse)
 //
-// with A : T×d int8, W : d×COLS ternary {−1,0,+1}, Y : T×COLS int8. The requant
-// scale is {m0=1, n=0} (identity + int8 clip) so the golden model stays a plain
-// integer matmul; inputs are bounded so the accumulator lands inside int8.
+// This TB is program-agnostic: it streams whatever the program file holds, loads
+// whatever bytes the input file holds, and checks exactly the bytes the ISS says
+// the program wrote (tpu_spad_exp.hex carries only those). Regenerate the vectors
+// after changing the program or tensors:
 //
-// Both stages are checked against an in-TB integer reference: the requantized
-// layer output Y (validates MXU + requant + scratchpad) and the activation Z
-// (validates the VPU op reading the MXU's result back out of scratchpad, i.e.
-// the scalar unit's issue-and-wait dependency chain across two units).
+//     cd ../../tpulang && python gen_vectors.py
 //
-// Small 8×8 array so the systolic drain simulates quickly (RTL default 128×128).
+// The default program is examples/relu_layer.tpu — one ternary NN layer plus a
+// ReLU (Y = requant(A@W); Z = relu(Y)), the shape the adder model runs.
+//
+// Small 8x8 array so the systolic drain simulates quickly (RTL default 128x128).
+// The geometry below MUST match gen_vectors.py (ROWS/COLS/T).
 //
 // Run:  make TEST=tpu_top RTL="../rtl/tpu_top.sv ../rtl/scalar_unit.sv \
 //            ../rtl/mxu.sv ../rtl/vpu.sv ../rtl/scratchpad.sv"
+// Override a vector file:  iverilog ... -DPROG_FILE='"vectors/other_prog.hex"'
 // -----------------------------------------------------------------------------
+
+// ---- Vector files (paths relative to the tb/ dir where vvp runs) -------------
+`ifndef PROG_FILE
+  `define PROG_FILE "vectors/tpu_prog.hex"
+`endif
+`ifndef SPAD_IN_FILE
+  `define SPAD_IN_FILE "vectors/tpu_spad_in.hex"
+`endif
+`ifndef SPAD_EXP_FILE
+  `define SPAD_EXP_FILE "vectors/tpu_spad_exp.hex"
+`endif
 
 module tpu_top_tb;
 
-    // ---- Geometry (must match the DUT instance) -----------------------------
+    // ---- Geometry (must match the DUT instance and gen_vectors.py) ----------
     localparam int ROWS      = 8;      // MXU contraction dim d
     localparam int COLS      = 8;      // MXU output features
     localparam int VPU_BYTES = 64;     // VPU port width (512-bit)
@@ -46,27 +60,8 @@ module tpu_top_tb;
     localparam int N_W       = 4;
     localparam int DMA_BYTES = 64;     // host memory port width
 
-    localparam int T          = 4;                 // token rows
-    localparam int WCOL_BYTES = (ROWS * 2) / 8;    // packed weight column bytes
-    localparam int NELEM      = T * COLS;          // flat layer-output length
-
-    // ---- Requant scale: {m0=1, n=0} => Y = clip(acc) to int8 ----------------
-    localparam int RQ_M0 = 1;
-    localparam int RQ_N  = 0;
-
-    // ---- Scratchpad address map ---------------------------------------------
-    localparam logic [ADDR_W-1:0] ACT = 16'h0000;  // A[t][i] int8, row-major
-    localparam logic [ADDR_W-1:0] WGT = 16'h1000;  // W[i][j] ternary, col-major 2-bit
-    localparam logic [ADDR_W-1:0] OUT = 16'h3000;  // Y[t][j] int8 (requant store)
-    localparam logic [ADDR_W-1:0] RLU = 16'h5000;  // Z[t][j] int32 (relu output)
-    localparam logic [ADDR_W-1:0] RQW = 16'h7000;  // requant {m0,n} word (int32)
-
-    // ---- Scalar ISA opcodes (subset used here; must match scalar_unit.sv) ----
-    localparam logic [5:0]
-        OP_MATMUL = 6'h00, OP_RELU = 6'h04, OP_SETCFG = 6'h15,
-        OP_LIS    = 6'h14, OP_HALT = 6'h1F;
-    localparam logic [CFG_AW-1:0]
-        CFG_TLEN = 4'd0, CFG_VLEN = 4'd1, CFG_SCALAR = 4'd3;
+    localparam int DEPTH     = (1 << ADDR_W);      // scratchpad size in bytes
+    localparam int IMEM_DEP  = (1 << IMEM_AW);     // instruction memory depth
 
     // -------------------------------------------------------------------------
     // Clock / reset.
@@ -130,18 +125,7 @@ module tpu_top_tb;
         host_mem_wstrb = '0;
     endtask
 
-    task automatic spad_wr_word(input logic [ADDR_W-1:0] addr, input logic [31:0] d);
-        @(negedge clk);
-        host_mem_we    = 1'b1;
-        host_mem_waddr = addr;
-        host_mem_wdata = '0;  host_mem_wdata[31:0] = d;
-        host_mem_wstrb = '0;  host_mem_wstrb[3:0]  = 4'hF;  // int32 word at addr
-        @(negedge clk);
-        host_mem_we    = 1'b0;
-        host_mem_wstrb = '0;
-    endtask
-
-    // Read a 32-bit window starting at addr (byte k in dma_rdata[k*8 +: 8]).
+    // Read a 32-bit window starting at addr (byte k in host_mem_rdata[k*8 +: 8]).
     task automatic spad_rd(input logic [ADDR_W-1:0] addr, output logic [31:0] d);
         @(negedge clk);
         host_mem_re    = 1'b1;
@@ -152,9 +136,6 @@ module tpu_top_tb;
         d = host_mem_rdata[31:0];
     endtask
 
-    // -------------------------------------------------------------------------
-    // Instruction / config load helpers (scalar unit accepts these while idle).
-    // -------------------------------------------------------------------------
     task automatic load_instr(input logic [IMEM_AW-1:0] a, input logic [31:0] w);
         @(negedge clk);
         imem_we    = 1'b1;
@@ -164,121 +145,80 @@ module tpu_top_tb;
         imem_we    = 1'b0;
     endtask
 
-    function automatic logic [31:0] enc_rrr(input logic [5:0] op,
-                                            input logic [7:0] dst,
-                                            input logic [7:0] src0,
-                                            input logic [7:0] src1,
-                                            input logic [1:0] fl);
-        return {op, dst, src0, src1, fl};
-    endfunction
-
-    function automatic logic [31:0] enc_imm(input logic [5:0]  op,
-                                            input logic [7:0]  dst,
-                                            input logic [15:0] imm);
-        return {op, dst, imm, 2'b00};   // imm16 occupies ir[17:2]
-    endfunction
-
     // -------------------------------------------------------------------------
-    // Reference model.
+    // Vector-file backing stores (loaded with $readmemh).
+    //   prog_words : dense from addr 0; trailing entries stay x (=> program end).
+    //   in_bytes   : sparse (@addr runs); a defined byte is a tensor byte to load.
+    //   exp_bytes  : sparse (@addr runs); a defined byte is an output to check.
     // -------------------------------------------------------------------------
-    int actv [0:T-1][0:ROWS-1];      // int8 activations
-    int wgtv [0:ROWS-1][0:COLS-1];   // ternary weights {-1,0,1}
+    logic [31:0] prog_words [0:IMEM_DEP-1];
+    logic [7:0]  in_bytes   [0:DEPTH-1];
+    logic [7:0]  exp_bytes  [0:DEPTH-1];
+
     int errors = 0, checks = 0;
 
-    function automatic int clip8(input int v);
-        if (v >  127) return  127;
-        if (v < -128) return -128;
-        return v;
+    // Fully-defined (no x bits) test for a loaded byte / word.
+    function automatic logic defined8(input logic [7:0] b);
+        return (^b !== 1'bx);
+    endfunction
+    function automatic logic defined32(input logic [31:0] w);
+        return (^w !== 1'bx);
     endfunction
 
-    // Ternary -> 2-bit code: 00=0, 01=+1, 11=-1 (scratchpad.md §2).
-    function automatic logic [1:0] trit(input int w);
-        return (w == 0) ? 2'b00 : (w == 1) ? 2'b01 : 2'b11;
-    endfunction
-
-    // Golden layer output Y[t][j] = clip(Σ_i A[t][i]·W[i][j]) with {m0=1,n=0}.
-    function automatic int ref_y(input int t, input int j);
-        int s; s = 0;
-        for (int i = 0; i < ROWS; i++) s += actv[t][i] * wgtv[i][j];
-        return clip8(s);
-    endfunction
-
-    // Generate bounded, deterministic operands and stream them into scratchpad.
-    task automatic gen_and_load_operands();
-        logic [8*WCOL_BYTES-1:0] colword;
-        // Activations: A[t][i] in [-4,4], row-major int8.
-        for (int t = 0; t < T; t++)
-            for (int i = 0; i < ROWS; i++) begin
-                actv[t][i] = ((t*3 + i) % 9) - 4;
-                spad_wr_byte(ACT + ADDR_W'(t*ROWS + i), actv[t][i][7:0]);
-            end
-        // Weights: W[i][j] in {-1,0,1}, column-major 2-bit packed.
-        for (int j = 0; j < COLS; j++) begin
-            colword = '0;
-            for (int i = 0; i < ROWS; i++) begin
-                wgtv[i][j] = ((i + 2*j) % 3) - 1;
-                colword[i*2 +: 2] = trit(wgtv[i][j]);
-            end
-            for (int b = 0; b < WCOL_BYTES; b++)
-                spad_wr_byte(WGT + ADDR_W'(j*WCOL_BYTES + b), colword[b*8 +: 8]);
-        end
-        // Requant {m0,n} word: m0 in low M0_W bits, n above (matches requant8()).
-        spad_wr_word(RQW, (RQ_N << M0_W) | RQ_M0);
-    endtask
-
-    // -------------------------------------------------------------------------
-    // Program: config, address setup, matmul+requant, relu, halt.
-    // -------------------------------------------------------------------------
-    // Registers: r1=ACT, r2=WGT, r3=OUT(Y), r4=RLU(Z).
+    // Stream the assembled program into instruction BRAM (stop at first hole).
+    // ($readmemh warns that the file has fewer words than prog_words is deep —
+    //  that is expected: the unfilled trailing entries stay x and mark the end.)
     task automatic load_program();
-        load_instr(0, enc_imm(OP_SETCFG, CFG_TLEN,   16'(T)));       // MXU token count
-        load_instr(1, enc_imm(OP_SETCFG, CFG_VLEN,   16'(NELEM)));   // VPU vector length
-        load_instr(2, enc_imm(OP_SETCFG, CFG_SCALAR, RQW));          // requant word addr
-        load_instr(3, enc_imm(OP_LIS, 8'd1, ACT));
-        load_instr(4, enc_imm(OP_LIS, 8'd2, WGT));
-        load_instr(5, enc_imm(OP_LIS, 8'd3, OUT));
-        load_instr(6, enc_imm(OP_LIS, 8'd4, RLU));
-        // MATMUL out=r3, act=r1, weight=r2; flags[1]=requant, flags[0]=accumulate.
-        load_instr(7, enc_rrr(OP_MATMUL, 8'd3, 8'd1, 8'd2, 2'b10));
-        // RELU dst=r4, src0=r3 (reads the int8 layer output back from scratchpad).
-        load_instr(8, enc_rrr(OP_RELU, 8'd4, 8'd3, 8'd0, 2'b00));
-        load_instr(9, enc_rrr(OP_HALT, 8'd0, 8'd0, 8'd0, 2'b00));
+        int i;
+        $readmemh(`PROG_FILE, prog_words);
+        i = 0;
+        while (i < IMEM_DEP && defined32(prog_words[i])) begin
+            load_instr(i[IMEM_AW-1:0], prog_words[i]);
+            i++;
+        end
+        $display("loaded %0d instruction words from %s", i, `PROG_FILE);
     endtask
 
-    // -------------------------------------------------------------------------
-    // Checks.
-    // -------------------------------------------------------------------------
-    task automatic check_layer_output();   // Y = requant(A@W), int8 at OUT
-        logic [31:0] rd; int got, exp;
-        for (int t = 0; t < T; t++)
-            for (int j = 0; j < COLS; j++) begin
-                spad_rd(OUT + ADDR_W'(t*COLS + j), rd);
-                got = $signed(rd[7:0]);
-                exp = ref_y(t, j);
-                checks++;
-                if (got !== exp) begin
-                    errors++;
-                    $display("  FAIL Y[%0d][%0d]: got %0d  exp %0d", t, j, got, exp);
-                end
+    // Stream the sample tensors into scratchpad over the host memory port.
+    task automatic load_tensors();
+        int a, cnt;
+        $readmemh(`SPAD_IN_FILE, in_bytes);
+        cnt = 0;
+        for (a = 0; a < DEPTH; a++)
+            if (defined8(in_bytes[a])) begin
+                spad_wr_byte(a[ADDR_W-1:0], in_bytes[a]);
+                cnt++;
             end
-        $display("[matmul+requant] checked %0d elems (errors so far: %0d)", NELEM, errors);
+        $display("loaded %0d scratchpad input bytes from %s", cnt, `SPAD_IN_FILE);
     endtask
 
-    task automatic check_activation();     // Z = relu(Y), int32 at RLU
-        logic [31:0] rd; int got, exp, idx;
-        for (int t = 0; t < T; t++)
-            for (int j = 0; j < COLS; j++) begin
-                idx = t*COLS + j;
-                spad_rd(RLU + ADDR_W'(idx*4), rd);
-                got = $signed(rd);
-                exp = (ref_y(t, j) < 0) ? 0 : ref_y(t, j);
-                checks++;
-                if (got !== exp) begin
-                    errors++;
-                    $display("  FAIL Z[%0d][%0d]: got %0d  exp %0d", t, j, got, exp);
+    // Read every expected byte back out of BRAM and compare (word at a time).
+    task automatic check_outputs();
+        int wa, lane;
+        logic [31:0] rd;
+        logic [7:0]  eb, gb;
+        $readmemh(`SPAD_EXP_FILE, exp_bytes);
+        for (wa = 0; wa < DEPTH; wa += 4) begin
+            // Only read BRAM when this word carries an expected output byte.
+            if (defined8(exp_bytes[wa])  || defined8(exp_bytes[wa+1]) ||
+                defined8(exp_bytes[wa+2])|| defined8(exp_bytes[wa+3])) begin
+                spad_rd(wa[ADDR_W-1:0], rd);
+                for (lane = 0; lane < 4; lane++) begin
+                    eb = exp_bytes[wa+lane];
+                    if (defined8(eb)) begin
+                        gb = rd[lane*8 +: 8];
+                        checks++;
+                        if (gb !== eb) begin
+                            errors++;
+                            $display("  FAIL @%04h: got %02h  exp %02h",
+                                     wa+lane, gb, eb);
+                        end
+                    end
                 end
             end
-        $display("[relu activation] checked %0d elems (errors so far: %0d)", NELEM, errors);
+        end
+        $display("[compare] checked %0d output bytes (errors so far: %0d)",
+                 checks, errors);
     endtask
 
     // -------------------------------------------------------------------------
@@ -296,12 +236,11 @@ module tpu_top_tb;
         rst_n = 1'b1;
         @(posedge clk);
 
-        $display("==== TPU top-level testbench (%0dx%0d array, T=%0d) ====",
-                 ROWS, COLS, T);
+        $display("==== TPU top-level testbench (%0dx%0d array) ====", ROWS, COLS);
 
-        // 1) Preload operands into BRAM, 2) load the program, 3) run.
-        gen_and_load_operands();
+        // 1) Load the assembled program + input tensors, 2) run, 3) check.
         load_program();
+        load_tensors();
 
         @(negedge clk); host_run = 1'b1; boot_pc = '0;
         @(negedge clk); host_run = 1'b0;
@@ -310,9 +249,7 @@ module tpu_top_tb;
         do @(negedge clk); while (!done);
         $display("program halted at pc=%0d", pc_dbg);
 
-        // 4) Read results back out of BRAM and check both layer stages.
-        check_layer_output();
-        check_activation();
+        check_outputs();
 
         $display("==== done: %0d checks, %0d errors ====", checks, errors);
         if (errors == 0) $display("TPU_TOP: ALL TESTS PASSED");

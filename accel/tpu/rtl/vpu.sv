@@ -20,6 +20,24 @@
 // residual stream / softmax temporaries wide and requantize only where an int8
 // activation is actually needed (e.g. before feeding the MXU).
 //
+// Broadcast scalar ops. VOP_SCALAR_ADD / VOP_SCALAR_MUL / VOP_SCALAR_DIV read one
+// int32 word from `vpu_scalar` (once, on the first chunk) and apply it to every
+// lane — the broadcast forms softmax's `x - max` and LayerNorm's `x - mean` need.
+// Dividing by a *runtime* scalar (softmax's Σexp, LayerNorm's variance) cannot be
+// a compile-time {m0, n} like REQUANT, so VOP_SCALAR_DIV reciprocates the divisor
+// once into R = 2**RECIP_Q / |d| using a single shared restoring divider
+// (RECIP_Q+1 cycles, amortized over the whole vector) and then reuses each lane's
+// existing 8x32 multiplier. The result is emitted in a *fixed* Q(DIV_Q) format,
+// `dst[i] = round(src0[i] * 2**DIV_Q / d)`: pinning the format in hardware is what
+// keeps the result's scale known at compile time even though the divisor is not,
+// so the compiler can requantize a division like any other int32 buffer.
+//
+// Activation LUTs. GELU/EXP are 256-entry int8 tables indexed by the signed input
+// byte, generated on the host at a *canonical* input scale (accel/compiler/luts.py)
+// rather than per-program — the table is a fixed hardware artifact, and getting an
+// operand into the table's input scale is the compiler's job (an ordinary REQUANT
+// ahead of the op). See vpu.md §Activation LUTs.
+//
 // Streaming: a vector of `vpu_vlen` elements is processed LANES elements at a
 // time. Each chunk reads its operand(s), computes all lanes in one cycle, then
 // either writes the chunk back (elementwise / requant) or folds it into a
@@ -40,6 +58,12 @@ module vpu #(
     parameter int ADDR_W       = 16,  // scratchpad byte-address width
     parameter int M0_W         = 12,  // requant fixed-point multiplier width (requant.sv)
     parameter int N_W          = 4,   // requant shift width
+    // VOP_SCALAR_DIV fixed-point. The divisor is reciprocated to R = 2**RECIP_Q /
+    // |d| (RECIP_Q-bit unsigned) and each quotient is emitted in Q(DIV_Q): dst[i]
+    // = round(src0[i] * 2**DIV_Q / d). DIV_Q pins the result scale at compile time
+    // (see vpu.md §Divide); RECIP_Q carries enough reciprocal precision for it.
+    parameter int RECIP_Q      = 31,  // reciprocal numerator exponent (2**RECIP_Q / |d|)
+    parameter int DIV_Q        = 15,  // quotient fractional bits (Q15 result)
     // Host-generated activation LUTs (256 x int8), indexed by the signed input
     // byte. Left empty by default; a top-level with real activations points
     // these at $readmemh files generated from the reference model.
@@ -73,6 +97,9 @@ module vpu #(
     localparam int LANES = SCRATCHPAD_W / 4;   // int32 lanes per access (512b -> 16)
     localparam int ACC_W = 32;
     localparam int RQ_W  = 48;                 // requant intermediate width (headroom)
+    // Reciprocal / divide intermediate width: a8 (int8) * R (RECIP_Q+1 bits),
+    // plus a sign bit and rounding headroom.
+    localparam int DIV_W = RECIP_Q + 12;
 
     // Op encoding (codes 0..4 match VOP_* in scalar_unit.sv).
     localparam logic [3:0]
@@ -86,7 +113,9 @@ module vpu #(
         VOP_REDUCEMAX   = 4'd7,
         VOP_REDUCESUM   = 4'd8,
         VOP_ELEMENT_MUL = 4'd9,
-        VOP_REQUANT     = 4'd10;
+        VOP_REQUANT     = 4'd10,
+        VOP_SCALAR_ADD  = 4'd11,   // dst[i] = src0[i] + scalar   (broadcast add)
+        VOP_SCALAR_DIV  = 4'd12;   // dst[i] = round(src0[i] * 2**DIV_Q / scalar)
 
     // -------------------------------------------------------------------------
     // Activation LUTs (256 x int8). Preloaded on the host from the reference.
@@ -105,7 +134,8 @@ module vpu #(
         return (o == VOP_DOT) || (o == VOP_ADD) || (o == VOP_ELEMENT_MUL);
     endfunction
     function automatic logic needs_scalar(input logic [3:0] o);
-        return (o == VOP_SCALAR_MUL) || (o == VOP_REQUANT);
+        return (o == VOP_SCALAR_MUL) || (o == VOP_REQUANT) ||
+               (o == VOP_SCALAR_ADD) || (o == VOP_SCALAR_DIV);
     endfunction
     function automatic logic is_reduction(input logic [3:0] o);
         return (o == VOP_DOT) || (o == VOP_REDUCESUM) || (o == VOP_REDUCEMAX);
@@ -129,7 +159,7 @@ module vpu #(
     // FSM.
     // -------------------------------------------------------------------------
     typedef enum logic [3:0] {
-        S_IDLE, S_RD0, S_RD0D, S_RD1, S_RD1D, S_RDS, S_RDSD, S_EXEC, S_WB, S_DONE
+        S_IDLE, S_RD0, S_RD0D, S_RD1, S_RD1D, S_RDS, S_RDSD, S_RECIP, S_EXEC, S_WB, S_DONE
     } state_t;
     state_t state, state_n;
 
@@ -143,6 +173,21 @@ module vpu #(
 
     logic [ACC_W-1:0]  scalar_reg;              // SCALAR_MUL multiplier / REQUANT {n,m0}
     logic signed [ACC_W-1:0] acc;               // reduction accumulator
+
+    // Reciprocal unit (VOP_SCALAR_DIV): one shared restoring divider computing
+    // R = floor(2**RECIP_Q / |scalar|) in RECIP_Q+1 steps after the scalar loads.
+    // A div-by-zero saturates R to all-ones (largest representable reciprocal).
+    logic [RECIP_Q:0]   recip_R;   // reciprocal magnitude, held across all chunks
+    logic               div_neg;   // sign of the divisor (applied per lane in EXEC)
+    logic [RECIP_Q+1:0] div_rem;   // running remainder (headroom for the shift)
+    logic [RECIP_Q:0]   div_quot;  // quotient built MSB-first
+    logic [RECIP_Q:0]   div_n;     // numerator shift register (2**RECIP_Q, then <<1)
+    logic [ACC_W-1:0]   div_d;     // |divisor|
+    logic [5:0]         div_cnt;   // iterations remaining
+
+    // One restoring-division step, shared by every S_RECIP cycle.
+    wire [RECIP_Q+1:0] div_rem_sh = {div_rem[RECIP_Q:0], div_n[RECIP_Q]};
+    wire               div_ge     = (div_rem_sh >= {1'b0, div_d});
 
     // Requant parameters (valid once scalar_reg is loaded).
     wire [M0_W-1:0] rq_m0 = scalar_reg[M0_W-1:0];
@@ -171,12 +216,16 @@ module vpu #(
     logic        [7:0]       res8  [0:LANES-1];    // int8 requant result
     logic signed [ACC_W-1:0] red_val [0:LANES-1];  // per-lane value into reduction
 
+    localparam int DIV_SHIFT = RECIP_Q - DIV_Q;   // post-multiply right shift
+
     logic signed [7:0]       a8;
     logic signed [7:0]       b8;
     logic        [7:0]       idx8;    // unsigned byte for LUT indexing
     logic signed [ACC_W-1:0] a32;
+    logic signed [DIV_W-1:0] div_prod;   // a8 * reciprocal, pre-shift
+    logic signed [DIV_W-1:0] div_q;      // rounded quotient magnitude
     always_comb begin
-        a8 = '0; b8 = '0; idx8 = '0; a32 = '0;
+        a8 = '0; b8 = '0; idx8 = '0; a32 = '0; div_prod = '0; div_q = '0;
         for (int l = 0; l < LANES; l++) begin
             a8   = V_data0[l*8  +: 8];
             b8   = V_data1[l*8  +: 8];
@@ -186,10 +235,19 @@ module vpu #(
             res32[l] = '0;
             res8[l]  = '0;
             red_val[l] = '0;
+            // round(a8 * 2**DIV_Q / |d|) = round((a8 * R) >> (RECIP_Q - DIV_Q)),
+            // then sign-corrected below. R is unsigned, so widen it through 0.
+            div_prod = $signed(a8) * $signed({1'b0, recip_R});
+            // The round term must be *signed*, else the sum goes unsigned and `>>>`
+            // degrades to a logical shift (mirrors requant8's signed `round`).
+            div_q    = (DIV_SHIFT == 0) ? div_prod
+                     : ((div_prod + $signed(DIV_W'(1) <<< (DIV_SHIFT - 1))) >>> DIV_SHIFT);
             unique case (op_r)
                 VOP_ADD:         res32[l] = ACC_W'(a8) + ACC_W'(b8);
                 VOP_ELEMENT_MUL: res32[l] = a8 * b8;
                 VOP_SCALAR_MUL:  res32[l] = a8 * $signed(scalar_reg);
+                VOP_SCALAR_ADD:  res32[l] = ACC_W'(a8) + $signed(scalar_reg);
+                VOP_SCALAR_DIV:  res32[l] = div_neg ? ACC_W'(-div_q) : ACC_W'(div_q);
                 VOP_RELU:        res32[l] = (a8 > 0) ? ACC_W'(a8) : '0;
                 VOP_SQUARE:      res32[l] = a8 * a8;
                 VOP_GELU:        res32[l] = ACC_W'(gelu_rom[idx8]);
@@ -288,7 +346,10 @@ module vpu #(
             S_RD1:  state_n = S_RD1D;
             S_RD1D: state_n = S_EXEC;
             S_RDS:  state_n = S_RDSD;
-            S_RDSD: state_n = S_EXEC;
+            S_RDSD: if (op_r == VOP_SCALAR_DIV) state_n = S_RECIP;
+                    else                        state_n = S_EXEC;
+            S_RECIP: if (div_cnt == 6'd1) state_n = S_EXEC;
+                     else                 state_n = S_RECIP;
             S_EXEC: begin
                         if (last_chunk) begin
                             if (is_reduction(op_r)) state_n = S_WB;
@@ -319,6 +380,13 @@ module vpu #(
             acc           <= '0;
             V_data0       <= '0;
             V_data1       <= '0;
+            recip_R       <= '0;
+            div_neg       <= 1'b0;
+            div_rem       <= '0;
+            div_quot      <= '0;
+            div_n         <= '0;
+            div_d         <= '0;
+            div_cnt       <= '0;
         end else begin
             state <= state_n;
 
@@ -339,8 +407,25 @@ module vpu #(
                 S_RD0D: V_data0 <= V_rdata;
                 S_RD1D: V_data1 <= V_rdata;
                 S_RDSD: begin
-                    scalar_reg    <= V_rdata[ACC_W-1:0];   // multiplier / {n,m0}
+                    scalar_reg    <= V_rdata[ACC_W-1:0];   // multiplier / {n,m0} / divisor
                     scalar_loaded <= 1'b1;
+                    // Kick off the reciprocal for SCALAR_DIV: |d|, numerator 2**RECIP_Q.
+                    div_neg  <= V_rdata[ACC_W-1];
+                    div_d    <= V_rdata[ACC_W-1] ? (~V_rdata[ACC_W-1:0] + 1'b1)
+                                                 :   V_rdata[ACC_W-1:0];
+                    div_rem  <= '0;
+                    div_quot <= '0;
+                    div_n    <= {1'b1, {RECIP_Q{1'b0}}};   // 2**RECIP_Q
+                    div_cnt  <= 6'(RECIP_Q + 1);
+                end
+
+                // Restoring division: one quotient bit (MSB-first) per cycle.
+                S_RECIP: begin
+                    div_rem  <= div_ge ? (div_rem_sh - {1'b0, div_d}) : div_rem_sh;
+                    div_quot <= {div_quot[RECIP_Q-1:0], div_ge};
+                    div_n    <= div_n << 1;
+                    div_cnt  <= div_cnt - 1'b1;
+                    if (div_cnt == 6'd1) recip_R <= {div_quot[RECIP_Q-1:0], div_ge};
                 end
 
                 S_EXEC: begin

@@ -5,7 +5,9 @@
 // read: data valid the cycle after V_re; byte-strobed single-cycle write) and
 // checks every VPU op against an in-testbench reference:
 //
-//   elementwise (int8 -> int32): ADD, ELEMENT_MUL, SCALAR_MUL, RELU, SQUARE
+//   elementwise (int8 -> int32): ADD, ELEMENT_MUL, SCALAR_MUL, SCALAR_ADD, RELU,
+//                                SQUARE
+//   scalar div  (int8 -> int32): SCALAR_DIV (reciprocate-then-multiply, Q15)
 //   LUT         (int8 -> int32): GELU, EXP
 //   reductions  (int8 -> int32 scalar): DOT, REDUCESUM, REDUCEMAX
 //   requant     (int32 -> int8): REQUANT
@@ -28,14 +30,17 @@ module vpu_tb;
     localparam int ADDR_W       = 16;
     localparam int M0_W         = 12;
     localparam int N_W          = 4;
+    localparam int RECIP_Q      = 31;                 // must match the DUT instance
+    localparam int DIV_Q        = 15;
     localparam int LANES        = SCRATCHPAD_W / 4;   // 16 int32 lanes
 
     // ---- Op encoding (matches vpu.sv) ---------------------------------------
     localparam logic [3:0]
-        VOP_DOT         = 4'd0,  VOP_ADD       = 4'd1,  VOP_SCALAR_MUL = 4'd2,
-        VOP_RELU        = 4'd3,  VOP_GELU      = 4'd4,  VOP_SQUARE     = 4'd5,
-        VOP_EXP         = 4'd6,  VOP_REDUCEMAX = 4'd7,  VOP_REDUCESUM  = 4'd8,
-        VOP_ELEMENT_MUL = 4'd9,  VOP_REQUANT   = 4'd10;
+        VOP_DOT         = 4'd0,  VOP_ADD        = 4'd1,  VOP_SCALAR_MUL = 4'd2,
+        VOP_RELU        = 4'd3,  VOP_GELU       = 4'd4,  VOP_SQUARE     = 4'd5,
+        VOP_EXP         = 4'd6,  VOP_REDUCEMAX  = 4'd7,  VOP_REDUCESUM  = 4'd8,
+        VOP_ELEMENT_MUL = 4'd9,  VOP_REQUANT    = 4'd10, VOP_SCALAR_ADD = 4'd11,
+        VOP_SCALAR_DIV  = 4'd12;
 
     // ---- Scratchpad address map (generous spacing; int8 chunks over-read) ---
     localparam logic [ADDR_W-1:0] A_ADDR  = 16'h1000;  // src0
@@ -196,10 +201,24 @@ module vpu_tb;
             VOP_ADD:         return a + b;
             VOP_ELEMENT_MUL: return a * b;
             VOP_SCALAR_MUL:  return a * scal;
+            VOP_SCALAR_ADD:  return a + scal;
             VOP_RELU:        return (a > 0) ? a : 0;
             VOP_SQUARE:      return a * a;
             default:         return 0;
         endcase
+    endfunction
+
+    // Reference for SCALAR_DIV: round(a * 2**DIV_Q / d), mirroring vpu.sv's
+    // reciprocate-then-multiply — R = floor(2**RECIP_Q / |d|), a*R rounded down by
+    // (RECIP_Q-DIV_Q) with an arithmetic shift, then sign-corrected for d.
+    function automatic int ref_div(input int a, input int d);
+        longint absd, R, prod, rnd, shifted;
+        absd    = (d < 0) ? -longint'(d) : longint'(d);
+        R       = (longint'(1) << RECIP_Q) / absd;           // floor; d != 0 in tests
+        prod    = longint'(a) * R;
+        rnd     = (RECIP_Q == DIV_Q) ? 0 : (longint'(1) << (RECIP_Q - DIV_Q - 1));
+        shifted = (prod + rnd) >>> (RECIP_Q - DIV_Q);
+        return int'((d < 0) ? -shifted : shifted);
     endfunction
 
     // Reference for REQUANT: clip((x*m0 + round) >> n), arithmetic shift.
@@ -263,6 +282,16 @@ module vpu_tb;
         $display("[%s] vlen=%0d  result=%0d  (errors so far: %0d)", tag, vlen, exp, errors);
     endtask
 
+    task automatic test_div(input int vlen, input int d, input string tag);
+        gen_i8(vlen);
+        for (int i = 0; i < vlen; i++) put8(A_ADDR + i, tv_a[i]);
+        put32(SC_ADDR, d);
+        run_op(VOP_SCALAR_DIV, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
+        for (int i = 0; i < vlen; i++)
+            exp32(D_ADDR + i*4, ref_div(tv_a[i], d), tag);
+        $display("[%s] vlen=%0d d=%0d  (errors so far: %0d)", tag, vlen, d, errors);
+    endtask
+
     task automatic test_requant(input int vlen, input int m0, input int n, input string tag);
         gen_i32(vlen);
         for (int i = 0; i < vlen; i++) put32(A_ADDR + i*4, tv32[i]);
@@ -302,8 +331,17 @@ module vpu_tb;
         test_elem(VOP_ELEMENT_MUL, 40, 0,   "ELEMENT_MUL");
         test_elem(VOP_SCALAR_MUL,  40, -7,  "SCALAR_MUL-neg");
         test_elem(VOP_SCALAR_MUL,  33, 100, "SCALAR_MUL-pos");
+        test_elem(VOP_SCALAR_ADD,  40, -50, "SCALAR_ADD-neg");   // softmax x-max
+        test_elem(VOP_SCALAR_ADD,  33, 64,  "SCALAR_ADD-pos");
         test_elem(VOP_RELU,        40, 0,   "RELU");
         test_elem(VOP_SQUARE,      40, 0,   "SQUARE");
+
+        // Scalar divide (reciprocate-then-multiply, Q15 result). Positive and
+        // negative divisors, a softmax-sized denominator, and a partial tail.
+        test_div(40, 100,  "SCALAR_DIV-pos");
+        test_div(33, -37,  "SCALAR_DIV-neg");
+        test_div(48, 2039, "SCALAR_DIV-softmax");
+        test_div( 7, 3,    "SCALAR_DIV-tail");
 
         // LUT activations.
         test_lut(VOP_GELU, 40, "GELU");

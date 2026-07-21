@@ -1,0 +1,65 @@
+; tiled_matmul.tpu — a matmul whose contraction dim is larger than the array,
+; split into TILES passes and accumulated in the MXU's int32 C buffer.
+;
+; This is the tile loop the scalar unit runs for matmuls bigger than ROWS
+; (mxu.md §6). It's the control-flow example: li / adds / cmps / branch / jmp
+; drive the loop; the matmul flags select the accumulate/requant behaviour per
+; tile:
+;
+;     tile 0        : matmul            write int32 partial (no acc, no requant)
+;     tiles 1..n-2  : matmul.acc        add this tile's partial into C
+;     tile n-1      : matmul.acc.rq     add, then requant int32->int8 on store
+;
+; Each pass advances the activation and weight base pointers by one tile.
+;
+;     python ../assembler.py tiled_matmul.tpu --listing
+
+.equ ACT    0x0000      ; activation tiles, back to back
+.equ WGT    0x1000      ; weight tiles, back to back
+.equ OUT    0x3000      ; int32 accumulator C, then requantized int8 result
+.equ RQW    0x7000      ; requant {m0,n} word
+
+.equ T      4           ; token count (MXU columns)
+.equ TILES  4           ; number of contraction tiles
+.equ ATILE  0x0200      ; bytes to advance the activation pointer per tile
+.equ WTILE  0x0020      ; bytes to advance the weight pointer per tile
+.equ LAST   TILES - 1   ; index of the final tile
+
+.reg act    r1
+.reg wgt    r2
+.reg out    r3
+.reg i      r4          ; tile index
+.reg last   r5          ; == LAST
+.reg astep  r6
+.reg wstep  r7
+.reg one    r8
+
+    setcfg  tlen,   T
+    setcfg  scalar, RQW
+
+    li  act,   ACT
+    li  wgt,   WGT
+    li  out,   OUT
+    li  last,  LAST
+    li  astep, ATILE
+    li  wstep, WTILE
+    li  one,   1
+
+    ; --- tile 0: initialise the int32 accumulator -------------------------
+    matmul  out, act, wgt       ; C = A0 @ W0   (no accumulate, no requant)
+    adds    act, act, astep
+    adds    wgt, wgt, wstep
+    li      i, 1
+
+loop:
+    cmps    i, last             ; while i < LAST: accumulate middle tiles
+    bge     final
+    matmul.acc  out, act, wgt   ; C += Ai @ Wi
+    adds    act, act, astep
+    adds    wgt, wgt, wstep
+    adds    i, i, one
+    jmp     loop
+
+final:
+    matmul.acc.rq  out, act, wgt ; C += A_last @ W_last, then requant int32->int8
+    halt
