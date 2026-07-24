@@ -4,9 +4,17 @@
 //
 // Exercises the fully integrated core (scalar_unit + mxu + vpu + scratchpad,
 // BRAM working memory) the way a host actually drives it: load an *assembled*
-// program and sample input tensors from $readmemh memory files, stream them into
-// the DUT over the top-level host ports, pulse host_run, then read the results
-// back out of BRAM and compare — no direct poking of any unit's internal ports.
+// program and sample input tensors from $readmemh memory files, load them into
+// scratchpad, pulse host_run, then read the results back out of BRAM and compare.
+//
+// Scratchpad preload/readback. The old top-level `host_mem_*` port is gone — the
+// DMA engine now owns the scratchpad's single DMA port. So this TB seeds and
+// reads back the scratchpad by *backdoor* hierarchical access into the storage
+// array (`dut.u_scratchpad.g_mem.mem[...]`), which is a zero-time poke/peek of
+// BRAM and keeps this test's flow identical to before. A behavioral async-SRAM
+// chip model is attached to the new external-DRAM pins (`sram_*`) so any program
+// that issues DMA Read/WriteMemory ops still functions (the default program does
+// not touch DRAM). Compute-unit dispatch ports are still never poked directly.
 //
 // The golden reference is produced entirely outside the RTL: accel/tpulang
 // assembles a .tpu program (assembler.py) and simulates the instruction set in
@@ -30,7 +38,8 @@
 // The geometry below MUST match gen_vectors.py (ROWS/COLS/T).
 //
 // Run:  make TEST=tpu_top RTL="../rtl/tpu_top.sv ../rtl/scalar_unit.sv \
-//            ../rtl/mxu.sv ../rtl/vpu.sv ../rtl/scratchpad.sv"
+//            ../rtl/mxu.sv ../rtl/vpu.sv ../rtl/scratchpad.sv \
+//            ../rtl/dma.sv ../rtl/sram.sv"
 // Override a vector file:  iverilog ... -DPROG_FILE='"vectors/other_prog.hex"'
 // -----------------------------------------------------------------------------
 
@@ -58,7 +67,8 @@ module tpu_top_tb;
     localparam int REG_AW    = 5;
     localparam int M0_W      = 12;
     localparam int N_W       = 4;
-    localparam int DMA_BYTES = 64;     // host memory port width
+    localparam int MEM_ADDR_W = 19;    // external SRAM byte address (DUT default)
+    localparam int MEM_DATA_W = 8;     // external SRAM data width (bits)
 
     localparam int DEPTH     = (1 << ADDR_W);      // scratchpad size in bytes
     localparam int IMEM_DEP  = (1 << IMEM_AW);     // instruction memory depth
@@ -86,54 +96,56 @@ module tpu_top_tb;
     logic [CFG_AW-1:0]     cfg_waddr;
     logic [XLEN-1:0]       cfg_wdata;
 
-    logic                  host_mem_re;
-    logic [ADDR_W-1:0]     host_mem_raddr;
-    logic [DMA_BYTES*8-1:0] host_mem_rdata;
-    logic                  host_mem_we;
-    logic [ADDR_W-1:0]     host_mem_waddr;
-    logic [DMA_BYTES*8-1:0] host_mem_wdata;
-    logic [DMA_BYTES-1:0]   host_mem_wstrb;
+    // External DRAM pins (driven by the DUT's internal DMA + sram_controller).
+    wire  [MEM_ADDR_W-1:0] sram_addr;
+    wire  [MEM_DATA_W-1:0] sram_data;   // inout: bus shared with the chip model
+    wire                   sram_we, sram_ce, sram_oen;
 
     tpu_top #(
         .ROWS(ROWS), .COLS(COLS), .VPU_BYTES(VPU_BYTES), .ADDR_W(ADDR_W),
         .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W),
         .REG_AW(REG_AW), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
-        .MEM_STYLE("BRAM")
+        .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W)
     ) dut (
         .clk(clk), .rst_n(rst_n),
         .host_run(host_run), .boot_pc(boot_pc),
         .busy(busy), .done(done), .pc_dbg(pc_dbg),
         .imem_we(imem_we), .imem_waddr(imem_waddr), .imem_wdata(imem_wdata),
         .cfg_we(cfg_we), .cfg_waddr(cfg_waddr), .cfg_wdata(cfg_wdata),
-        .host_mem_re(host_mem_re), .host_mem_raddr(host_mem_raddr),
-        .host_mem_rdata(host_mem_rdata),
-        .host_mem_we(host_mem_we), .host_mem_waddr(host_mem_waddr),
-        .host_mem_wdata(host_mem_wdata), .host_mem_wstrb(host_mem_wstrb)
+        // External DRAM interface
+        .sram_addr(sram_addr), .sram_data(sram_data),
+        .sram_we(sram_we), .sram_ce(sram_ce), .sram_oen(sram_oen)
     );
 
     // -------------------------------------------------------------------------
-    // Host memory helpers (drive the top-level host_mem_* port).
+    // Behavioral async SRAM chip model on the external-DRAM pins (matches
+    // sram_tb.sv / dma_tb.sv). The chip drives the bus only when selected, output
+    // enabled, and not being written; otherwise it releases to Hi-Z. A write
+    // commits on the WE# rising edge. Present so DMA-using programs work; the
+    // default program leaves it idle.
+    // -------------------------------------------------------------------------
+    localparam int SRAM_SZ = 1 << MEM_ADDR_W;
+    logic [MEM_DATA_W-1:0] sram_mem [0:SRAM_SZ-1];
+
+    wire mem_drives = (sram_ce == 1'b0) && (sram_oen == 1'b0) && (sram_we == 1'b1);
+    assign #3 sram_data = mem_drives ? sram_mem[sram_addr] : {MEM_DATA_W{1'bz}};
+    always @(posedge sram_we) if (sram_ce == 1'b0) sram_mem[sram_addr] <= sram_data;
+
+    // -------------------------------------------------------------------------
+    // Scratchpad preload/readback via backdoor hierarchical access to the storage
+    // array. Zero-time poke/peek: preload runs before host_run (no compute writer
+    // is active) and readback runs after HALT (memory is stable). Byte k of a word
+    // lives at addr+k, matching the scratchpad read port's window layout; the
+    // ADDR_W cast reproduces its mod-DEPTH wrap.
     // -------------------------------------------------------------------------
     task automatic spad_wr_byte(input logic [ADDR_W-1:0] addr, input logic [7:0] d);
-        @(negedge clk);
-        host_mem_we    = 1'b1;
-        host_mem_waddr = addr;
-        host_mem_wdata = '0;  host_mem_wdata[7:0] = d;
-        host_mem_wstrb = '0;  host_mem_wstrb[0]   = 1'b1;   // one byte at addr
-        @(negedge clk);
-        host_mem_we    = 1'b0;
-        host_mem_wstrb = '0;
+        dut.u_scratchpad.g_mem.mem[addr] = d;
     endtask
 
-    // Read a 32-bit window starting at addr (byte k in host_mem_rdata[k*8 +: 8]).
+    // Read a 32-bit window starting at addr (byte k at addr+k).
     task automatic spad_rd(input logic [ADDR_W-1:0] addr, output logic [31:0] d);
-        @(negedge clk);
-        host_mem_re    = 1'b1;
-        host_mem_raddr = addr;
-        @(posedge clk);         // scratchpad latches mem[addr..] into rdata here
-        @(negedge clk);         // rdata now stable
-        host_mem_re    = 1'b0;
-        d = host_mem_rdata[31:0];
+        for (int k = 0; k < 4; k++)
+            d[k*8 +: 8] = dut.u_scratchpad.g_mem.mem[ADDR_W'(addr + k)];
     endtask
 
     task automatic load_instr(input logic [IMEM_AW-1:0] a, input logic [31:0] w);
@@ -228,9 +240,6 @@ module tpu_top_tb;
         host_run = 1'b0; boot_pc = '0;
         imem_we  = 1'b0; imem_waddr = '0; imem_wdata = '0;
         cfg_we   = 1'b0; cfg_waddr  = '0; cfg_wdata  = '0;
-        host_mem_re = 1'b0; host_mem_raddr = '0;
-        host_mem_we = 1'b0; host_mem_waddr = '0;
-        host_mem_wdata = '0; host_mem_wstrb = '0;
 
         repeat (4) @(posedge clk);
         rst_n = 1'b1;

@@ -136,31 +136,26 @@ module dma_tb;
     endtask
 
     // Read one scratchpad byte at absolute address `a` through the DMA port.
-    task automatic spad_read_byte(input [SCRATCHPAD_ADDR_W-1:0] a,
-                                  output [7:0] b);
-        @(negedge clk);
-        force u_spad.dma_re    = 1'b1;
-        force u_spad.dma_raddr = a;
-        @(negedge clk);
-        force u_spad.dma_re    = 1'b0;
-        @(negedge clk);                 // rdata valid now
-        b = u_spad.dma_rdata[7:0];
-        release u_spad.dma_re;
-        release u_spad.dma_raddr;
+    // NOTE: static (not automatic): `a`/`b` are referenced in `force` below, which
+    // may not name automatic variables. Called sequentially, so no reentrancy risk.
+    task spad_read_byte(input [SCRATCHPAD_ADDR_W-1:0] a,
+                               output [7:0] b);
+        // @(negedge clk);
+        // force u_spad.dma_re    = 1'b1;
+        // force u_spad.dma_raddr = a;
+        // @(negedge clk);
+        // force u_spad.dma_re    = 1'b0;
+        // @(negedge clk);                 // rdata valid now
+        // b = u_spad.dma_rdata[7:0];
+        // release u_spad.dma_re;
+        // release u_spad.dma_raddr;
+        b = u_spad.g_mem.mem[a];
     endtask
 
     // Write one scratchpad byte at absolute address `a` through the DMA port.
-    task automatic spad_write_byte(input [SCRATCHPAD_ADDR_W-1:0] a, input [7:0] b);
-        @(negedge clk);
-        force u_spad.dma_we    = 1'b1;
-        force u_spad.dma_waddr = a;
-        force u_spad.dma_wdata = { {(SPAD_BYTES-1){8'b0}}, b };
-        force u_spad.dma_wstrb = SPAD_BYTES'(1);
-        @(negedge clk);
-        release u_spad.dma_we;
-        release u_spad.dma_waddr;
-        release u_spad.dma_wdata;
-        release u_spad.dma_wstrb;
+    // static (not automatic): `a`/`b` are referenced in `force` below.
+    task static spad_write_byte(input [SCRATCHPAD_ADDR_W-1:0] a, input [7:0] b);
+        u_spad.g_mem.mem[a] = b; 
     endtask
 
     // -------------------------------------------------------------------------

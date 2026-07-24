@@ -23,19 +23,17 @@
 // entirely name-matched wiring.
 //
 // Memory. The top-level working memory is FPGA BRAM: the scratchpad is
-// instantiated with MEM_STYLE="BRAM" (scratchpad.md §6). DRAM / weight streaming
-// is out of scope here — there is no DMA engine block yet — so the scratchpad's
-// DMA port is brought out to the top level as a host preload/readback interface
-// (`host_mem_*`), letting a testbench or host fill activations/weights and read
-// results back out of BRAM directly.
+// instantiated with MEM_STYLE="BRAM" (scratchpad.md §6). External DRAM is the
+// async SRAM chip: the DMA engine (dma.sv) owns the scratchpad's DMA port and,
+// behind it, a single sram_controller whose chip pins (`sram_*`) are brought out
+// to the top level. The scalar unit's Read/WriteMemory ops dispatch to the DMA
+// engine, which byte-moves DRAM <-> scratchpad. The scalar unit only emits a
+// 16-bit (ADDR_W) DRAM address, so it is zero-extended to MEM_ADDR_W at the DMA.
 //
-// Deliberately left out (see notes at the stub tie-offs below):
+// Deliberately left out (see notes at the stub tie-off below):
 //   * comms / inter-TPU LINK — the scalar unit's WriteNeighbor dispatch is
 //     stubbed (`nb_done` tied high) so a LINK op is a completing no-op. Wiring a
 //     real comms block (comms.md) is a later step.
-//   * DMA engine — the scalar unit's Read/WriteMemory dispatch is likewise
-//     stubbed (`dma_done` tied high). Memory is moved in/out through the
-//     `host_mem_*` port instead until a DMA engine lands.
 //
 // Everything is parameterized off the systolic array size (ROWS/COLS), the VPU
 // port width, and the scalar datapath; the scratchpad's per-port byte widths are
@@ -59,6 +57,11 @@ module tpu_top #(
     parameter int REG_AW   = 5,     // scalar register file: 2**REG_AW regs
     parameter int IMEM_AW  = 10,    // instruction memory depth = 2**IMEM_AW
     parameter int CFG_AW   = 4,     // config register file: 2**CFG_AW regs
+
+    // ---- External DRAM (async SRAM chip) ------------------------------------
+    parameter int MEM_ADDR_W = 19,   // external SRAM byte address (CMOD A7: 512K×8)
+    parameter int MEM_DATA_W = 8,    // external SRAM data width (bits) = 1 byte
+    parameter int SRAM_CPA   = 2,    // sram_controller CLOCKS_PER_ACCESS
 
     // ---- Memory / init ------------------------------------------------------
     parameter     MEM_STYLE = "BRAM",  // top-level working memory primitive
@@ -94,15 +97,15 @@ module tpu_top #(
     input  logic [CFG_AW-1:0]    cfg_waddr,
     input  logic [XLEN-1:0]      cfg_wdata,
 
-    // ---- Host memory port: scratchpad DMA port brought out for preload /
-    //      readback (stands in for the future DMA engine) ---------------------
-    input  logic                  host_mem_re,
-    input  logic [ADDR_W-1:0]     host_mem_raddr,
-    output logic [DMA_BYTES*8-1:0] host_mem_rdata,   // valid the cycle after re
-    input  logic                  host_mem_we,
-    input  logic [ADDR_W-1:0]     host_mem_waddr,
-    input  logic [DMA_BYTES*8-1:0] host_mem_wdata,
-    input  logic [DMA_BYTES-1:0]   host_mem_wstrb
+    // ---- External DRAM pins: async SRAM chip interface ----------------------
+    //      Driven by the on-chip DMA engine through its sram_controller. The
+    //      scalar unit's Read/WriteMemory ops now move data over this port
+    //      (host_mem_* preload path removed — DMA owns the scratchpad DMA port).
+    output logic [MEM_ADDR_W-1:0] sram_addr,
+    inout  wire  [MEM_DATA_W-1:0] sram_data,   // inout must be a net, not a var
+    output logic                  sram_we,
+    output logic                  sram_ce,
+    output logic                  sram_oen
 );
 
     // =========================================================================
@@ -154,10 +157,27 @@ module tpu_top #(
     logic [V_BYTES*8-1:0] V_wdata;
     logic [V_BYTES-1:0]  V_wstrb;
 
-    // ---- scalar_unit DMA / LINK dispatch (stubbed — see tie-offs below) -----
+    // ---- scalar_unit → DMA dispatch -----------------------------------------
     logic                dma_start, dma_write;
     logic [ADDR_W-1:0]   dma_scratch_addr, dma_dram_addr;
     logic [15:0]         dma_len;
+    logic                dma_busy, dma_done;
+
+    // ---- DMA ↔ scratchpad DMA port ------------------------------------------
+    logic                 spad_dma_re;
+    logic [ADDR_W-1:0]    spad_dma_raddr;
+    logic [DMA_BYTES*8-1:0] spad_dma_rdata;
+    logic                 spad_dma_we;
+    logic [ADDR_W-1:0]    spad_dma_waddr;
+    logic [DMA_BYTES*8-1:0] spad_dma_wdata;
+    logic [DMA_BYTES-1:0]   spad_dma_wstrb;
+
+    // ---- DMA ↔ sram_controller (user side) ----------------------------------
+    logic                  mem_start, mem_we, mem_busy, mem_done;
+    logic [MEM_ADDR_W-1:0] mem_addr;
+    logic [MEM_DATA_W-1:0] mem_din, mem_dout;
+
+    // ---- scalar_unit → LINK dispatch (comms left out — stubbed below) -------
     logic                nb_start;
     logic [1:0]          nb_dir;
     logic [ADDR_W-1:0]   nb_src_addr, nb_dst_addr;
@@ -218,14 +238,14 @@ module tpu_top #(
         .vpu_busy   (vpu_busy),
         .vpu_done   (vpu_done),
 
-        // DMA dispatch (no engine yet — stubbed below)
+        // DMA dispatch → DMA engine (below)
         .dma_start        (dma_start),
         .dma_write        (dma_write),
         .dma_scratch_addr (dma_scratch_addr),
         .dma_dram_addr    (dma_dram_addr),
         .dma_len          (dma_len),
-        .dma_busy         (1'b0),      // stub: no DMA engine integrated
-        .dma_done         (1'b1),      // stub: Read/WriteMemory completes as a no-op
+        .dma_busy         (dma_busy),
+        .dma_done         (dma_done),
 
         // Inter-TPU LINK dispatch (comms left out — stubbed below)
         .nb_start    (nb_start),
@@ -236,9 +256,10 @@ module tpu_top #(
         .nb_done     (1'b1)            // stub: WriteNeighbor completes as a no-op
     );
 
-    // dma_*/nb_* dispatch outputs are intentionally unconnected: no DMA or comms
-    // block is integrated yet. Their `done` inputs are tied high above so a
-    // program that issues those ops does not deadlock (the op is a no-op).
+    // nb_* dispatch outputs are intentionally unconnected: no comms block is
+    // integrated yet. Its `nb_done` input is tied high above so a program that
+    // issues a LINK op does not deadlock (the op is a no-op). The DMA dispatch is
+    // now wired to the real DMA engine below.
 
     // =========================================================================
     // MXU — weight-stationary ternary systolic matrix unit.
@@ -320,8 +341,7 @@ module tpu_top #(
 
     // =========================================================================
     // Scratchpad — shared BRAM working memory (single storage owner).
-    // The DMA port is brought out to the top level as the host preload/readback
-    // interface (host_mem_*), standing in for a future DMA engine.
+    // The DMA port is owned by the on-chip DMA engine (instantiated below).
     // =========================================================================
     scratchpad #(
         .MEM_STYLE (MEM_STYLE),
@@ -372,14 +392,86 @@ module tpu_top #(
         .s_wdata (s_wdata),
         .s_rdata (s_rdata),
 
-        // DMA port → host preload/readback
-        .dma_re    (host_mem_re),
-        .dma_raddr (host_mem_raddr),
-        .dma_rdata (host_mem_rdata),
-        .dma_we    (host_mem_we),
-        .dma_waddr (host_mem_waddr),
-        .dma_wdata (host_mem_wdata),
-        .dma_wstrb (host_mem_wstrb)
+        // DMA port → DMA engine
+        .dma_re    (spad_dma_re),
+        .dma_raddr (spad_dma_raddr),
+        .dma_rdata (spad_dma_rdata),
+        .dma_we    (spad_dma_we),
+        .dma_waddr (spad_dma_waddr),
+        .dma_wdata (spad_dma_wdata),
+        .dma_wstrb (spad_dma_wstrb)
+    );
+
+    // =========================================================================
+    // DMA engine — byte-moves DRAM <-> scratchpad on scalar Read/WriteMemory.
+    // Owns the scratchpad DMA port (above) and the sram_controller (below). The
+    // scalar unit's DRAM address is ADDR_W wide; zero-extend to the wider
+    // external-SRAM byte address.
+    // =========================================================================
+    dma #(
+        .MEM_ADDR_W        (MEM_ADDR_W),
+        .SCRATCHPAD_ADDR_W (ADDR_W),
+        .MEM_DATA_W        (MEM_DATA_W),
+        .SCRATCHPAD_BYTES  (DMA_BYTES)
+    ) u_dma (
+        .clk   (clk),
+        .rst_n (rst_n),
+
+        // sram_controller interface (user side)
+        .sram_start (mem_start),
+        .sram_we    (mem_we),
+        .sram_addr  (mem_addr),
+        .sram_din   (mem_din),
+        .sram_dout  (mem_dout),
+        .sram_busy  (mem_busy),
+        .sram_done  (mem_done),
+
+        // scratchpad DMA port
+        .scratchpad_re    (spad_dma_re),
+        .scratchpad_raddr (spad_dma_raddr),
+        .scratchpad_rdata (spad_dma_rdata),
+        .scratchpad_we    (spad_dma_we),
+        .scratchpad_waddr (spad_dma_waddr),
+        .scratchpad_wdata (spad_dma_wdata),
+        .scratchpad_wstrb (spad_dma_wstrb),
+
+        // scalar-unit dispatch (issue-and-wait)
+        .dma_start        (dma_start),
+        .dma_write        (dma_write),
+        .dma_scratch_addr (dma_scratch_addr),
+        .dma_dram_addr    (MEM_ADDR_W'(dma_dram_addr)),  // zero-extend ADDR_W → MEM_ADDR_W
+        .dma_len          (dma_len),
+        .dma_busy         (dma_busy),
+        .dma_done         (dma_done)
+    );
+
+    // =========================================================================
+    // SRAM controller — single owner is the DMA engine. Its chip-side pins are
+    // the top-level external DRAM interface (sram_*).
+    // =========================================================================
+    sram_controller #(
+        .CLOCKS_PER_ACCESS (SRAM_CPA),
+        .ADDR_W            (MEM_ADDR_W),
+        .DATA_W            (MEM_DATA_W)
+    ) u_sram (
+        .clk   (clk),
+        .rst_n (rst_n),
+
+        // user side ← DMA engine
+        .start (mem_start),
+        .we    (mem_we),
+        .addr  (mem_addr),
+        .din   (mem_din),
+        .dout  (mem_dout),
+        .busy  (mem_busy),
+        .done  (mem_done),
+
+        // chip side → top-level pins
+        .sram_addr (sram_addr),
+        .sram_data (sram_data),
+        .sram_we   (sram_we),
+        .sram_ce   (sram_ce),
+        .sram_oen  (sram_oen)
     );
 
 endmodule
