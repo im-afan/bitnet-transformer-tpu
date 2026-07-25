@@ -17,14 +17,14 @@
 // model on the external-DRAM pins.
 //
 // The program must therefore be self-contained over DRAM (stage inputs in with
-// rdmem, spill outputs out with wrmem). examples/relu_layer_dma.tpu is that
-// program; it uses identical DRAM and scratchpad addresses so the ISS golden
-// (which models DMA as a no-op with tensors pre-placed in the scratchpad) matches
-// the real DMA byte-copy. The three $readmemh vector files are produced by
-// gen_vectors.py exactly as for tpu_top_tb; regenerate them (or use the Makefile
-// `uart` target) after editing the program:
+// rdmem, spill outputs out with wrmem) — all the examples/ programs now are. Each
+// uses identical DRAM and scratchpad addresses so the ISS golden (which models DMA
+// as a no-op with tensors pre-placed in the scratchpad) matches the real DMA
+// byte-copy. The three $readmemh vector files are produced by gen_vectors.py
+// exactly as for tpu_top_tb; regenerate them (or use the Makefile `uart` target)
+// after editing the program:
 //
-//     cd ../../tpulang && python gen_vectors.py -p examples/relu_layer_dma.tpu
+//     cd ../../tpulang && python gen_vectors.py -p examples/relu_layer.tpu -o ../tpu/tb/vectors_uart
 //
 // Geometry below MUST match gen_vectors.py (ROWS/COLS/T). A small UART_CPB keeps
 // the bit-banged serial traffic fast in simulation; the FSM is baud-agnostic.

@@ -14,10 +14,10 @@
 #
 # UART end-to-end (one command: assemble a tpulang program, generate its golden
 # vectors, then drive the whole thing into the DUT over the UART pins and check):
-#   make uart                          default program (examples/relu_layer_dma.tpu)
+#   make uart                          default program (examples/relu_layer.tpu)
 #   make uart PROG=examples/foo.tpu    your own program (path relative to tpulang/)
-# The program must be self-contained over DRAM (rdmem inputs in, wrmem outputs out)
-# and match gen_vectors.py's geometry/address map — relu_layer_dma.tpu is the template.
+# All examples are self-contained over DRAM (rdmem inputs in, wrmem outputs out);
+# a custom program must also match gen_vectors.py's geometry/address map.
 
 TEST ?= mxu
 
@@ -29,7 +29,7 @@ IVERILOG := iverilog -g2012 -Wall
 VVP      := vvp
 
 # --- UART end-to-end wiring ---------------------------------------------------
-PROG     ?= examples/relu_layer_dma.tpu
+PROG     ?= examples/relu_layer.tpu
 TPULANG  := ../../tpulang
 UART_TOP := tpu_top_uart_tb
 UART_RTL := ../rtl/tpu_top.sv ../rtl/scalar_unit.sv ../rtl/mxu.sv ../rtl/vpu.sv \

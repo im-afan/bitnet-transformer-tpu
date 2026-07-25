@@ -10,7 +10,11 @@ Detailed per-component design notes (this file is the overview):
 | [mxu.md](mxu.md)                 | Weight-stationary ternary systolic matrix unit        |
 | [vpu.md](vpu.md)                 | SIMD vector unit: activations, reductions, attention  |
 | [comms.md](comms.md)             | 2D inter-TPU link for scale-out                       |
-| [scalar_unit.md](scalar_unit.md) | Control processor + ISA                               |
+| [scalar_unit.md](scalar_unit.md) | Control processor microarchitecture                   |
+| [isa.md](isa.md)                 | Instruction set reference — encoding, opcodes, semantics |
+
+The assembly language that lowers 1:1 onto the ISA is documented in
+[`accel/tpulang/README.md`](../../tpulang/README.md).
 
 ## 1. Overview
 

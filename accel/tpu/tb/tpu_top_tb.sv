@@ -7,14 +7,14 @@
 // program and sample input tensors from $readmemh memory files, load them into
 // scratchpad, pulse host_run, then read the results back out of BRAM and compare.
 //
-// Scratchpad preload/readback. The old top-level `host_mem_*` port is gone — the
-// DMA engine now owns the scratchpad's single DMA port. So this TB seeds and
-// reads back the scratchpad by *backdoor* hierarchical access into the storage
-// array (`dut.u_scratchpad.g_mem.mem[...]`), which is a zero-time poke/peek of
-// BRAM and keeps this test's flow identical to before. A behavioral async-SRAM
-// chip model is attached to the new external-DRAM pins (`sram_*`) so any program
-// that issues DMA Read/WriteMemory ops still functions (the default program does
-// not touch DRAM). Compute-unit dispatch ports are still never poked directly.
+// DRAM preload/readback. The example programs are now self-contained over DRAM:
+// each stages its inputs in from external DRAM (rdmem) and spills its outputs back
+// (wrmem), so the host's only job is to seed DRAM and read DRAM. This TB does that
+// by *backdoor* poke/peek of the behavioral async-SRAM chip model attached to the
+// external-DRAM pins (`sram_mem[...]`), a zero-time load/readback. The DMA engine
+// then moves the bytes DRAM<->scratchpad exactly as it would for a real host; the
+// scratchpad and compute-unit ports are never poked directly. This is the backdoor
+// analog of tpu_top_uart_tb.sv, which drives the identical flow over the UART pins.
 //
 // The golden reference is produced entirely outside the RTL: accel/tpulang
 // assembles a .tpu program (assembler.py) and simulates the instruction set in
@@ -138,20 +138,19 @@ module tpu_top_tb;
     always @(posedge sram_we) if (sram_ce == 1'b0) sram_mem[sram_addr] <= sram_data;
 
     // -------------------------------------------------------------------------
-    // Scratchpad preload/readback via backdoor hierarchical access to the storage
-    // array. Zero-time poke/peek: preload runs before host_run (no compute writer
-    // is active) and readback runs after HALT (memory is stable). Byte k of a word
-    // lives at addr+k, matching the scratchpad read port's window layout; the
-    // ADDR_W cast reproduces its mod-DEPTH wrap.
+    // DRAM preload/readback via backdoor poke/peek of the SRAM chip model.
+    // Zero-time: preload runs before host_run (no DMA writer is active) and
+    // readback runs after HALT (memory is stable). Byte k of a word lives at
+    // addr+k; tensor addresses (< 2^ADDR_W) index directly into the wider DRAM.
     // -------------------------------------------------------------------------
-    task automatic spad_wr_byte(input logic [ADDR_W-1:0] addr, input logic [7:0] d);
-        dut.u_scratchpad.g_mem.mem[addr] = d;
+    task automatic dram_wr_byte(input logic [ADDR_W-1:0] addr, input logic [7:0] d);
+        sram_mem[addr] = d;
     endtask
 
     // Read a 32-bit window starting at addr (byte k at addr+k).
-    task automatic spad_rd(input logic [ADDR_W-1:0] addr, output logic [31:0] d);
+    task automatic dram_rd(input logic [ADDR_W-1:0] addr, output logic [31:0] d);
         for (int k = 0; k < 4; k++)
-            d[k*8 +: 8] = dut.u_scratchpad.g_mem.mem[ADDR_W'(addr + k)];
+            d[k*8 +: 8] = sram_mem[MEM_ADDR_W'(addr + k)];
     endtask
 
     task automatic load_instr(input logic [IMEM_AW-1:0] a, input logic [31:0] w);
@@ -204,10 +203,10 @@ module tpu_top_tb;
         cnt = 0;
         for (a = 0; a < DEPTH; a++)
             if (defined8(in_bytes[a])) begin
-                spad_wr_byte(a[ADDR_W-1:0], in_bytes[a]);
+                dram_wr_byte(a[ADDR_W-1:0], in_bytes[a]);
                 cnt++;
             end
-        $display("loaded %0d scratchpad input bytes from %s", cnt, `SPAD_IN_FILE);
+        $display("loaded %0d DRAM input bytes from %s", cnt, `SPAD_IN_FILE);
     endtask
 
     // Read every expected byte back out of BRAM and compare (word at a time).
@@ -220,7 +219,7 @@ module tpu_top_tb;
             // Only read BRAM when this word carries an expected output byte.
             if (defined8(exp_bytes[wa])  || defined8(exp_bytes[wa+1]) ||
                 defined8(exp_bytes[wa+2])|| defined8(exp_bytes[wa+3])) begin
-                spad_rd(wa[ADDR_W-1:0], rd);
+                dram_rd(wa[ADDR_W-1:0], rd);
                 for (lane = 0; lane < 4; lane++) begin
                     eb = exp_bytes[wa+lane];
                     if (defined8(eb)) begin

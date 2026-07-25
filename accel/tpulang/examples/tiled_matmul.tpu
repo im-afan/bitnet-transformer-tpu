@@ -13,6 +13,11 @@
 ; Each pass advances the activation and weight base pointers by one tile.
 ;
 ;     python ../assembler.py tiled_matmul.tpu --listing
+;
+; Self-contained over DRAM: the whole activation and weight tile spans are staged
+; in from DRAM with rdmem (before the loop consumes the base pointers), and the
+; final requantized int8 result is spilled back with wrmem — identical DRAM and
+; scratchpad addresses (see relu_layer.tpu for why the golden model still matches).
 
 .equ ACT    0x0000      ; activation tiles, back to back
 .equ WGT    0x1000      ; weight tiles, back to back
@@ -20,10 +25,19 @@
 .equ RQW    0x7000      ; requant {m0,n} word
 
 .equ T      4           ; token count (MXU columns)
+.equ COLS   8           ; output features (MXU rows) — for the result size
 .equ TILES  4           ; number of contraction tiles
 .equ ATILE  0x0200      ; bytes to advance the activation pointer per tile
 .equ WTILE  0x0020      ; bytes to advance the weight pointer per tile
 .equ LAST   TILES - 1   ; index of the final tile
+
+.equ ACT_SPAN   TILES * ATILE   ; all activation tiles (0x800 = 2048 bytes)
+.equ WGT_SPAN   TILES * WTILE   ; all weight tiles    (0x080 =  128 bytes)
+.equ RQW_BYTES  4               ; one int32 word
+; The C buffer is the full int32 accumulator (T*COLS int32 = 128 bytes); the final
+; requant overlays the int8 result into its low T*COLS bytes. Spill the whole
+; region so the int8 result *and* the accumulator are exported to DRAM.
+.equ OUT_BYTES  T * COLS * 4    ; int32 C buffer = 128 bytes
 
 .reg act    r1
 .reg wgt    r2
@@ -33,6 +47,7 @@
 .reg astep  r6
 .reg wstep  r7
 .reg one    r8
+.reg rqw    r9          ; base for staging the requant word
 
     setcfg  tlen,   T
     setcfg  scalar, RQW
@@ -44,6 +59,15 @@
     li  astep, ATILE
     li  wstep, WTILE
     li  one,   1
+    li  rqw,   RQW
+
+    ; --- stage inputs: DRAM -> scratchpad (before act/wgt become moving ptrs) ---
+    setcfg  len, ACT_SPAN
+    rdmem   act, act
+    setcfg  len, WGT_SPAN
+    rdmem   wgt, wgt
+    setcfg  len, RQW_BYTES
+    rdmem   rqw, rqw
 
     ; --- tile 0: initialise the int32 accumulator -------------------------
     matmul  out, act, wgt       ; C = A0 @ W0   (no accumulate, no requant)
@@ -62,4 +86,8 @@ loop:
 
 final:
     matmul.acc.rq  out, act, wgt ; C += A_last @ W_last, then requant int32->int8
+
+    ; --- store result: scratchpad -> DRAM ---
+    setcfg  len, OUT_BYTES
+    wrmem   out, out
     halt

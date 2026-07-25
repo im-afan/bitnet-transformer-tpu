@@ -5,21 +5,35 @@
 ;
 ;     python ../assembler.py vector_add.tpu -o vector_add.hex
 ;
-; The host preloads A and B (N int32 elements each) into scratchpad first, then
-; reads C back after HALT.
+; Self-contained over DRAM: A and B are staged in from DRAM with rdmem and the
+; result C is spilled back to DRAM with wrmem, using identical DRAM/scratchpad
+; addresses (see relu_layer.tpu for why the golden model still matches).
 
 .equ A  0x0000      ; input vector A (int32)
 .equ B  0x0400      ; input vector B (int32)
 .equ C  0x0800      ; output vector C = A + B (int32)
 .equ N  64          ; elements
 
+.equ VEC_BYTES  256 ; N int32 = N * 4  (A, B and C are all this size)
+
 .reg a  r1
 .reg b  r2
 .reg c  r3
 
-    setcfg  vlen, N     ; VPU processes N elements
     li      a, A
     li      b, B
     li      c, C
+
+    ; ---- stage inputs: DRAM -> scratchpad ----
+    setcfg  len, VEC_BYTES
+    rdmem   a, a
+    rdmem   b, b
+
+    ; ---- compute ----
+    setcfg  vlen, N     ; VPU processes N elements
     vecadd  c, a, b     ; C[i] = A[i] + B[i]
+
+    ; ---- store result: scratchpad -> DRAM ----
+    setcfg  len, VEC_BYTES
+    wrmem   c, c
     halt

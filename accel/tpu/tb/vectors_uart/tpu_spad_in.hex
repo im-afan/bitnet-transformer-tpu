@@ -1,4 +1,4 @@
-// input tensors for relu_layer_dma.tpu (ACT/WGT/RQW)
+// input tensors for tiled_matmul.tpu (ACT/WGT/RQW)
 @0000
 fc
 fd

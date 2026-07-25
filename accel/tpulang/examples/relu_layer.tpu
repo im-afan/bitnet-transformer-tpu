@@ -4,39 +4,66 @@
 ;                             accumulate, requantized int32->int8 on store
 ;     Z = relu(Y)             VPU activation over the int8 layer output
 ;
-; This is the exact program hand-encoded in accel/tpu/tb/tpu_top_tb.sv, written in
-; tpulang. Assembling it and comparing to that testbench's load_program() is the
-; assembler's golden check:
+; Self-contained over DRAM: the program stages its own operands with the DMA
+; engine, so the only way data enters or leaves is external DRAM —
+;
+;   host --UART/DMA--> DRAM --rdmem--> scratchpad --compute--> scratchpad --wrmem--> DRAM
+;
+; Every tensor uses the SAME address in DRAM and in the scratchpad. The ISS models
+; DMA as a no-op with the tensors pre-placed at their scratchpad addresses
+; (gen_vectors.py), so `rdmem a,a` / `wrmem a,a` are identity there, while on real
+; hardware they byte-copy DRAM<->scratchpad at the matching address — both agree.
 ;
 ;     python ../assembler.py relu_layer.tpu --listing
 ;
-; Geometry (must match the DUT / testbench): T=4 tokens, COLS=8  => NELEM=32.
-; The host preloads A, W and the requant {m0,n} word into scratchpad first.
+; Geometry (must match the DUT / gen_vectors.py): ROWS=8, COLS=8, T=4 => NELEM=32.
 
-.equ ACT    0x0000      ; A[t][i] int8, row-major
-.equ WGT    0x1000      ; W[i][j] ternary, column-major 2-bit packed
-.equ OUT    0x3000      ; Y[t][j] int8   (requant store target)
-.equ RLU    0x5000      ; Z[t][j] int32  (relu output)
-.equ RQW    0x7000      ; requant {m0,n} word (int32)
+.equ ACT    0x0000      ; A[t][i] int8, row-major             (32 bytes)
+.equ WGT    0x1000      ; W[i][j] ternary, col-major 2b-packed (16 bytes)
+.equ OUT    0x3000      ; Y[t][j] int8   (requant store)       (32 bytes)
+.equ RLU    0x5000      ; Z[t][j] int32  (relu output)        (128 bytes)
+.equ RQW    0x7000      ; requant {m0,n} word (int32)          (4 bytes)
 
 .equ T      4           ; token rows
 .equ COLS   8
 .equ NELEM  T * COLS    ; flat layer-output length = 32
 
+.equ ACT_BYTES  32      ; T * ROWS            (ROWS = 8)
+.equ WGT_BYTES  16      ; COLS * (ROWS*2/8)
+.equ RQW_BYTES  4       ; one int32 word
+.equ OUT_BYTES  32      ; NELEM int8
+.equ RLU_BYTES  128     ; NELEM int32
+
 .reg act    r1
 .reg wgt    r2
 .reg out    r3
 .reg rlu    r4
-
-    setcfg  tlen,   T           ; MXU token count
-    setcfg  vlen,   NELEM       ; VPU vector length
-    setcfg  scalar, RQW         ; MXU requant {m0,n} word address
+.reg rqw    r5
 
     li      act, ACT
     li      wgt, WGT
     li      out, OUT
     li      rlu, RLU
+    li      rqw, RQW
 
-    matmul.rq  out, act, wgt    ; Y = requant(A @ W)   (flags: requant only)
-    relu       rlu, out         ; Z = relu(Y), reading Y back from scratchpad
+    ; ---- stage inputs: DRAM -> scratchpad (identical addresses) ----
+    setcfg  len, ACT_BYTES
+    rdmem   act, act
+    setcfg  len, WGT_BYTES
+    rdmem   wgt, wgt
+    setcfg  len, RQW_BYTES
+    rdmem   rqw, rqw
+
+    ; ---- compute ----
+    setcfg  tlen,   T           ; MXU token count
+    setcfg  vlen,   NELEM       ; VPU vector length
+    setcfg  scalar, RQW         ; MXU requant {m0,n} word address
+    matmul.rq  out, act, wgt    ; Y = requant(A @ W)
+    relu       rlu, out         ; Z = relu(Y)
+
+    ; ---- store results: scratchpad -> DRAM (identical addresses) ----
+    setcfg  len, OUT_BYTES
+    wrmem   out, out
+    setcfg  len, RLU_BYTES
+    wrmem   rlu, rlu
     halt

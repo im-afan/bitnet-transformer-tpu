@@ -15,6 +15,11 @@
 ; in the exp table's input scale; omitted here to keep the primitive chain clear.)
 ;
 ;     python ../assembler.py softmax_row.tpu --listing
+;
+; Self-contained over DRAM: the input row X is staged in from DRAM with rdmem and
+; the probability vector PROB is spilled back with wrmem (identical DRAM/scratchpad
+; addresses). The MAXA/NEGA/SHIFT/EXPA/DENA regions are scratchpad-only scratch and
+; never touch DRAM.
 
 .equ X      0x0000      ; input score row (int8), N elements
 .equ MAXA   0x0100      ; scalar: max_i x[i]        (int32)
@@ -24,6 +29,9 @@
 .equ DENA   0x0600      ; scalar: Σ exp             (int32)
 .equ PROB   0x0700      ; probabilities, Q15        (int32)
 .equ N      16          ; row length (== #keys attended)
+
+.equ X_BYTES     16     ; N int8
+.equ PROB_BYTES  64     ; N int32
 
 .reg x      r1
 .reg maxa   r2
@@ -44,6 +52,11 @@
     li  dena,  DENA
     li  prob,  PROB
 
+    ; ---- stage input: DRAM -> scratchpad ----
+    setcfg  len, X_BYTES
+    rdmem   x, x
+
+    ; ---- compute ----
     redmax  maxa, x         ; scratch[MAXA] = max_i x[i]
     loads   t, maxa         ; t = max
     subs    t, r0, t        ; t = 0 - max = -max
@@ -52,4 +65,8 @@
     exp     expa, shift     ; e[i] = exp(shift[i])
     redsum  dena, expa      ; scratch[DENA] = Σ e[i]
     sdiv    prob, expa, dena ; p[i] = round(e[i] * 2^15 / D)   (Q15)
+
+    ; ---- store result: scratchpad -> DRAM ----
+    setcfg  len, PROB_BYTES
+    wrmem   prob, prob
     halt
