@@ -7,16 +7,24 @@
 // bit-banging uart_rx and decoding uart_tx, exactly like uart_receiver_tb.sv /
 // uart_transmitter_tb.sv, so this is a full end-to-end test of the serial link.
 //
+// The instruction-memory write port and the run trigger are captured by small
+// behavioral models (an IMEM array and a run-pulse counter) so the 'I' and 'G'
+// commands can be checked without pulling in the whole scalar unit.
+//
 // A small CLK_PER_BIT is used purely to keep simulation fast — the FSM is
 // baud-agnostic, so functionally it is identical to the 868-clock default.
 //
-// Covers docs/uart_host.md §10:
-//   1. write N bytes, read back, compare (round-trip)
+// Covers docs/uart_host.md §10 plus the extended command set:
+//   1. write N bytes to SRAM, read back, compare (round-trip)
 //   2. len==1 and a burst crossing a 256-byte boundary (address carry)
 //   3. len==0, top-bits-set address, addr+len overflow -> NAK, memory untouched
 //   4. unknown command byte -> NAK, FSM accepts a valid command next
 //   5. mid-frame abort + RX_TIMEOUT elapse, then a fresh command decodes
 //   6. back-to-back commands with no idle gap
+//   7. 'I' write instruction memory + read back the IMEM model
+//   8. 'G' start program: run pulse fires with the right boot PC
+//   9. arbitration: any command while core_busy -> NAK; works again once idle
+//  10. new-command validation: bad IMEM length/range and bad boot PC -> NAK
 //
 // Build:
 //   make TEST=uart_interface \
@@ -31,12 +39,15 @@ module uart_interface_tb;
     localparam int CPB         = 16;    // UART clocks per bit (fast, for sim)
     localparam int MEM_ADDR_W  = 19;
     localparam int MEM_DATA_W  = 8;
+    localparam int IMEM_AW     = 10;
     localparam int RX_TIMEOUT  = 1000;  // clocks; > one byte (10*CPB) so normal
                                         // frames never trip it, but small enough
                                         // to exercise mid-frame abort quickly.
-    localparam int MAXLEN      = 16;    // largest payload used by any test
+    localparam int MAXLEN      = 16;    // largest SRAM payload used by any test
+    localparam int MAXW        = 8;     // largest IMEM payload (words) used
 
-    localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ACK = 8'h06, NAK = 8'h15;
+    localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47;
+    localparam [7:0] ACK  = 8'h06, NAK  = 8'h15;
 
     // ---- Clock / reset ------------------------------------------------------
     logic clk = 1'b0;
@@ -46,6 +57,9 @@ module uart_interface_tb;
     // ---- Serial pins --------------------------------------------------------
     logic uart_rx = 1'b1;   // host -> device (idles high)
     logic uart_tx;          // device -> host
+
+    // ---- Arbitration --------------------------------------------------------
+    logic core_busy = 1'b0; // driven by the TB to model a running program
 
     // ---- receiver <-> FSM ---------------------------------------------------
     logic [7:0] rx_data;
@@ -62,6 +76,13 @@ module uart_interface_tb;
     logic [MEM_DATA_W-1:0]  sram_din, sram_dout;
     logic                   sram_busy, sram_done;
     logic                   host_busy;
+
+    // ---- FSM -> IMEM write / run trigger ------------------------------------
+    logic                imem_we;
+    logic [IMEM_AW-1:0]  imem_waddr;
+    logic [31:0]         imem_wdata;
+    logic                run_start;
+    logic [IMEM_AW-1:0]  run_pc;
 
     // ---- sram_controller <-> SRAM chip pins ---------------------------------
     wire  [MEM_ADDR_W-1:0]  chip_addr;
@@ -82,14 +103,17 @@ module uart_interface_tb;
     );
 
     uart_interface #(
-        .ADDR_W(MEM_ADDR_W), .LENGTH_W(16), .RX_TIMEOUT(RX_TIMEOUT)
+        .ADDR_W(MEM_ADDR_W), .LENGTH_W(16), .IMEM_AW(IMEM_AW), .RX_TIMEOUT(RX_TIMEOUT)
     ) dut (
         .clk(clk), .rst_n(rst_n),
+        .core_busy(core_busy),
         .data_in(rx_data), .receiver_valid(rx_valid),
         .transmitter_start(tx_start), .data_out(tx_data), .transmitter_busy(tx_busy),
         .sram_start(sram_start), .sram_we(sram_we), .sram_addr(sram_addr),
         .sram_din(sram_din), .sram_dout(sram_dout),
         .sram_busy(sram_busy), .sram_done(sram_done),
+        .imem_we(imem_we), .imem_waddr(imem_waddr), .imem_wdata(imem_wdata),
+        .run_start(run_start), .run_pc(run_pc),
         .host_busy(host_busy)
     );
 
@@ -114,14 +138,27 @@ module uart_interface_tb;
     always @(posedge chip_we) if (chip_ce == 1'b0) sram_mem[chip_addr] <= chip_data;
 
     // =========================================================================
+    // Behavioral IMEM + run-trigger models (stand in for the scalar unit)
+    // =========================================================================
+    logic [31:0] imem_model [0:(1 << IMEM_AW)-1];
+    always @(posedge clk) if (imem_we) imem_model[imem_waddr] <= imem_wdata;
+
+    int                run_count = 0;   // number of run pulses seen
+    logic [IMEM_AW-1:0] run_pc_last;    // boot PC of the most recent run pulse
+    always @(posedge clk) if (run_start) begin
+        run_count   <= run_count + 1;
+        run_pc_last <= run_pc;
+    end
+
+    // =========================================================================
     // Host-side bit-bang / decode helpers
     // =========================================================================
     int errors = 0;
     int checks = 0;
 
-    // Payload buffers shared by the command tasks (fixed-size, Icarus-friendly).
-    logic [7:0] wbuf [0:MAXLEN-1];
-    logic [7:0] rbuf [0:MAXLEN-1];
+    logic [7:0]  wbuf   [0:MAXLEN-1];   // SRAM write payload
+    logic [7:0]  rbuf   [0:MAXLEN-1];   // SRAM read-back
+    logic [31:0] iwords [0:MAXW-1];     // IMEM write payload (32-bit words)
 
     task automatic chk(input logic cond, input string tag);
         checks++;
@@ -161,7 +198,7 @@ module uart_interface_tb;
         tx_bit_byte(n[15:8]);  tx_bit_byte(n[7:0]);
     endtask
 
-    // Full write command: header + wbuf[0..n-1], then check the ACK reply.
+    // Full SRAM write: header + wbuf[0..n-1], then check the ACK reply.
     task automatic do_write(input [23:0] a, input [15:0] n);
         logic [7:0] st;
         fork
@@ -174,7 +211,7 @@ module uart_interface_tb;
         chk(st === ACK, $sformatf("write ack (got %02h)", st));
     endtask
 
-    // Full read command: header, then collect n data bytes back into rbuf[0..n-1].
+    // Full SRAM read: header, then collect n data bytes back into rbuf[0..n-1].
     task automatic do_read(input [23:0] a, input [15:0] n);
         fork
             send_header(RCMD, a, n);
@@ -186,6 +223,38 @@ module uart_interface_tb;
                 end
             end
         join
+    endtask
+
+    // 'I' write instruction memory: header (len = nwords*4 bytes) + word payload
+    // (each word big-endian, MSB byte first), then check ACK.
+    task automatic do_imem(input [23:0] a, input [15:0] nwords);
+        logic [7:0] st;
+        fork
+            begin
+                send_header(ICMD, a, 16'(nwords << 2));
+                for (int w = 0; w < nwords; w++) begin
+                    tx_bit_byte(iwords[w][31:24]);
+                    tx_bit_byte(iwords[w][23:16]);
+                    tx_bit_byte(iwords[w][15:8]);
+                    tx_bit_byte(iwords[w][7:0]);
+                end
+            end
+            rx_bit_byte(st);
+        join
+        chk(st === ACK, $sformatf("imem ack (got %02h)", st));
+    endtask
+
+    // 'G' go/run: 4-byte frame (CMD + 24-bit boot PC, no length), check status.
+    task automatic do_go(input [23:0] a, input logic exp_ack);
+        logic [7:0] st;
+        fork
+            begin
+                tx_bit_byte(GCMD);
+                tx_bit_byte(a[23:16]); tx_bit_byte(a[15:8]); tx_bit_byte(a[7:0]);
+            end
+            rx_bit_byte(st);
+        join
+        chk(st === (exp_ack ? ACK : NAK), $sformatf("go status (got %02h)", st));
     endtask
 
     // Send a header only (no payload) and expect a single NAK — used for
@@ -242,31 +311,27 @@ module uart_interface_tb;
         chk(rbuf[0] === 8'h11 && rbuf[1] === 8'h22 &&
             rbuf[2] === 8'h33 && rbuf[3] === 8'h44, "carry readback");
 
-        // ---- Test 3: rejected commands leave memory untouched ---------------
-        // len == 0
+        // ---- Test 3: rejected SRAM commands leave memory untouched ----------
         sram_mem[24'h000200] = 8'hEE;
-        expect_nak(WCMD, 24'h00_0200, 16'd0);
+        expect_nak(WCMD, 24'h00_0200, 16'd0);                 // len == 0
         chk(sram_mem[24'h000200] === 8'hEE, "len0 leaves mem untouched");
 
-        // address with a top bit set (outside the 19-bit space): 0x080000
         sram_mem[24'h000201] = 8'hEE;
-        expect_nak(WCMD, 24'h08_0000, 16'd4);
+        expect_nak(WCMD, 24'h08_0000, 16'd4);                 // top bit set
         chk(sram_mem[24'h000201] === 8'hEE, "bad-addr leaves mem untouched");
 
-        // addr + len overflows the 19-bit space: 0x7FFFF + 2 > 0x80000
         sram_mem[24'h07FFFF] = 8'hEE;
-        expect_nak(WCMD, 24'h07_FFFF, 16'd2);
+        expect_nak(WCMD, 24'h07_FFFF, 16'd2);                 // addr+len overflow
         chk(sram_mem[24'h07FFFF] === 8'hEE, "overflow write not committed");
 
-        // rejected reads return a lone NAK too
-        expect_nak(RCMD, 24'h08_0000, 16'd4);
+        expect_nak(RCMD, 24'h08_0000, 16'd4);                 // rejected read
         expect_nak(RCMD, 24'h00_0100, 16'd0);
 
         // ---- Test 4: unknown command byte, then a valid command still works --
         begin
             logic [7:0] st;
             fork
-                tx_bit_byte(8'h99);   // not 'R'/'W'
+                tx_bit_byte(8'h99);   // not a known command
                 rx_bit_byte(st);
             join
             chk(st === NAK, $sformatf("bad cmd NAK (got %02h)", st));
@@ -276,8 +341,6 @@ module uart_interface_tb;
             chk(rbuf[i] === sram_mem[24'h000100 + i], "valid cmd after bad cmd");
 
         // ---- Test 5: mid-frame abort + RX_TIMEOUT, then fresh command --------
-        // Send CMD + one address byte, then stall. The FSM is now in RX_ADDR
-        // waiting; after RX_TIMEOUT it must abort silently back to IDLE.
         tx_bit_byte(WCMD);
         tx_bit_byte(8'h00);
         repeat (RX_TIMEOUT + 4 * CPB) @(posedge clk);   // let the timeout elapse
@@ -289,13 +352,58 @@ module uart_interface_tb;
         chk(rbuf[0] === 8'hDE && rbuf[1] === 8'hAD, "command after timeout abort");
 
         // ---- Test 6: back-to-back commands, no idle gap ---------------------
-        // do_write waits only for the ACK, so issuing the next command
-        // immediately exercises the IDLE -> new-frame path with no gap.
         wbuf[0] = 8'h01; wbuf[1] = 8'h02; wbuf[2] = 8'h03;
         do_write(24'h00_0400, 16'd3);
         do_read (24'h00_0400, 16'd3);         // fired right after the ACK
         chk(rbuf[0] === 8'h01 && rbuf[1] === 8'h02 && rbuf[2] === 8'h03,
             "back-to-back write then read");
+
+        // ---- Test 7: 'I' write instruction memory, read the model back ------
+        iwords[0] = 32'hDEAD_BEEF;
+        iwords[1] = 32'h0011_2233;
+        iwords[2] = 32'hCAFE_F00D;
+        iwords[3] = 32'h8000_0001;
+        do_imem(24'h00_0010, 16'd4);          // 4 words at instr addr 0x010
+        for (int w = 0; w < 4; w++)
+            chk(imem_model[24'h000010 + w] === iwords[w],
+                $sformatf("imem[%0h] got %08h exp %08h",
+                          24'h000010 + w, imem_model[24'h000010 + w], iwords[w]));
+
+        // ---- Test 8: 'G' start program — run pulse + correct boot PC --------
+        begin
+            int c0;
+            c0 = run_count;                   // capture at block entry (not time 0)
+            do_go(24'h00_0005, 1'b1);         // boot PC = 5, accepted
+            chk(run_count === c0 + 1, "exactly one run pulse");
+            chk(run_pc_last === 10'd5, $sformatf("boot pc (got %0d)", run_pc_last));
+        end
+
+        // ---- Test 9: arbitration — any command while core_busy is NAK'd ------
+        core_busy = 1'b1;
+        repeat (2) @(posedge clk);
+        begin
+            int c0;
+            c0 = run_count;
+            expect_nak(RCMD, 24'h00_0100, 16'd4);   // read rejected while busy
+            expect_nak(WCMD, 24'h00_0100, 16'd4);   // write rejected while busy
+            expect_nak(ICMD, 24'h00_0010, 16'd4);   // imem rejected while busy
+            do_go     (24'h00_0005, 1'b0);          // go rejected while busy
+            chk(run_count === c0, "no run pulse while busy");
+        end
+        // memory and the region under the rejected write must be unchanged
+        chk(sram_mem[24'h000100] === 8'h33, "no SRAM write while busy");
+
+        core_busy = 1'b0;
+        repeat (2) @(posedge clk);
+        do_read(24'h00_0100, 16'd4);               // works again once idle
+        for (int i = 0; i < 4; i++)
+            chk(rbuf[i] === sram_mem[24'h000100 + i], "command works after busy");
+
+        // ---- Test 10: validation of the new commands ------------------------
+        expect_nak(ICMD, 24'h00_0010, 16'd3);   // IMEM len not a multiple of 4
+        expect_nak(ICMD, 24'h00_0400, 16'd4);   // IMEM addr out of range (>=1024)
+        expect_nak(ICMD, 24'h00_03FF, 16'd8);   // IMEM addr+words overflow
+        do_go     (24'h00_0400, 1'b0);          // boot PC out of range -> NAK
 
         repeat (4) @(posedge clk);
 
@@ -308,7 +416,7 @@ module uart_interface_tb;
     // Safety net so a hang (e.g. an expected reply that never comes) fails loudly
     // instead of running forever.
     initial begin
-        #20_000_000;   // 20 ms
+        #40_000_000;   // 40 ms
         $display("  FAIL: global timeout — DUT appears hung");
         $finish;
     end

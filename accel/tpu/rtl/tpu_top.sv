@@ -63,6 +63,10 @@ module tpu_top #(
     parameter int MEM_DATA_W = 8,    // external SRAM data width (bits) = 1 byte
     parameter int SRAM_CPA   = 2,    // sram_controller CLOCKS_PER_ACCESS
 
+    // ---- UART host link (bring-up / debug over serial; docs/uart_host.md) ----
+    parameter int UART_CPB        = 868, // UART clocks-per-bit (115200 @ 100 MHz)
+    parameter int UART_RX_TIMEOUT = 0,   // UART inter-byte abort (clocks; 0 = off)
+
     // ---- Memory / init ------------------------------------------------------
     parameter     MEM_STYLE = "BRAM",  // top-level working memory primitive
     parameter     SPAD_INIT = "",      // optional scratchpad $readmemh preload
@@ -98,14 +102,21 @@ module tpu_top #(
     input  logic [XLEN-1:0]      cfg_wdata,
 
     // ---- External DRAM pins: async SRAM chip interface ----------------------
-    //      Driven by the on-chip DMA engine through its sram_controller. The
-    //      scalar unit's Read/WriteMemory ops now move data over this port
-    //      (host_mem_* preload path removed — DMA owns the scratchpad DMA port).
+    //      Driven by the on-chip DMA engine (while a program runs) or the UART
+    //      host (while idle) through the shared sram_controller. The scalar unit's
+    //      Read/WriteMemory ops move data over this port when running.
     output logic [MEM_ADDR_W-1:0] sram_addr,
     inout  wire  [MEM_DATA_W-1:0] sram_data,   // inout must be a net, not a var
     output logic                  sram_we,
     output logic                  sram_ce,
-    output logic                  sram_oen
+    output logic                  sram_oen,
+
+    // ---- UART host serial link ----------------------------------------------
+    //      Lets a host PC read/write external SRAM, load the program image into
+    //      instruction memory, and start the core — all while the core is idle
+    //      (commands arriving mid-run are NAK'd). See docs/uart_host.md.
+    input  logic                  uart_rx,     // serial in from host
+    output logic                  uart_tx      // serial out to host
 );
 
     // =========================================================================
@@ -172,10 +183,57 @@ module tpu_top #(
     logic [DMA_BYTES*8-1:0] spad_dma_wdata;
     logic [DMA_BYTES-1:0]   spad_dma_wstrb;
 
-    // ---- DMA ↔ sram_controller (user side) ----------------------------------
+    // ---- sram_controller (user side) — shared, arbitrated below -------------
+    //   DMA drives the controller while a program runs; the UART host drives it
+    //   while idle. `mem_*` are the muxed signals actually wired to the
+    //   controller; `dma_mem_*` / `uart_mem_*` are the two candidate drivers.
     logic                  mem_start, mem_we, mem_busy, mem_done;
     logic [MEM_ADDR_W-1:0] mem_addr;
     logic [MEM_DATA_W-1:0] mem_din, mem_dout;
+
+    logic                  dma_mem_start, dma_mem_we;
+    logic [MEM_ADDR_W-1:0] dma_mem_addr;
+    logic [MEM_DATA_W-1:0] dma_mem_din;
+
+    logic                  uart_mem_start, uart_mem_we;
+    logic [MEM_ADDR_W-1:0] uart_mem_addr;
+    logic [MEM_DATA_W-1:0] uart_mem_din;
+
+    // ---- UART host interface ------------------------------------------------
+    logic [7:0]            uart_rx_data;
+    logic                  uart_rx_valid;
+    logic                  uart_tx_start, uart_tx_busy;
+    logic [7:0]            uart_tx_data;
+
+    logic                  uart_imem_we;
+    logic [IMEM_AW-1:0]    uart_imem_waddr;
+    logic [31:0]           uart_imem_wdata;
+    logic                  uart_run_start;
+    logic [IMEM_AW-1:0]    uart_run_pc;
+
+    // ---- Host program/run path: external host ports OR'd with the UART host --
+    //   Both paths write instruction memory and pulse host_run; they are used
+    //   only while the core is idle, so a simple priority-mux is safe.
+    logic                  su_host_run;
+    logic [IMEM_AW-1:0]    su_boot_pc;
+    logic                  su_imem_we;
+    logic [IMEM_AW-1:0]    su_imem_waddr;
+    logic [31:0]           su_imem_wdata;
+
+    assign su_host_run   = host_run  | uart_run_start;
+    assign su_boot_pc    = uart_run_start ? uart_run_pc : boot_pc;
+    assign su_imem_we    = imem_we   | uart_imem_we;
+    assign su_imem_waddr = uart_imem_we ? uart_imem_waddr : imem_waddr;
+    assign su_imem_wdata = uart_imem_we ? uart_imem_wdata : imem_wdata;
+
+    // ---- SRAM arbitration: the core has priority ----------------------------
+    //   While a program runs (`busy`) the DMA engine owns the controller; while
+    //   idle the UART host does. The UART FSM independently NAKs any command that
+    //   arrives while `busy`, so the two drivers never actually contend.
+    assign mem_start = busy ? dma_mem_start : uart_mem_start;
+    assign mem_we    = busy ? dma_mem_we    : uart_mem_we;
+    assign mem_addr  = busy ? dma_mem_addr  : uart_mem_addr;
+    assign mem_din   = busy ? dma_mem_din   : uart_mem_din;
 
     // ---- scalar_unit → LINK dispatch (comms left out — stubbed below) -------
     logic                nb_start;
@@ -196,14 +254,14 @@ module tpu_top #(
         .clk   (clk),
         .rst_n (rst_n),
 
-        .host_run   (host_run),
-        .boot_pc    (boot_pc),
+        .host_run   (su_host_run),
+        .boot_pc    (su_boot_pc),
         .busy       (busy),
         .done       (done),
         .pc_dbg     (pc_dbg),
-        .imem_we    (imem_we),
-        .imem_waddr (imem_waddr),
-        .imem_wdata (imem_wdata),
+        .imem_we    (su_imem_we),
+        .imem_waddr (su_imem_waddr),
+        .imem_wdata (su_imem_wdata),
         .cfg_we     (cfg_we),
         .cfg_waddr  (cfg_waddr),
         .cfg_wdata  (cfg_wdata),
@@ -417,11 +475,11 @@ module tpu_top #(
         .clk   (clk),
         .rst_n (rst_n),
 
-        // sram_controller interface (user side)
-        .sram_start (mem_start),
-        .sram_we    (mem_we),
-        .sram_addr  (mem_addr),
-        .sram_din   (mem_din),
+        // sram_controller interface (user side) — arbitrated with the UART host
+        .sram_start (dma_mem_start),
+        .sram_we    (dma_mem_we),
+        .sram_addr  (dma_mem_addr),
+        .sram_din   (dma_mem_din),
         .sram_dout  (mem_dout),
         .sram_busy  (mem_busy),
         .sram_done  (mem_done),
@@ -472,6 +530,74 @@ module tpu_top #(
         .sram_we   (sram_we),
         .sram_ce   (sram_ce),
         .sram_oen  (sram_oen)
+    );
+
+    // =========================================================================
+    // UART host link — serial bring-up/debug path (docs/uart_host.md).
+    //   uart_receiver/transmitter do the 8N1 wire framing; uart_interface is the
+    //   command FSM. It shares the sram_controller with the DMA engine (mux above,
+    //   core priority), writes the scalar unit's instruction memory, and can start
+    //   the program. Any command arriving while the core is busy is NAK'd.
+    // =========================================================================
+    uart_receiver #(
+        .CLK_PER_BIT (UART_CPB)
+    ) u_uart_rx (
+        .clk   (clk),
+        .rst_n (rst_n),
+        .uart_rx (uart_rx),
+        .data    (uart_rx_data),
+        .valid   (uart_rx_valid)
+    );
+
+    uart_transmitter #(
+        .CLK_PER_BIT (UART_CPB)
+    ) u_uart_tx (
+        .clk   (clk),
+        .rst_n (rst_n),
+        .start   (uart_tx_start),
+        .data    (uart_tx_data),
+        .uart_tx (uart_tx),
+        .busy    (uart_tx_busy)
+    );
+
+    uart_interface #(
+        .ADDR_W     (MEM_ADDR_W),
+        .LENGTH_W   (16),
+        .IMEM_AW    (IMEM_AW),
+        .RX_TIMEOUT (UART_RX_TIMEOUT)
+    ) u_uart (
+        .clk   (clk),
+        .rst_n (rst_n),
+
+        // arbitration: core has priority
+        .core_busy (busy),
+
+        // receiver / transmitter
+        .data_in           (uart_rx_data),
+        .receiver_valid    (uart_rx_valid),
+        .transmitter_start (uart_tx_start),
+        .data_out          (uart_tx_data),
+        .transmitter_busy  (uart_tx_busy),
+
+        // sram_controller user side (muxed with DMA above)
+        .sram_start (uart_mem_start),
+        .sram_we    (uart_mem_we),
+        .sram_addr  (uart_mem_addr),
+        .sram_din   (uart_mem_din),
+        .sram_dout  (mem_dout),
+        .sram_busy  (mem_busy),
+        .sram_done  (mem_done),
+
+        // instruction-memory write → scalar unit (OR'd into su_imem_* above)
+        .imem_we    (uart_imem_we),
+        .imem_waddr (uart_imem_waddr),
+        .imem_wdata (uart_imem_wdata),
+
+        // run trigger → scalar unit (OR'd into su_host_run above)
+        .run_start (uart_run_start),
+        .run_pc    (uart_run_pc),
+
+        .host_busy ()   // informational; unused at top level
     );
 
 endmodule

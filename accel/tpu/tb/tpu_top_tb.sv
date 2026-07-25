@@ -101,6 +101,10 @@ module tpu_top_tb;
     wire  [MEM_DATA_W-1:0] sram_data;   // inout: bus shared with the chip model
     wire                   sram_we, sram_ce, sram_oen;
 
+    // UART host link is unused in this core-focused test: hold RX idle-high so the
+    // receiver never triggers, and leave TX observed but unchecked.
+    wire                   uart_tx;
+
     tpu_top #(
         .ROWS(ROWS), .COLS(COLS), .VPU_BYTES(VPU_BYTES), .ADDR_W(ADDR_W),
         .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W),
@@ -114,7 +118,9 @@ module tpu_top_tb;
         .cfg_we(cfg_we), .cfg_waddr(cfg_waddr), .cfg_wdata(cfg_wdata),
         // External DRAM interface
         .sram_addr(sram_addr), .sram_data(sram_data),
-        .sram_we(sram_we), .sram_ce(sram_ce), .sram_oen(sram_oen)
+        .sram_we(sram_we), .sram_ce(sram_ce), .sram_oen(sram_oen),
+        // UART host link (idle in this test)
+        .uart_rx(1'b1), .uart_tx(uart_tx)
     );
 
     // -------------------------------------------------------------------------
