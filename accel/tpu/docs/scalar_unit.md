@@ -40,11 +40,12 @@ fetch ─► decode ─► dispatch ─┬─► MXU   (Matmul)
 
 ## 3. Instruction set
 
-> **The authoritative instruction reference is [isa.md](isa.md)** — exact 32-bit
-> encoding, the full opcode map (with hex values and tpulang mnemonics), per-op semantics,
-> and the shared numeric conventions (ternary packing, requant, `sdiv` Q15). The tables
-> below are the conceptual overview; where they differ from `isa.md`, `isa.md` (which
-> tracks `rtl/scalar_unit.sv`, `tpulang/assembler.py`, and `tpulang/iss.py`) wins.
+> **The authoritative instruction reference is [isa.md Appendix A](isa.md#appendix-a--encoding--opcode-reference)** —
+> exact 32-bit encoding, the full opcode map (with hex values and tpulang mnemonics),
+> per-op semantics, and the shared numeric conventions (ternary packing, requant, `sdiv`
+> Q15); the rest of [isa.md](isa.md) is the programmer's guide to writing tpulang. The
+> tables below are the conceptual overview; where they differ from `isa.md`, `isa.md`
+> (which tracks `rtl/scalar_unit.sv`, `tpulang/assembler.py`, and `tpulang/iss.py`) wins.
 
 All **math** ops address **scratchpad**; all **comms/memory** ops address **DRAM** except
 where noted. Fixed-size operands are implied by config registers (array size, `d`, `T`).
@@ -96,7 +97,7 @@ Fixed 32-bit instructions: `[ opcode:6 | dst:8 | src0:8 | src1:8 | flags:2 ]`, w
 `jmp`. The three 8-bit fields name scalar registers whose *contents* are the byte
 addresses handed to a unit. Opcode space is small (<32), leaving room for future fused ops
 (e.g. `MatmulRequant`, `LayerNorm`). This is now concrete — the field layout, opcode
-values, and forms are specified in full in [isa.md §2–§3, §7](isa.md#2-instruction-encoding).
+values, and forms are specified in full in [isa.md Appendix A.2–A.4](isa.md#a2-instruction-word).
 
 ## 5. Worked example — one attention block
 

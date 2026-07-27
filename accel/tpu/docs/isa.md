@@ -1,55 +1,400 @@
-# TPU Instruction Set Reference
+# Writing TPU Programs (tpulang)
 
-The authoritative reference for the TPU's 32-bit machine instructions — the code the
-[scalar unit](scalar_unit.md) fetches and executes. This document defines the encoding,
-the machine model, and the exact semantics of every opcode.
+A practical guide to writing programs for the TPU in **tpulang**, its assembly language.
+It walks from the machine you're targeting, through the language and the handful of idioms
+every kernel uses, to fully worked programs — then keeps a condensed encoding reference in
+[Appendix A](#appendix-a--encoding--opcode-reference) for when you need the bits.
 
-**Three implementations must agree on everything below**, and this doc is the contract
-between them:
+Read this to *write* code. For the *language spec* (grammar, directives, toolchain flags)
+see the [tpulang README](../../tpulang/README.md); for the per-unit hardware see
+[scalar_unit.md](scalar_unit.md), [mxu.md](mxu.md), and [vpu.md](vpu.md). Where any of them
+disagree with this doc on encoding, [Appendix A](#appendix-a--encoding--opcode-reference)
+(mirrored by `scalar_unit.sv`, `assembler.py`, and `iss.py`) is the contract.
 
-| Where               | File                                     | Role                                 |
-| ------------------- | ---------------------------------------- | ------------------------------------ |
-| Hardware            | [`rtl/scalar_unit.sv`](../rtl/scalar_unit.sv) | decodes and executes these words     |
-| Assembler           | [`tpulang/assembler.py`](../../tpulang/assembler.py) | emits these words from [tpulang](../../tpulang/README.md) |
-| Golden simulator    | [`tpulang/iss.py`](../../tpulang/iss.py) | reproduces the final memory state    |
-
-For the *microarchitecture* that runs these instructions (FSM, dispatch, run-ahead) see
-[scalar_unit.md](scalar_unit.md); this doc is the programmer's-model / encoding view.
-For the human-writable assembly syntax that lowers 1:1 onto these opcodes, see the
-[tpulang reference](../../tpulang/README.md).
-
----
-
-## 1. Machine model
-
-The scalar unit is a small in-order engine — a microcontroller, not an out-of-order core.
-Programmer-visible state:
-
-| State                | Size                    | Notes                                                        |
-| -------------------- | ----------------------- | ------------------------------------------------------------ |
-| **PC**               | `IMEM_AW` bits (10)     | word index into instruction memory                           |
-| **Registers** `r0..r31` | 32 × int32 (`REG_AW=5`) | `r0` is hardwired to 0 (writes ignored)                      |
-| **Config regs** `cfg0..cfg15` | 16 × int32 (`CFG_AW=4`) | implied operands (lengths, requant addr); §6                 |
-| **Flags**            | `eq`, `lt`              | set by `CMPS`, consumed by `BRANCH`                           |
-| **Instruction mem**  | 2¹⁰ × 32-bit BRAM       | separate from the scratchpad; host-loaded while idle         |
-| **Scratchpad**       | 2¹⁶ bytes               | on-chip working memory; all *math* addresses point here      |
-| **DRAM**             | external                | all *DMA / comms* addresses point here                       |
-
-**Registers hold addresses, not tensors.** The three 8-bit operand fields in an
-instruction name registers (low 5 bits used). A compute op reads the *contents* of those
-registers to get the scratchpad/DRAM **byte addresses** it hands to its unit. So the
-idiom everywhere is: load an address into a register with `LI`, then pass the register to
-the op. Tensor *sizes* are not in the instruction — they come from config registers (§6):
-`TLEN` (MXU token rows), `VLEN` (VPU vector length), `LEN` (DMA/LINK byte count).
-
-Address arithmetic wraps mod 2¹⁶ (the scratchpad depth), matching the RTL and ISS.
+```
+   kernel.tpu  ──assembler.py──►  32-bit words  ──►  instruction BRAM  ──►  scalar_unit.sv
+       │                              │
+       │                              └──iss.py──►  golden scratchpad image
+       └──── you write this ────┘
+```
 
 ---
 
-## 2. Instruction encoding
+## 1. The machine you're programming
 
-Every instruction is a fixed **32-bit** word. There are two field layouts, selected by
-opcode:
+The program runs on the **scalar unit** — a small in-order microcontroller. It fetches one
+instruction at a time, does the scalar/address math itself, and **dispatches** the heavy
+ops to two accelerators, blocking on each until it finishes:
+
+```
+   scalar_unit  ── issue-and-wait ──►  MXU   (ternary matmul: act @ weight)
+        │                          └─►  VPU   (SIMD vectors: add, relu, exp, reductions…)
+        │
+   scratchpad (on-chip BRAM)  ◄── every unit reads/writes here
+        ▲
+   DMA  │  moves bytes DRAM ⇄ scratchpad (rdmem / wrmem)
+   DRAM ┘  (external; where the host stages tensors)
+```
+
+Four things drive how you write every program:
+
+1. **Two memory levels.** External **DRAM** holds tensors the host stages in; the on-chip
+   **scratchpad** (2¹⁶ bytes, byte-addressed) is the working memory. *All math addresses
+   point into the scratchpad.* DMA (`rdmem`/`wrmem`) moves bytes between the two.
+
+2. **Registers hold addresses, not data.** There are 32 registers `r0..r31` (`r0` is
+   hardwired to 0). A compute op names registers, but reads their *contents* as the
+   scratchpad byte address to operate on. So the universal idiom is **load an address into
+   a register, then hand the register to the op**.
+
+3. **Sizes live in config registers, not instructions.** A `matmul` doesn't carry "how
+   many tokens"; a `vecadd` doesn't carry "how many elements". You set those once in the
+   config registers (`tlen`, `vlen`, `len`) and the ops read them.
+
+4. **Dispatch is issue-and-wait.** The hardware automatically blocks until a dispatched
+   unit is done before running the next instruction, so you rarely manage concurrency by
+   hand.
+
+---
+
+## 2. Anatomy of a program
+
+Nearly every kernel has the same five-part shape. Here is the smallest complete one —
+a residual add `C = A + B` ([`vector_add.tpu`](../../tpulang/examples/vector_add.tpu)):
+
+```asm
+; ---- 1. declare constants (addresses, sizes) and register aliases ----
+.equ A  0x0000          ; input vector A (int32)   -- a scratchpad byte address
+.equ B  0x0400          ; input vector B (int32)
+.equ C  0x0800          ; output C = A + B
+.equ N  64              ; elements
+.equ VEC_BYTES  256     ; N int32 = N * 4
+
+.reg a  r1              ; give registers readable names
+.reg b  r2
+.reg c  r3
+
+; ---- 2. load addresses into registers ----
+    li      a, A
+    li      b, B
+    li      c, C
+
+; ---- 3. stage inputs DRAM -> scratchpad ----
+    setcfg  len, VEC_BYTES
+    rdmem   a, a
+    rdmem   b, b
+
+; ---- 4. compute ----
+    setcfg  vlen, N         ; the VPU will process N elements
+    vecadd  c, a, b         ; C[i] = A[i] + B[i]
+
+; ---- 5. store result scratchpad -> DRAM, then stop ----
+    setcfg  len, VEC_BYTES
+    wrmem   c, c
+    halt
+```
+
+Every example in [`tpulang/examples/`](../../tpulang/examples) follows this skeleton.
+Internalize it and most of the work is deciding the addresses, sizes, and op sequence.
+
+---
+
+## 3. Language basics
+
+**One instruction per line**, of the form:
+
+```
+[label:]  mnemonic[.flag...]  operand, operand, ...   [; comment]
+```
+
+- **Comments** start with `;` or `#` and run to end of line.
+- **Labels** end in `:` and name the *word address* of the next instruction — branch/jump
+  targets. They may stack (`loop: inner: op ...`).
+- Mnemonics and `.flag` suffixes are case-insensitive; symbol names are case-sensitive.
+
+**Two directives** set up names before you use them:
+
+| Directive        | Effect                                                            |
+| ---------------- | ----------------------------------------------------------------- |
+| `.equ NAME expr` | define an integer constant (addresses, sizes, tile strides)       |
+| `.reg NAME rN`   | alias a register, so you write `act` instead of `r1`              |
+
+`.equ` values are full expressions over earlier constants, labels, and numbers, using
+`+ - * // % << >> & | ^ ~` and parentheses — e.g. `.equ NELEM T * COLS`,
+`.equ LAST TILES - 1`, `.equ WGT_BYTES COLS * (ROWS*2/8)`. Numbers are decimal or `0x` hex.
+Compute these at assemble time rather than hand-carrying magic numbers.
+
+**Three operand kinds**, picked by the instruction's form:
+
+- **Register** — `rN` or a `.reg` alias. Holds a byte address (or a scalar value).
+- **Immediate / expression** — a number or expression, used by `li`, `setcfg`, and as
+  branch/jump targets (e.g. `li act, ACT + 0x40`).
+- **Label** — a control-flow target.
+
+---
+
+## 4. The core idioms
+
+### 4.1 Load an address, then use it
+
+Because registers hold addresses, the pattern is always *materialize the address, pass the
+register*:
+
+```asm
+.equ  ACT  0x0000
+.reg  act  r1
+    li      act, ACT            ; act now holds the byte address 0x0000
+    matmul  out, act, wgt       ; MXU reads scratchpad starting at that address
+```
+
+`li` sign-extends a 16-bit immediate, which spans the whole 16-bit scratchpad, so any
+scratchpad address fits directly.
+
+### 4.2 Set sizes in config before you compute
+
+A compute op needs to know how much data to touch, and that comes from config registers —
+set them with `setcfg` (or the host presets them):
+
+| Config  | Drives                                   | Set before      |
+| ------- | ---------------------------------------- | --------------- |
+| `tlen`  | MXU token-row count `T`                  | `matmul`        |
+| `vlen`  | VPU vector length (elements)             | any VPU op      |
+| `len`   | DMA byte count                           | `rdmem`/`wrmem` |
+| `scalar`| scratchpad address of the requant `{m0,n}` word | `matmul.rq` |
+
+`setcfg` takes a *zero-extended* 16-bit immediate. A common bug is reusing `len` for
+different-sized tensors — set it again right before each DMA (the examples do). You only
+re-`setcfg` when the value changes.
+
+### 4.3 The identical-address DMA convention
+
+The current DUT has **no DMA/LINK engine attached** — `rdmem`/`wrmem`/`wrneigh` complete as
+no-ops — and the ISS models them the same way, with input tensors pre-placed in the
+scratchpad. To keep a program correct on *both* the no-op simulator and real byte-copying
+hardware, give every tensor the **same address in DRAM and in the scratchpad**. Then
+`rdmem a, a` / `wrmem a, a` are the identity in simulation and a matched-address copy on
+hardware — both agree. This is why every example passes the *same* register twice to
+`rdmem`/`wrmem`. Scratchpad-only scratch (softmax's intermediates, say) never needs DMA at
+all.
+
+### 4.4 Lay tensors out the way the units expect
+
+The MXU and VPU consume fixed byte layouts. Place your tensors to match (full detail in
+[Appendix A.5](#a5-numeric-conventions)):
+
+- **Activations** `A[t][i]`: int8, **row-major**, `base + t·ROWS + i`.
+- **Weights** `W[i][j]`: ternary, **column-major, 2-bit packed** (`00→0`, `01→+1`,
+  `11→−1`), `base + j·(ROWS·2/8)`.
+- **Requant word** `{m0,n}`: one int32 — `m0` in the low 12 bits, `n` above.
+- **VPU buffers**: ops read **int8** (1-byte stride) and write **int32** (4-byte stride);
+  `requant` is the only op that narrows int32→int8. So an int8 buffer and an int32 buffer
+  of the same length differ 4× in bytes — size and place them accordingly.
+
+### 4.5 Bridge scalars between registers and vectors
+
+Reductions (`redmax`, `redsum`, `vecdot`) write a single int32 *into the scratchpad*, not a
+register. To use that value as a scalar in later scalar math, pull it into a register with
+`loads`, and push a register value back with `stores`:
+
+```asm
+    redmax  maxa, x         ; scratch[MAXA] = max_i x[i]
+    loads   t, maxa         ; t = that max (register)
+    subs    t, r0, t        ; t = -max
+    stores  nega, t         ; scratch[NEGA] = -max   (now a broadcastable scalar)
+    sadd    shift, x, nega  ; shift[i] = x[i] - max
+```
+
+`sadd`/`vecmul`/`sdiv`/`requant` take their scalar/param from a *scratchpad* address (the
+third operand's register), so a scalar destined for broadcast must live in the scratchpad —
+hence the `stores`.
+
+---
+
+## 5. The instruction toolbox
+
+Grouped by what you reach for. Operands `rX` are registers holding scratchpad addresses
+unless noted; full semantics/encoding in [Appendix A.3](#a3-opcode-map).
+
+**MXU — matmul.** `matmul[.acc][.rq] rout, ract, rweight`: `out = act @ ternary-weight`,
+int8×ternary, int32 accumulate. `.acc` adds into the existing int32 `C` buffer (for tiling
+a contraction larger than the array); `.rq` requantizes int32→int8 on store using the
+`{m0,n}` word at `cfg scalar`. Token rows come from `cfg tlen`.
+
+**VPU — elementwise, activations, reductions.**
+
+```
+vecadd  d, a, b     d[i]=a[i]+b[i]        relu    d, a    max(a[i],0)
+vecemul d, a, b     d[i]=a[i]*b[i]        gelu    d, a    gelu_lut[a[i]]
+vecmul  d, a, s     d[i]=a[i]*scalar(s)   exp     d, a    exp_lut[a[i]]
+sadd    d, a, s     d[i]=a[i]+scalar(s)   square  d, a    a[i]^2
+sdiv    d, a, s     round(a[i]*2^15/s)    redmax  d, a    max_i a[i]  -> scalar
+vecdot  d, a, b     Σ a[i]*b[i] -> scalar redsum  d, a    Σ a[i]      -> scalar
+requant d, a, p     clip((a[i]*m0+rnd)>>n) int32->int8, {m0,n} at p
+```
+
+All read `cfg vlen` elements. `gelu`/`exp` use fixed 256-entry LUTs loaded at init.
+
+**DMA / comms** (byte length from `cfg len`):
+
+```
+rdmem  rscratch, rdram      DRAM -> scratchpad (fill)
+wrmem  rscratch, rdram      scratchpad -> DRAM (spill)
+wrneigh rmy, rnb, dir       push local DRAM -> neighbor DRAM  (dir: n|e|s|w)
+```
+
+**Scalar & control:**
+
+```
+li     d, imm16     d = sign_extend(imm16)      adds  d, a, b   d = a + b
+loads  d, raddr     d = scratch[raddr] (int32)  subs  d, a, b   d = a - b
+stores raddr, rval  scratch[raddr] = rval        muls  d, a, b   d = a * b
+setcfg name, imm16  cfg[name] = imm16            cmps  a, b      set eq/lt flags
+jmp    label        pc = label                   halt            stop, raise done
+branch cond, label  if cond: pc = label          wait  unit      block on unit done
+beq/bne/blt/bge label   conditional jump (cond baked in: eq|ne|lt|ge)
+```
+
+---
+
+## 6. Control flow: loops
+
+Loops are `cmps` + a conditional branch, exactly like a tiny assembly CPU. Targets are
+labels. The tiling loop from [`tiled_matmul.tpu`](../../tpulang/examples/tiled_matmul.tpu)
+walks a contraction bigger than the array, accumulating partials in the MXU's int32 `C`
+buffer:
+
+```asm
+    matmul  out, act, wgt       ; tile 0: C = A0 @ W0   (no acc, no requant)
+    adds    act, act, astep     ; advance the tile base pointers
+    adds    wgt, wgt, wstep
+    li      i, 1
+
+loop:
+    cmps    i, last             ; while i < LAST:
+    bge     final               ;   (flags set by cmps; bge takes them)
+    matmul.acc  out, act, wgt   ;   C += Ai @ Wi
+    adds    act, act, astep
+    adds    wgt, wgt, wstep
+    adds    i, i, one
+    jmp     loop
+
+final:
+    matmul.acc.rq  out, act, wgt ; last tile: C += A_last@W_last, then requant int32->int8
+```
+
+Note the three-way flag split across the tiles — plain `matmul` initializes `C`, `.acc`
+accumulates, and the final `.acc.rq` also narrows — and that `bge` reads the flags the
+immediately preceding `cmps` set (`eq=0, ne, lt, ge`).
+
+---
+
+## 7. Synchronization
+
+Because dispatch is **issue-and-wait**, the hardware already fences one compute op against
+the next — you do *not* insert `wait` between two dependent VPU/MXU ops. You only need an
+explicit `wait unit` when a **scalar** instruction (`loads`) reads a value a unit just
+wrote, and even then the examples rely on the in-order blocking and use `loads` directly
+after the reduction. Reach for `wait mxu|vpu|dma|link` only if you have reason to fence a
+scalar read against an outstanding dispatch. `halt` ends the program and raises `done`; the
+host can restart it.
+
+---
+
+## 8. Worked example: softmax over a score row
+
+Softmax has no single instruction — you decompose it into VPU primitives, using the
+scalar↔vector bridge from §4.5. From
+[`softmax_row.tpu`](../../tpulang/examples/softmax_row.tpu):
+
+```asm
+    setcfg  vlen, N         ; N-element row
+    ; ... li each address into its register, rdmem the input row X ...
+
+    redmax  maxa, x          ; m       = max_i x[i]
+    loads   t, maxa          ; t       = m
+    subs    t, r0, t         ; t       = -m
+    stores  nega, t          ; scratch = -m   (broadcastable)
+    sadd    shift, x, nega   ; s[i]    = x[i] - m
+    exp     expa, shift      ; e[i]    = exp(s[i])       (LUT)
+    redsum  dena, expa       ; D       = Σ e[i]
+    sdiv    prob, expa, dena ; p[i]    = round(e[i]*2^15 / D)   (Q15)
+```
+
+The pattern to absorb: a reduction lands in the scratchpad → `loads` it → do scalar math →
+`stores` it back → a broadcast op (`sadd`) consumes it. The `x−m` shift is the standard
+numerically-stable softmax, and `sdiv` produces a Q15 fixed-point probability whose scale is
+a compile-time constant even though `D` is runtime.
+
+---
+
+## 9. Assemble, simulate, test
+
+From `accel/tpulang/`:
+
+```bash
+python assembler.py prog.tpu                 # hex words -> stdout ($readmemh image)
+python assembler.py prog.tpu -o prog.hex     # write the loadable image
+python assembler.py prog.tpu --listing       # addr / word / flags / source, to stderr
+```
+
+`--listing` is the fastest way to sanity-check an encoding by eye. Programmatically,
+`from assembler import assemble; assemble(src) -> list[int]`.
+
+To check correctness against the golden model, `gen_vectors.py` assembles a program, runs it
+on the bit-exact [ISS](../../tpulang/iss.py), and emits the three `$readmemh` files
+(`program`, `inputs`, `expected`) that `tpu_top_tb.sv` replays on the RTL:
+
+```bash
+python gen_vectors.py                        # default: examples/relu_layer.tpu
+python gen_vectors.py -p examples/softmax_row.tpu
+```
+
+The expected file holds exactly the bytes the program *wrote*, so the testbench checks that
+program's outputs and nothing else — the loop that keeps hardware honest against the model.
+
+---
+
+## 10. Checklist & common pitfalls
+
+- **Set `len` before every DMA** whose tensor size differs from the last one; likewise
+  `vlen`/`tlen` before compute. Stale config is the most common silent bug.
+- **int8 vs int32 strides.** VPU ops write int32 (4 bytes/elem); only `requant` narrows.
+  An int32 output buffer needs 4× the bytes of the int8 input — leave room.
+- **Weights are column-major, 2-bit packed** (`00/01/11 → 0/+1/−1`); activations are
+  row-major int8. Mixing these up produces a plausible-looking but wrong matmul.
+- **Reductions write to the scratchpad, not a register** — `loads` to get the scalar out.
+- **Broadcast scalars must be in the scratchpad** (`sadd`/`vecmul`/`sdiv`/`requant` read the
+  param from a scratchpad address), so `stores` a computed scalar before broadcasting it.
+- **Identical DRAM/scratchpad addresses** per tensor, so the no-op DMA stays correct (§4.3).
+- **Branch conditions come from the preceding `cmps`** — don't let another flag-setting op
+  slip between the `cmps` and its branch.
+- **End with `halt`.** Without it the scalar unit runs off into whatever follows in IMEM.
+
+---
+
+# Appendix A — Encoding & opcode reference
+
+The bit-level contract shared by `scalar_unit.sv` (decodes/executes), `assembler.py`
+(emits), and `iss.py` (golden simulator). You rarely need this to write programs, but it is
+the authority when the units disagree.
+
+## A.1 Machine model
+
+| State                  | Size                       | Notes                                            |
+| ---------------------- | -------------------------- | ------------------------------------------------ |
+| **PC**                 | `IMEM_AW` (10) bits        | word index into instruction memory               |
+| **Registers** `r0..r31`| 32 × int32 (`REG_AW=5`)    | `r0` hardwired to 0 (writes ignored)             |
+| **Config** `cfg0..cfg15`| 16 × int32 (`CFG_AW=4`)   | implied operands (lengths, requant addr); §A.4   |
+| **Flags**              | `eq`, `lt`                 | set by `cmps`, consumed by `branch`              |
+| **Instruction mem**    | 2¹⁰ × 32-bit BRAM          | host-loaded while idle; separate from scratchpad |
+| **Scratchpad**         | 2¹⁶ bytes                  | working memory; all *math* addresses point here  |
+| **DRAM**               | external                   | all *DMA/comms* addresses point here             |
+
+Address arithmetic wraps mod 2¹⁶ (scratchpad depth), matching RTL and ISS.
+
+## A.2 Instruction word
+
+Every instruction is a fixed **32-bit** word, in one of two layouts selected by opcode:
 
 ```
  bits  31..26   25..18   17..10    9..2    1..0
@@ -57,202 +402,124 @@ opcode:
  RRR   │opcode│  dst   │  src0  │  src1  │ flags │   register-form ops
        └──────┴────────┴────────┴────────┴───────┘
        ┌──────┬────────┬─────────────────┬───────┐
- imm16 │opcode│  dst   │      imm16      │ flags │   LI / SETCFG / BRANCH / JMP
+ imm16 │opcode│  dst   │      imm16      │ flags │   li / setcfg / branch / jmp
        └──────┴────────┴─────────────────┴───────┘
                         17................2
 ```
 
-| Field    | Bits    | Meaning                                                                 |
-| -------- | ------- | ----------------------------------------------------------------------- |
-| `opcode` | 31..26  | 6-bit operation selector (§4). Opcode space is < 32, leaving room for fused ops. |
-| `dst`    | 25..18  | destination register index (low 5 bits) — or the config index for `SETCFG` |
-| `src0`   | 17..10  | source-0 register index                                                 |
-| `src1`   | 9..2    | source-1 register index                                                 |
-| `flags`  | 1..0    | per-op modifier: matmul acc/rq, branch condition, wait/neighbor unit, direction |
-| `imm16`  | 17..2   | 16-bit immediate (overlays `src0`+`src1`); sign- or zero-extended per op |
+| Field    | Bits    | Meaning                                                            |
+| -------- | ------- | ----------------------------------------------------------------- |
+| `opcode` | 31..26  | 6-bit operation selector (§A.3)                                   |
+| `dst`    | 25..18  | destination register (low 5 bits) — or config index for `setcfg` |
+| `src0`   | 17..10  | source-0 register                                                 |
+| `src1`   | 9..2    | source-1 register                                                 |
+| `flags`  | 1..0    | per-op modifier: matmul acc/rq, branch cond, wait/neighbor unit  |
+| `imm16`  | 17..2   | 16-bit immediate (overlays `src0`+`src1`); sign/zero-extended per op |
 
-Packing (from `assembler.py`, matching `scalar_unit.sv`):
+Packing (`assembler.py`, matching `scalar_unit.sv`):
 
 ```
-word      = opcode<<26 | dst<<18 | src0<<10 | src1<<2 | flags
-word_imm  = opcode<<26 | dst<<18 |     (imm16 & 0xFFFF)<<2 | flags
+word     = opcode<<26 | dst<<18 | src0<<10 | src1<<2 | flags
+word_imm = opcode<<26 | dst<<18 |     (imm16 & 0xFFFF)<<2 | flags
 ```
 
-Which operand fields are *live* depends on the opcode's **form** — a two-register op
-still occupies 32 bits, it just ignores the unused fields. The forms, and which register
-each field names, are given per-instruction in §5 and summarized in §7.
+**Worked encoding.** `matmul.rq r3, r1, r2` (out=r3, act=r1, weight=r2, requant):
 
----
+```
+opcode=0x00  dst=3  src0=1  src1=2  flags=0b10 (.rq)
+word = (0<<26)|(3<<18)|(1<<10)|(2<<2)|2 = 0x000C_040A
+```
 
-## 3. Opcode map
+`li r1, 0x1000` (imm16 form):
+
+```
+opcode=0x14  dst=1  imm16=0x1000
+word = (0x14<<26)|(1<<18)|(0x1000<<2)|0 = 0x5004_4000
+```
+
+## A.3 Opcode map
 
 Opcodes are the 6-bit `OP_*` constants in `scalar_unit.sv` (mirrored by `SPECS` in
-`assembler.py` and the `OP_*` map in `iss.py`). Mnemonics are the [tpulang](../../tpulang/README.md)
-spelling.
+`assembler.py`, `OP_*` in `iss.py`). "scratch[a]" is the byte at scratchpad address `a`;
+int32 is little-endian 4-byte, int8 a single signed byte.
 
-| Opcode | Mnemonic  | Form    | Unit   | One-line semantics                                        |
-| ------ | --------- | ------- | ------ | --------------------------------------------------------- |
-| `0x00` | `matmul`  | RRR     | MXU    | `out = act @ ternary-weight`; `.acc`/`.rq` via flags      |
-| `0x01` | `vecdot`  | RRR     | VPU    | `dst = Σ src0·src1` (scalar result)                       |
-| `0x02` | `vecmul`  | RRR     | VPU    | `dst[i] = src0[i] × scalar(src1)`                         |
-| `0x03` | `vecadd`  | RRR     | VPU    | `dst[i] = src0[i] + src1[i]`                              |
-| `0x04` | `relu`    | RR      | VPU    | `dst[i] = max(src0[i], 0)`                                |
-| `0x05` | `gelu`    | RR      | VPU    | `dst[i] = gelu_lut[src0[i]]`                              |
-| `0x06` | `wrmem`   | SS      | DMA    | scratch(src0) → DRAM(src1)                                |
-| `0x07` | `rdmem`   | RS      | DMA    | DRAM(src0) → scratch(dst)                                 |
-| `0x08` | `wrneigh` | NEIGH   | LINK   | local DRAM(src0) → neighbor DRAM(src1), dir = flags       |
-| `0x09` | `requant` | RRR     | VPU    | `dst[i] = clip((src0[i]·m0 + rnd) >> n)` int32→int8       |
-| `0x0A` | `vecemul` | RRR     | VPU    | `dst[i] = src0[i] · src1[i]` (elementwise)                |
-| `0x0B` | `square`  | RR      | VPU    | `dst[i] = src0[i]²`                                       |
-| `0x0C` | `exp`     | RR      | VPU    | `dst[i] = exp_lut[src0[i]]`                               |
-| `0x0D` | `redmax`  | RR      | VPU    | `dst = max_i src0[i]` (scalar result)                     |
-| `0x0E` | `redsum`  | RR      | VPU    | `dst = Σ_i src0[i]` (scalar result)                       |
-| `0x0F` | `sadd`    | RRR     | VPU    | `dst[i] = src0[i] + scalar(src1)` (broadcast)             |
-| `0x10` | `adds`    | RRR     | scalar | `dst = src0 + src1`                                       |
-| `0x11` | `subs`    | RRR     | scalar | `dst = src0 − src1`                                       |
-| `0x12` | `muls`    | RRR     | scalar | `dst = src0 × src1` (low 32 bits)                         |
-| `0x13` | `cmps`    | SS      | scalar | set `eq`/`lt` flags from `cmp(src0, src1)`                |
-| `0x14` | `li`      | RIMM    | scalar | `dst = sign_extend(imm16)`                                |
-| `0x15` | `setcfg`  | CFG     | scalar | `cfg[dst] = zero_extend(imm16)`                           |
-| `0x16` | `loads`   | RS      | scalar | `dst = scratch[src0]` (int32)                             |
-| `0x17` | `stores`  | SS      | scalar | `scratch[src0] = src1` (int32)                            |
-| `0x18` | `branch`  | BRANCH  | control| `if cond(flags): pc = imm16`                              |
-| `0x19` | `jmp`     | JMP     | control| `pc = imm16`                                              |
-| `0x1A` | `wait`    | WAIT    | control| block until `flags`-selected unit is done                |
-| `0x1B` | `sdiv`    | RRR     | VPU    | `dst[i] = round(src0[i]·2¹⁵ / scalar(src1))` (Q15)        |
-| `0x1F` | `halt`    | NONE    | control| stop; raise `done`                                       |
+| Opcode | Mnemonic  | Form   | Unit    | Semantics                                            |
+| ------ | --------- | ------ | ------- | ---------------------------------------------------- |
+| `0x00` | `matmul`  | RRR    | MXU     | `out = act @ ternary-weight`; `.acc`/`.rq` via flags |
+| `0x01` | `vecdot`  | RRR    | VPU     | `dst = Σ src0·src1` (scalar result)                  |
+| `0x02` | `vecmul`  | RRR    | VPU     | `dst[i] = src0[i]·scalar(src1)`                      |
+| `0x03` | `vecadd`  | RRR    | VPU     | `dst[i] = src0[i] + src1[i]`                         |
+| `0x04` | `relu`    | RR     | VPU     | `dst[i] = max(src0[i], 0)`                           |
+| `0x05` | `gelu`    | RR     | VPU     | `dst[i] = gelu_lut[src0[i]]`                         |
+| `0x06` | `wrmem`   | SS     | DMA     | scratch(src0) → DRAM(src1)                           |
+| `0x07` | `rdmem`   | RS     | DMA     | DRAM(src0) → scratch(dst)                            |
+| `0x08` | `wrneigh` | NEIGH  | LINK    | local DRAM(src0) → neighbor DRAM(src1), dir = flags  |
+| `0x09` | `requant` | RRR    | VPU     | `dst[i] = clip((src0·m0 + rnd) >> n)` int32→int8     |
+| `0x0A` | `vecemul` | RRR    | VPU     | `dst[i] = src0[i]·src1[i]` (elementwise)             |
+| `0x0B` | `square`  | RR     | VPU     | `dst[i] = src0[i]²`                                  |
+| `0x0C` | `exp`     | RR     | VPU     | `dst[i] = exp_lut[src0[i]]`                          |
+| `0x0D` | `redmax`  | RR     | VPU     | `dst = max_i src0[i]` (scalar result)               |
+| `0x0E` | `redsum`  | RR     | VPU     | `dst = Σ_i src0[i]` (scalar result)                 |
+| `0x0F` | `sadd`    | RRR    | VPU     | `dst[i] = src0[i] + scalar(src1)` (broadcast)       |
+| `0x10` | `adds`    | RRR    | scalar  | `dst = src0 + src1`                                  |
+| `0x11` | `subs`    | RRR    | scalar  | `dst = src0 − src1`                                  |
+| `0x12` | `muls`    | RRR    | scalar  | `dst = src0 × src1` (low 32 bits)                    |
+| `0x13` | `cmps`    | SS     | scalar  | set `eq`/`lt` from `cmp(src0, src1)`                 |
+| `0x14` | `li`      | RIMM   | scalar  | `dst = sign_extend(imm16)`                           |
+| `0x15` | `setcfg`  | CFG    | scalar  | `cfg[dst] = zero_extend(imm16)`                      |
+| `0x16` | `loads`   | RS     | scalar  | `dst = scratch[src0]` (int32)                        |
+| `0x17` | `stores`  | SS     | scalar  | `scratch[src0] = src1` (int32)                       |
+| `0x18` | `branch`  | BRANCH | control | `if cond(flags): pc = imm16`                         |
+| `0x19` | `jmp`     | JMP    | control | `pc = imm16`                                         |
+| `0x1A` | `wait`    | WAIT   | control | block until `flags`-selected unit is done            |
+| `0x1B` | `sdiv`    | RRR    | VPU     | `dst[i] = round(src0[i]·2¹⁵ / scalar(src1))` (Q15)  |
+| `0x1F` | `halt`    | NONE   | control | stop; raise `done`                                   |
 
-> Opcodes `0x1C–0x1E` are unallocated. `sdiv` sits at `0x1B` (added after the
-> `0x00–0x1A` block was assigned) — the numeric gap is intentional, not a typo.
+> `0x1C–0x1E` are unallocated; `sdiv` sits at `0x1B` (added after the `0x00–0x1A` block) —
+> the numeric gap is intentional.
 
----
+## A.4 Instruction forms & selectors
 
-## 4. Instruction reference
+Which fields are *live* depends on the opcode's form (unused fields are 0):
 
-Semantics below are stated for the [ISS](../../tpulang/iss.py), which is bit-exact with
-the [RTL](../rtl/scalar_unit.sv). "scratch[a]" is the byte at scratchpad address `a`;
-int32 values are little-endian 4-byte reads/writes; int8 values are single signed bytes.
+| Form     | `dst`    | `src0`             | `src1`      | `flags`     | Mnemonics                                     |
+| -------- | -------- | ------------------ | ----------- | ----------- | --------------------------------------------- |
+| `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul, vecdot/mul/add/emul, sadd, sdiv, requant, adds/subs/muls |
+| `RR`     | dst reg  | src0 reg           | —           | —           | relu, gelu, square, exp, redmax, redsum       |
+| `RS`     | dst reg  | src0 reg           | —           | —           | rdmem, loads                                  |
+| `SS`     | —        | src0 reg           | src1 reg    | —           | wrmem, stores, cmps                           |
+| `RIMM`   | dst reg  | ⟵ imm16 ⟶          |             | —           | li                                            |
+| `CFG`    | cfg idx  | ⟵ imm16 ⟶          |             | —           | setcfg                                        |
+| `BRANCH` | —        | ⟵ imm16 (target) ⟶ |             | cond        | branch, beq/bne/blt/bge                       |
+| `JMP`    | —        | ⟵ imm16 (target) ⟶ |             | —           | jmp                                           |
+| `WAIT`   | —        | —                  | —           | unit        | wait                                          |
+| `NEIGH`  | —        | src0 reg           | src1 reg    | direction   | wrneigh                                       |
+| `NONE`   | —        | —                  | —           | —           | halt                                          |
 
-### 4.1 MXU
+**Selectors / flags:**
 
-#### `matmul[.acc][.rq]  rout, ract, rweight`  — `0x00`, RRR
+| Field         | Values                                                   |
+| ------------- | -------------------------------------------------------- |
+| matmul flags  | `flags[0]=.acc` (accumulate), `flags[1]=.rq` (requant)  |
+| branch cond   | `eq=0b00`, `ne=0b01`, `lt=0b10`, `ge=0b11`              |
+| wait unit     | `mxu=0b00`, `vpu=0b01`, `dma=0b10`, `link=0b11`         |
+| neighbor dir  | `n=0`, `e=1`, `s=2`, `w=3`                               |
+| config index  | `tlen=0`, `vlen=1`, `len=2`, `scalar=3`                 |
 
-`out = act @ weight`, int8 activations × ternary weights, int32 accumulate. Fields:
-`dst → out`, `src0 → act`, `src1 → weight` (all registers holding scratchpad byte
-addresses). Sizes: `TLEN` token rows (`cfg[0]`, 6 bits); contraction dim = array `ROWS`;
-output features = array `COLS`.
+**Config registers.** Host-presettable while idle (`cfg_we`) and runtime-writable with
+`setcfg`. Indices `0=tlen` (MXU token rows, 6 bits), `1=vlen` (VPU length, ≤1023),
+`2=len` (DMA/LINK byte count, 16 bits), `3=scalar` (`matmul.rq` requant word address).
+Indices `4..15` exist and can be named `cfg4..cfg15`, but are unassigned.
 
-| Flag  | Bit       | Effect                                                                     |
-| ----- | --------- | -------------------------------------------------------------------------- |
-| `.acc`| `flags[0]`| accumulate into the existing int32 `C` buffer at `out` (tile loops, §mxu)  |
-| `.rq` | `flags[1]`| requantize int32→int8 on store, using the `{m0,n}` word at `cfg[SCALAR]`    |
+## A.5 Numeric conventions
 
-Layout consumed:
-- **Activations** `A[t][i]`: int8, row-major, `act + t·ROWS + i`.
-- **Weights** `W[i][j]`: ternary, **column-major, 2-bit packed** at `weight + j·(ROWS·2/8)`.
-  Trit codes: `00 → 0`, `01 → +1`, `11 → −1` (bit0 = nonzero, bit1 = sign). See
-  [scratchpad.md](scratchpad.md) §2.
-- **Output** `C[t][j]`: int32 result stride `COLS·4` (no `.rq`), or int8 stride `COLS`
-  when `.rq` narrows on store. Under `.acc`, the readback of the running partial always
-  uses the int32 stride.
+Shared verbatim by `mxu.sv`, `vpu.sv`/`requant.sv`, and the ISS — what makes hardware and
+golden simulator agree byte-for-byte.
 
-The requant `{m0,n}` word is read from the address in `cfg[SCALAR]` (`m0` in the low
-`M0_W=12` bits, `n` in the next `N_W=4`). Requant arithmetic is §5.
+**Ternary weight packing.** Column-major, 2 bits/weight: `00 → 0`, `01 → +1`, `11 → −1`
+(bit 0 = nonzero flag, bit 1 = sign). `ROWS·2/8` bytes per output column.
 
-### 4.2 VPU
-
-All VPU ops take their vector length from `VLEN` (`cfg[1]`, ≤ 1023). Unless noted, they
-read **int8** operands, accumulate in **int32**, and write an **int32** result (4-byte
-stride) — the VPU does *not* narrow on writeback; `requant` is the only narrowing op. For
-the microarchitecture and the full `vpu_op` table see [vpu.md](vpu.md).
-
-`src1` doubles as the **scalar/param address** for the scalar-argument ops: the op reads
-one int32 word from `scratch[src1]` and broadcasts it.
-
-| Mnemonic  | Form | Fields → operands            | Result                                                        |
-| --------- | ---- | ---------------------------- | ------------------------------------------------------------- |
-| `vecdot`  | RRR  | dst, src0, src1              | `dst = Σᵢ src0[i]·src1[i]` → single int32 (reduction)         |
-| `vecadd`  | RRR  | dst, src0, src1              | `dst[i] = src0[i] + src1[i]`                                  |
-| `vecemul` | RRR  | dst, src0, src1              | `dst[i] = src0[i]·src1[i]`                                    |
-| `vecmul`  | RRR  | dst, src0, scalar=src1       | `dst[i] = src0[i] × scalar` (int32 scalar, broadcast)         |
-| `sadd`    | RRR  | dst, src0, scalar=src1       | `dst[i] = src0[i] + scalar` (broadcast; `x−max`, `x−mean`)    |
-| `sdiv`    | RRR  | dst, src0, scalar=src1       | `dst[i] = round(src0[i]·2¹⁵ / scalar)` in Q15 (§5)            |
-| `relu`    | RR   | dst, src0                    | `dst[i] = max(src0[i], 0)`                                    |
-| `square`  | RR   | dst, src0                    | `dst[i] = src0[i]²` (LayerNorm variance)                      |
-| `gelu`    | RR   | dst, src0                    | `dst[i] = gelu_lut[src0[i]]` (256-entry int8→int8 LUT)        |
-| `exp`     | RR   | dst, src0                    | `dst[i] = exp_lut[src0[i]]` (softmax)                         |
-| `redmax`  | RR   | dst, src0                    | `dst = maxᵢ src0[i]` → single int32                           |
-| `redsum`  | RR   | dst, src0                    | `dst = Σᵢ src0[i]` → single int32                             |
-| `requant` | RRR  | dst(int8), src0(int32), param=src1 | `dst[i] = clip((src0[i]·m0 + rnd) >> n)`, `{m0,n}` at `src1` |
-
-Reductions (`vecdot`, `redmax`, `redsum`) collapse the whole vector to one int32 at
-`dst`. `gelu`/`exp` LUTs are fixed hardware tables loaded once at init (the ISS needs
-`gelu_lut`/`exp_lut`, 256×int8, or those ops raise). LUT tables and scales:
-[vpu.md §Activation LUTs](vpu.md#activation-luts).
-
-### 4.3 DMA and LINK
-
-Byte length for all three comes from `LEN` (`cfg[2]`, 16 bits).
-
-| Mnemonic  | Form  | Fields → operands            | Semantics                                                    |
-| --------- | ----- | ---------------------------- | ----------------------------------------------------------- |
-| `wrmem`   | SS    | src0 = scratch, src1 = DRAM  | DMA scratchpad → DRAM (spill)                                |
-| `rdmem`   | RS    | dst = scratch, src0 = DRAM   | DMA DRAM → scratchpad (fill)                                 |
-| `wrneigh` | NEIGH | src0 = local, src1 = neighbor, `flags` = dir | push local DRAM → neighbor's DRAM over the link |
-
-`wrneigh` direction is `n/e/s/w = 0/1/2/3` (or a numeric 0..3), carried in `flags` — see
-[comms.md](comms.md).
-
-> **The DUT ties DMA/LINK `done` high with no engine attached** (`tpu_top.sv`), and the
-> ISS models all three as no-ops. A program that issues them completes without moving
-> any data. Programs stay correct across this by using **identical DRAM and scratchpad
-> addresses** for each tensor, so `rdmem a, a` / `wrmem a, a` are the identity in
-> simulation while byte-copying on real hardware — see the DRAM-staging note in the
-> [tpulang memory model](../../tpulang/README.md).
-
-### 4.4 Scalar arithmetic and moves
-
-| Mnemonic | Form | Fields → operands | Semantics                                              |
-| -------- | ---- | ----------------- | ------------------------------------------------------ |
-| `adds`   | RRR  | dst, src0, src1   | `dst = src0 + src1` (int32, wraps)                      |
-| `subs`   | RRR  | dst, src0, src1   | `dst = src0 − src1`                                     |
-| `muls`   | RRR  | dst, src0, src1   | `dst = src0 × src1` (low 32 bits)                       |
-| `li`     | RIMM | dst, imm16        | `dst = sign_extend(imm16)` — load an address/constant  |
-| `loads`  | RS   | dst, src0         | `dst = scratch[src0]` (int32 read)                     |
-| `stores` | SS   | src0, src1        | `scratch[src0] = src1` (int32 write)                   |
-| `setcfg` | CFG  | cfgname, imm16    | `cfg[name] = zero_extend(imm16)`; name ∈ {tlen,vlen,len,scalar} (§6) |
-
-`loads`/`stores` are the register↔scratchpad bridge that lets scalar code read a computed
-value out of a tensor (e.g. a reduction result) and write one back (e.g. the negated max
-for softmax's `x − max`).
-
-### 4.5 Control flow
-
-| Mnemonic | Form   | Encoding                          | Semantics                                              |
-| -------- | ------ | --------------------------------- | ------------------------------------------------------ |
-| `cmps`   | SS     | src0, src1                        | set `eq = (src0==src1)`, `lt = (src0<src1)` (signed)   |
-| `branch cond, tgt` | BRANCH | `imm16 = tgt`, `flags = cond` | if `cond` holds, `pc = tgt`                          |
-| `beq/bne/blt/bge tgt` | BRANCH | aliases with `cond` baked in | conditional jump; same opcode as `branch`         |
-| `jmp tgt` | JMP   | `imm16 = tgt`                     | `pc = tgt` (unconditional)                             |
-| `wait unit` | WAIT | `flags = unit`                   | block until the unit's `done` (unit ∈ {mxu,vpu,dma,link}) |
-| `halt`   | NONE   | —                                 | stop; raise `done`; re-runnable on the next `host_run` |
-
-Branch/jump targets are **word addresses** in instruction memory (labels in tpulang
-resolve to these). Conditions read the flags most recently set by `cmps`. `cond` codes:
-`eq=0b00`, `ne=0b01`, `lt=0b10`, `ge=0b11`.
-
----
-
-## 5. Numeric conventions
-
-These are shared verbatim by `mxu.sv`, `vpu.sv`/`requant.sv`, and the ISS, and are what
-makes hardware and golden simulator agree byte-for-byte.
-
-**Ternary weight packing.** Column-major, 2 bits per weight: code `00 → 0`, `01 → +1`,
-`11 → −1`. Bit 0 is the nonzero flag, bit 1 the sign. `ROWS·2/8` bytes per output column.
-
-**Requant (`matmul.rq`, `requant`).** BitNet fixed-point rescale of an int32 accumulator
-to int8:
+**Requant (`matmul.rq`, `requant`)** — BitNet fixed-point int32→int8 rescale:
 
 ```
 rnd     = (n == 0) ? 0 : (1 << (n - 1))
@@ -260,12 +527,11 @@ shifted = (acc·m0 + rnd) >> n          # arithmetic (floor) shift
 dst     = clip(shifted, -128, 127)
 ```
 
-`m0` is a positive `M0_W=12`-bit multiplier, `n` an `N_W=4`-bit shift, packed into one
-int32 word (`m0` low, `n` above) at the `cfg[SCALAR]` address (matmul) or the `src1`
-address (`requant`). `{m0=1, n=0}` is the identity+clip (a plain integer matmul).
+`m0` is a positive 12-bit (`M0_W`) multiplier, `n` a 4-bit (`N_W`) shift, packed into one
+int32 (`m0` low, `n` above) at `cfg[scalar]` (matmul) or the `src1` address (`requant`).
+`{m0=1, n=0}` is identity+clip (a plain integer matmul).
 
-**Scalar divide (`sdiv`).** A runtime divisor is reciprocated once, then reused per lane
-(Q15 result), matching `vpu.sv`:
+**Scalar divide (`sdiv`)** — a runtime divisor reciprocated once, reused per lane (Q15):
 
 ```
 R = (d == 0) ? all-ones(2^32−1) : floor(2^31 / |d|)     # RECIP_Q = 31
@@ -277,108 +543,25 @@ The result is always Q15, so its scale is a compile-time constant even though `d
 runtime. A zero divisor saturates `R` (the compiler guarantees nonzero: `Σexp ≥ 1`).
 
 **VPU datatypes.** Compute ops read int8, accumulate int32, write int32 (4-byte stride).
-`requant` is the sole narrowing op (int32 in, int8 out, 1-byte stride). Reductions write
-one int32. `int8` byte-stride buffers and `int32` byte-stride buffers therefore differ by
-4× — the compiler/programmer must place them accordingly.
+`requant` is the sole narrowing op (int32→int8, 1-byte stride). Reductions write one int32.
 
----
-
-## 6. Config registers
-
-Host-presettable while idle (`cfg_we`) and runtime-writable with `setcfg`. Named indices:
-
-| Index | Name     | Drives                    | Used by                                   |
-| ----- | -------- | ------------------------- | ----------------------------------------- |
-| `0`   | `tlen`   | `mxu_t_len` (6 bits)      | `matmul` token-row count `T`              |
-| `1`   | `vlen`   | `vpu_vlen` (10 bits)      | every VPU op's vector length              |
-| `2`   | `len`    | `dma_len` / `nb_len` (16 bits) | `rdmem`/`wrmem`/`wrneigh` byte count |
-| `3`   | `scalar` | `mxu_scalar_addr`         | `matmul.rq` requant `{m0,n}` word address |
-
-Indices `4..15` exist (`CFG_AW=4`) and can be named `cfg4`..`cfg15` in tpulang, but are
-unassigned. Config makes the same bitstream run different problem sizes without
-resynthesis; a full host-visible config list (T, d, f, array dims, per-tensor scales,
-neighbor bitmap) is in [scalar_unit.md §6](scalar_unit.md#6-config-registers).
-
----
-
-## 7. Encoding quick-reference
-
-**Instruction forms** (which register each field names; unused fields are 0):
-
-| Form     | `dst`     | `src0`      | `src1`         | `flags`      | Mnemonics                                    |
-| -------- | --------- | ----------- | -------------- | ------------ | -------------------------------------------- |
-| `RRR`    | dst reg   | src0 reg    | src1 reg       | op modifier  | matmul, vecdot/mul/add/emul, sadd, sdiv, requant, adds/subs/muls |
-| `RR`     | dst reg   | src0 reg    | —              | —            | relu, gelu, square, exp, redmax, redsum      |
-| `RS`     | dst reg   | src0 reg    | —              | —            | rdmem, loads                                 |
-| `SS`     | —         | src0 reg    | src1 reg       | —            | wrmem, stores, cmps                          |
-| `RIMM`   | dst reg   | ⟵ imm16 ⟶   |                | —            | li                                           |
-| `CFG`    | cfg idx   | ⟵ imm16 ⟶   |                | —            | setcfg                                       |
-| `BRANCH` | —         | ⟵ imm16 (target) ⟶ |         | cond         | branch, beq/bne/blt/bge                       |
-| `JMP`    | —         | ⟵ imm16 (target) ⟶ |         | —            | jmp                                          |
-| `WAIT`   | —         | —           | —              | unit         | wait                                         |
-| `NEIGH`  | —         | src0 reg    | src1 reg       | direction    | wrneigh                                      |
-| `NONE`   | —         | —           | —              | —            | halt                                         |
-
-**Flag / selector fields:**
-
-| Field         | Values                                                        |
-| ------------- | ------------------------------------------------------------ |
-| matmul flags  | `flags[0]=.acc` (accumulate), `flags[1]=.rq` (requant)       |
-| branch cond   | `eq=0b00`, `ne=0b01`, `lt=0b10`, `ge=0b11`                    |
-| wait unit     | `mxu=0b00`, `vpu=0b01`, `dma=0b10`, `link=0b11`              |
-| neighbor dir  | `n=0`, `e=1`, `s=2`, `w=3`                                    |
-| config index  | `tlen=0`, `vlen=1`, `len=2`, `scalar=3`                       |
-
----
-
-## 8. Execution & synchronization model
+## A.6 Execution model
 
 The scalar unit issues one instruction per decode, **in order**, under the v1
 **issue-and-wait** model: a compute/comms dispatch asserts the unit's `start`, then the
-scalar unit blocks in `S_WAIT` until that unit's `done` before retiring and advancing the
-PC. Independent scalar/address work does *not* currently overlap a dispatch (a documented
-future optimization is run-ahead scoreboarding — see [scalar_unit.md §2](scalar_unit.md#2-execution-model)).
+scalar unit blocks in `S_WAIT` until that unit's `done` before retiring and advancing PC.
+Independent scalar/address work does not currently overlap a dispatch (run-ahead
+scoreboarding is a documented future step — see
+[scalar_unit.md §2](scalar_unit.md#2-execution-model)).
 
 FSM sketch (`scalar_unit.sv`): `FETCH → DECODE → EXEC → {LOAD | WAIT | FETCH}`.
-- Single-cycle ops (scalar arith, `li`, `setcfg`, `cmps`, `branch`, `jmp`, `stores`)
-  retire in `EXEC`.
+- Single-cycle ops (scalar arith, `li`, `setcfg`, `cmps`, `branch`, `jmp`, `stores`) retire
+  in `EXEC`.
 - `loads` takes an extra cycle in `S_LOAD` for the synchronous scratchpad read.
-- Dispatches (`matmul`, all VPU ops, `rdmem`/`wrmem`, `wrneigh`) and `wait` sit in
-  `S_WAIT` until the selected unit's `done`.
+- Dispatches (`matmul`, VPU ops, `rdmem`/`wrmem`, `wrneigh`) and `wait` sit in `S_WAIT`
+  until the selected unit's `done`.
 - `halt` enters `S_HALT`, drives `done`, and re-enters on the next `host_run`.
 
-Because the ISS runs every dispatch **atomically** (read operands → compute → write
-back), the final scratchpad image it produces is exactly what the cycle-accurate hardware
-must reproduce — this is what `gen_vectors.py` exports as the golden test vectors.
-
----
-
-## 9. Worked encoding
-
-Assembling `matmul.rq  r3, r1, r2` (out=r3, act=r1, weight=r2, requant):
-
-```
-opcode = 0x00 (matmul)          → 000000
-dst    = 3                       → 00000011   (bits 25..18)
-src0   = 1                       → 00000001   (bits 17..10)
-src1   = 2                       → 00000010   (bits  9.. 2)
-flags  = 0b10 (.rq)              → 10         (bits  1.. 0)
-
-word = (0<<26) | (3<<18) | (1<<10) | (2<<2) | 2
-     = 0x000C_0000 | 0x0000_0400 | 0x0000_0008 | 0x2
-     = 0x000C_040A
-```
-
-And `li r1, 0x1000` (imm16 form):
-
-```
-opcode = 0x14 (li)  → 010100
-dst    = 1
-imm16  = 0x1000
-word   = (0x14<<26) | (1<<18) | (0x1000<<2) | 0
-       = 0x5000_0000 | 0x0004_0000 | 0x0000_4000
-       = 0x5004_4000
-```
-
-Cross-check any program with `python assembler.py prog.tpu --listing`, which prints the
-`addr / word / flags / source` for every instruction.
+Because the ISS runs every dispatch **atomically** (read operands → compute → write back),
+the final scratchpad image it produces is exactly what the cycle-accurate hardware must
+reproduce — this is what `gen_vectors.py` exports as the golden test vectors.

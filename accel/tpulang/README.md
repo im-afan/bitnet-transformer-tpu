@@ -57,7 +57,7 @@ error. `.equ` values are computed with the expression evaluator below.
 
 ### 1.3 Operands
 
-Three operand kinds, chosen by the instruction's form (see [ISA §7](../tpu/docs/isa.md#7-encoding-quick-reference)):
+Three operand kinds, chosen by the instruction's form (see [ISA Appendix A.4](../tpu/docs/isa.md#a4-instruction-forms--selectors)):
 
 - **Register** — `rN` (0..31) or a `.reg` alias. `r0` reads as 0. Registers hold **byte
   addresses** (or scalar values); compute ops read the register *contents* as the
@@ -162,17 +162,25 @@ between DRAM and scratchpad. A self-contained kernel therefore follows:
 host --UART/DMA--> DRAM --rdmem--> scratchpad --compute--> scratchpad --wrmem--> DRAM
 ```
 
-**The identical-address convention.** The current DUT (`tpu_top.sv`) has no DMA/LINK
-engine attached — their `done` is tied high — and the [ISS](iss.py) models them as
-no-ops with input tensors pre-placed in the scratchpad. To keep programs correct in *both*
-the real byte-copying hardware and the no-op simulator, the examples give each tensor the
-**same address in DRAM and scratchpad**. Then `rdmem a, a` / `wrmem a, a` are the identity
-in simulation and a matched-address copy on hardware — both agree. `gen_vectors.py` only
-checks the bytes the program actually *wrote*, so DRAM-only scratch never needs staging.
+**DMA is real.** `tpu_top.sv` now has a DMA engine + external SRAM controller
+(`dma.sv`/`sram.sv`), and the [ISS](iss.py) matches it: `rdmem`/`wrmem` are real byte
+copies over `cfg 'len'` between a **separate DRAM space** and the scratchpad. Inputs live
+in DRAM, `rdmem` fills the scratchpad, and `wrmem` is what makes a result host-visible
+again — so `gen_vectors.py` seeds DRAM with the inputs and checks the DRAM bytes the
+program spilled with `wrmem` (the testbench does the same by backdoor-poking its DRAM
+model). (LINK/`wrneigh` is still a no-op — no link engine is attached.)
+
+**The identical-address convention.** The small examples give each tensor the **same
+address in DRAM and in the scratchpad**, so a fill/spill is just `rdmem a, a` / `wrmem a,
+a` — a tidy way to keep the address arithmetic obvious. This is only a convenience, *not*
+a requirement: because the DMA truly copies, a scratch buffer and its DRAM tile can sit at
+different addresses. [`tiled_matmul.tpu`](examples/tiled_matmul.tpu) uses that to **stream
+tiles** — each `rdmem` pulls one tile from an advancing DRAM address into a small *fixed*
+scratchpad buffer, so A, W and C can each be far larger than the scratchpad.
 
 ### 2.3 Data layout
 
-The MXU and VPU consume fixed layouts (see [ISA §4](../tpu/docs/isa.md#4-instruction-reference)):
+The MXU and VPU consume fixed layouts (see [ISA §4.4](../tpu/docs/isa.md#44-lay-tensors-out-the-way-the-units-expect)):
 
 - **Activations** `A[t][i]`: int8, **row-major**, `base + t·ROWS + i`.
 - **Weights** `W[i][j]`: ternary, **column-major, 2-bit packed** (`00→0, 01→+1, 11→−1`),
@@ -200,7 +208,7 @@ Each stages its own operands over DRAM (§2.2) and ends in `halt`.
 | ----------------------------------------- | -------------------------------------------------------------------- |
 | [`vector_add.tpu`](examples/vector_add.tpu) | smallest VPU program: config + one elementwise op (residual `C=A+B`) |
 | [`relu_layer.tpu`](examples/relu_layer.tpu) | one ternary layer `Y=requant(A@W)` + `relu` — the shape the adder model runs |
-| [`tiled_matmul.tpu`](examples/tiled_matmul.tpu) | the tile loop: `li/adds/cmps/branch/jmp` drive `matmul` → `matmul.acc` → `matmul.acc.rq` |
+| [`tiled_matmul.tpu`](examples/tiled_matmul.tpu) | streams a big `A@W` tile-by-tile: nested M/N/K loops (`li/muls/adds/cmps/branch/jmp`) `rdmem` each tile into fixed buffers, then `matmul` → `matmul.acc` → `matmul.acc.rq` — scratchpad use is fixed regardless of matrix size |
 | [`softmax_row.tpu`](examples/softmax_row.tpu) | a multi-op micro-sequence + scalar↔vector interplay (`redmax → sadd → exp → redsum → sdiv`) |
 
 **Softmax, annotated** — no single instruction; the scalar unit decomposes it into VPU

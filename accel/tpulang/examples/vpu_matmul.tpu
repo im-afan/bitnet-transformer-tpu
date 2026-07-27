@@ -1,0 +1,41 @@
+; matmul on the vpu, for int8 x int8 in attention (prefill)
+; Q (T x D_HEAD) * K^T (D_HEAD x T) -> T x T
+
+.equ Q 0x0000
+.equ K 0x1000
+.equ SCALAR 0x2000
+.equ OUT 0x3000
+
+.equ T 128     ; token count
+.equ D_HEAD 16 ; head dim
+.equ LEN 2048  ; T * D_HEAD
+
+.reg q_data r1
+.reg k_data r2
+.reg scalar_data r3
+.reg out r4
+.reg i r5
+.reg n r6
+.reg m r7
+
+setcfg len, LEN
+setcfg vlen, D_HEAD
+
+li q_data, Q
+li k_data, K
+li scalar_data, SCALAR
+li out, OUT
+li i, 0
+li j, 0
+li n, T
+li m, T
+
+loop1: 
+    cmps i, n
+    bge final
+    loop2:
+        
+        
+        
+
+

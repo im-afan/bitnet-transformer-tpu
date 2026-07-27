@@ -19,9 +19,16 @@ Numerics are kept bit-exact with the RTL:
   * VPU ops: int8 operands, int32 accumulate, int32 writeback; VOP_REQUANT
     narrows int32->int8 with the same fixed-point rescale (vpu.sv requant8).
 
-DMA (rdmem/wrmem) and inter-TPU LINK (wrneigh) are modelled as no-ops, matching
-``tpu_top.sv``, which ties their ``done`` high with no engine attached — a
-program that issues them completes without moving any data.
+DMA (rdmem/wrmem) is modelled as a real byte copy between a separate external
+**DRAM** space and the on-chip scratchpad, over ``cfg 'len'`` bytes — matching the
+``dma.sv``/``sram.sv`` engine now wired into ``tpu_top.sv`` (and how
+``tpu_top_tb.sv`` seeds/reads DRAM). This lets a kernel stream tiles: fill a small
+fixed scratchpad buffer from an advancing DRAM address, compute, spill the result
+back to a distinct DRAM address — so the operands need not all fit in scratchpad.
+Inputs live in DRAM, ``rdmem`` fills scratchpad, and ``wrmem`` is what makes a byte
+host-visible again, so the golden outputs are exactly the DRAM bytes ``wrmem`` wrote
+(tracked in ``dram_written``). Inter-TPU LINK (wrneigh) is still a no-op — no link
+engine is attached.
 """
 
 from __future__ import annotations
@@ -78,17 +85,21 @@ class TPU:
     gelu_lut: list | None = None   # 256 x int8, indexed by unsigned input byte
     exp_lut: list | None = None    # 256 x int8
 
-    mem: bytearray = field(init=False)
+    mem: bytearray = field(init=False)      # on-chip scratchpad
+    dram: bytearray = field(init=False)     # external DRAM (DMA source/destination)
     regs: list = field(init=False)          # 32 x int32 (r0 hardwired 0)
     cfg: list = field(init=False)           # 16 x int32
-    written: set = field(init=False)        # byte addrs a compute/store op wrote
+    written: set = field(init=False)        # scratchpad byte addrs a compute/store wrote
+    dram_written: set = field(init=False)   # DRAM byte addrs a wrmem spilled (host output)
 
     def __post_init__(self):
         self.depth = 1 << self.addr_w
         self.mem = bytearray(self.depth)
+        self.dram = bytearray(self.depth)
         self.regs = [0] * 32
         self.cfg = [0] * 16
         self.written = set()
+        self.dram_written = set()
         self.wcol_bytes = (self.rows * 2) // 8   # packed ternary column bytes
 
     # ---- scratchpad access (addresses wrap mod depth, like the RTL) ----------
@@ -117,6 +128,20 @@ class TPU:
             self.mem[a] = (val >> (8 * k)) & 0xFF
             if track:
                 self.written.add(a)
+
+    # ---- DMA: byte copy DRAM<->scratchpad over cfg 'len' (dma.sv/sram.sv) -----
+    def _dma(self, *, dst: int, src: int, to_scratch: bool) -> None:
+        """Copy ``cfg['len']`` bytes. Fill (to_scratch) reads DRAM into the
+        scratchpad; spill writes the scratchpad back to DRAM and records the
+        touched DRAM bytes as host-visible output."""
+        n = self.cfg[CFG_LEN] & 0xFFFF
+        for k in range(n):
+            if to_scratch:
+                self.mem[self._a(dst + k)] = self.dram[self._a(src + k)]
+            else:
+                a = self._a(dst + k)
+                self.dram[a] = self.mem[self._a(src + k)]
+                self.dram_written.add(a)
 
     # ---- register file (r0 == 0) ---------------------------------------------
     def rreg(self, field8: int) -> int:
@@ -187,8 +212,14 @@ class TPU:
                 self._vpu(opc, r_dst & addr_mask, r_src0 & addr_mask,
                           r_src1 & addr_mask)
 
-            elif opc in (OP_WRMEM, OP_RDMEM, OP_WRNEIGH):
-                pass  # no DMA/LINK engine in tpu_top.sv — completing no-op
+            elif opc == OP_RDMEM:    # fill: DRAM(src0) -> scratchpad(dst)
+                self._dma(dst=r_dst & addr_mask, src=r_src0 & addr_mask,
+                          to_scratch=True)
+            elif opc == OP_WRMEM:    # spill: scratchpad(src0) -> DRAM(src1)
+                self._dma(dst=r_src1 & addr_mask, src=r_src0 & addr_mask,
+                          to_scratch=False)
+            elif opc == OP_WRNEIGH:
+                pass  # no LINK engine attached in tpu_top.sv — completing no-op
 
             elif opc == OP_ADDS:
                 self.wreg(f_dst, r_src0 + r_src1)
