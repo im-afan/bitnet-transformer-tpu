@@ -110,30 +110,61 @@ top-level wires them straight through:
 **Contract.** Byte-addressed; each port gathers/scatters its own byte width
 (parameters `A_BYTES`, `W_BYTES`, `C_BYTES`, `V_BYTES`, `S_BYTES`, `DMA_BYTES`,
 defaulting to a 128×128 array). Reads are **synchronous** — `*_rdata` valid the
-cycle after `*_re` — and all read ports are independent, so the MXU can read
-`A_rd`, `W_rd` and `C_rw` in the same cycle. Writes are single-cycle under a
-per-byte strobe. A read and write to the same byte in one cycle returns the
-**old** value (read-first). This matches every unit and the inline TB memory
-models. Same-byte concurrent *writes* are not expected under the §4 static
-arbitration; the module resolves them C < V < S < DMA (last wins).
+cycle after `*_re`. Writes are single-cycle under a per-byte strobe. A read and
+write to the same byte in one cycle returns the **old** value (read-first). A
+window running off the top of the memory wraps mod `2**ADDR_W`.
 
-**Registers vs BRAM.** The `MEM_STYLE` parameter selects the storage primitive at
-elaboration, with identical functional/timing behaviour either way (the rest of
-the TPU is agnostic):
+**One read and one write per cycle.** The six read ports are muxed onto a single
+banked-BRAM read port (priority `A > W > C > V > S > DMA`), the four write ports
+onto a single write port (`DMA > S > V > C`, reproducing the old flat model's
+last-writer-wins order). A read and a write still proceed together — they are the
+two ports of the same BRAM — but two simultaneous reads, or two simultaneous
+writes, are not supported.
+
+This costs nothing, because the TPU never issues them. The MXU drives `A_re`,
+`W_re` and `C_re` from mutually exclusive FSM states (`S_LOAD` / `S_RUN` /
+`S_WB_RD`); the VPU reads in `S_RD0`/`S_RD1`/`S_RDS`; and the scalar unit is
+issue-and-wait — a dispatch op parks it in `S_WAIT` until the unit reports done,
+so MXU, VPU and DMA activity never overlaps and `s_re`/`s_we` only fire while no
+other unit owns the memory. The arbiter is therefore *exact*, not best-effort:
+no requester is ever denied, and no stall handshake is needed (none of the units
+have one). `scratchpad.sv` checks the invariant every cycle in simulation and
+`$error`s if it is ever violated.
+
+One visible consequence: `*_rdata` are slices of a single shared output register,
+so a read on any port updates all of them. Each consumer samples one cycle after
+its own enable with nothing else reading, so behaviour is unchanged — but the
+ports are no longer independently held.
+
+**Banking.** Storage is split into `NBANK` one-byte-wide banks (`NBANK` = widest
+port rounded up to a power of two), byte address `a` living in bank
+`a[OFF_W-1:0]` at row `a[ADDR_W-1:OFF_W]`. An unaligned `NBANK`-byte window then
+takes exactly one byte from every bank: bank `b` needs row `row0` when `b >= off`
+and `row0 + 1` when `b < off`, so the per-bank address is a 1-bit adjustment
+rather than an arbitrary index. The gathered bytes come back rotated by `off`,
+undone by one barrel rotate on the read path (and the mirror rotate applied on
+the write path). That replaces `NBANK` 64 Ki-to-1 byte multiplexers with `NBANK`
+dual-port BRAMs plus two log₂(`NBANK`)-stage rotate networks — the difference
+between "does not fit on any part" and "fits in about two thirds of an A7-35T's
+block RAM". See [synth.md](synth.md) §5.
+
+**Registers vs BRAM.** Banking is unconditional; `MEM_STYLE` only picks the
+primitive each bank is built from, with identical functional/timing behaviour
+either way:
 
 | `MEM_STYLE` | `ram_style` hint | Inferred primitive            | Use when                     |
 | ----------- | ---------------- | ----------------------------- | ---------------------------- |
-| `"BRAM"` (default) | `block`   | FPGA block RAM                | large regions (weight tiles) |
-| `"REG"`     | `registers`      | flip-flop / distributed RAM   | small, very-wide, many-read scratch |
+| `"BRAM"` (default) | `block`   | FPGA block RAM                | anything board-sized         |
+| `"REG"`     | `registers`      | flip-flops                    | shallow unit-test depths only |
 
-A full block-RAM mapping of the whole multi-read/multi-write port set needs the
-per-bank replication in §3; until a board is fixed in `constraints/`, the
-behavioural model plus the `ram_style` hint captures both synthesis targets.
+At `ADDR_W=16`, `"REG"` is the flip-flop explosion the banking exists to avoid;
+it is there so `scratchpad_tb.sv` can cross-check the two elaborations.
 
 Verify with `make TEST=scratchpad sim` (`tb/scratchpad_tb.sv` instantiates the
 `"BRAM"` and `"REG"` variants side by side and checks both against a byte-array
-reference, covering strobed writes, cross-port coherence, concurrent multiport
-reads, and read-first).
+reference, covering strobed writes, cross-port coherence, an unaligned sweep over
+every byte offset in a bank row, address wrap, back-to-back reads on different
+ports, and read-first).
 
 ## 7. Open questions
 

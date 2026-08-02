@@ -15,10 +15,21 @@
 //   - C port  : int32 result-row write + accumulate-style readback.
 //   - Cross-port coherence: write via one port, read the same bytes via another
 //               (shared storage, differing widths / byte views).
-//   - Concurrent reads: A_rd, W_rd and C_rw all latched in the same cycle
-//               (the MXU drives them together).
+//   - Unaligned windows: reads and writes at every byte offset within a bank
+//               row, including windows that straddle the bank wrap — the case
+//               the byte-lane banking + barrel rotate exists to handle.
+//   - Address wrap: a window running off the top of the memory wraps mod DEPTH.
+//   - Port sequencing: A_rd, W_rd and C_rw driven on consecutive cycles (how the
+//               MXU actually walks its S_LOAD / S_RUN / S_WB_RD states).
 //   - Read-first: a read and a write to the same address in one cycle returns
 //               the OLD value.
+//
+// NOT covered, deliberately: simultaneous requests on two read ports (or two
+// write ports). scratchpad.sv arbitrates them onto one banked BRAM port by fixed
+// priority and flags the overlap with $error — the TPU never issues them (see
+// the exclusivity invariant in the scratchpad.sv header), and supporting them
+// would need one storage replica per read port, ~3 Mbit against the A7-35T's
+// 1800 Kbit. Driving two enables here would trip the module's own assertion.
 //
 // Run:  make TEST=scratchpad sim      (iverilog -g2012 + vvp)
 // -----------------------------------------------------------------------------
@@ -103,6 +114,12 @@ module scratchpad_tb;
     // -------------------------------------------------------------------------
     logic [7:0] ref_mem [0:MEM_SZ-1];
     int errors = 0, checks = 0;
+
+    // Scratch temporaries for the unaligned sweep (declared here so the stimulus
+    // block stays free of mid-block declarations).
+    localparam int NBANK_TB = 16;          // = widest port (C_BYTES) rounded to 2^n
+    logic [ADDR_W-1:0]    ua;
+    logic [V_BYTES*8-1:0] pat;
 
     task automatic ref_wr(input [ADDR_W-1:0] a, input int nbytes,
                           input [1023:0] data, input [127:0] strb, input logic use_strb);
@@ -202,6 +219,20 @@ module scratchpad_tb;
               a, A_BYTES, tag);
     endtask
 
+    task automatic rd_w(input [ADDR_W-1:0] a, input string tag);
+        @(negedge clk); W_re = 1'b1; W_raddr = a;
+        @(negedge clk); W_re = 1'b0;
+        check({{(1024-W_BYTES*8){1'b0}}, W_rdata_b}, {{(1024-W_BYTES*8){1'b0}}, W_rdata_r},
+              a, W_BYTES, tag);
+    endtask
+
+    task automatic rd_dma(input [ADDR_W-1:0] a, input string tag);
+        @(negedge clk); dma_re = 1'b1; dma_raddr = a;
+        @(negedge clk); dma_re = 1'b0;
+        check({{(1024-DMA_BYTES*8){1'b0}}, dma_rdata_b},
+              {{(1024-DMA_BYTES*8){1'b0}}, dma_rdata_r}, a, DMA_BYTES, tag);
+    endtask
+
     // -------------------------------------------------------------------------
     // Stimulus.
     // -------------------------------------------------------------------------
@@ -244,21 +275,57 @@ module scratchpad_tb;
         wr_s(12'h044, 32'h7788_99AA);   // lands inside the V-region above
         rd_a(12'h040, "S->A-coherent");
 
-        // --- Concurrent multiport read (A, W, C together, like the MXU) ------
+        // --- Unaligned windows at every byte offset within a bank row --------
+        // The flat model made this trivially correct; the banked model has to
+        // skew the row select per bank and barrel-rotate both directions, so
+        // sweep every offset rather than spot-checking one.
+        for (int off = 0; off < NBANK_TB; off++) begin
+            ua = 12'h400 + off;
+            for (int k = 0; k < V_BYTES; k++) pat[k*8 +: 8] = off*16 + k;
+            wr_v(ua, pat, {V_BYTES{1'b1}});
+            rd_v(ua, "UA-V-full");
+        end
+
+        // Same sweep with a byte strobe, so the strobe rotate is exercised too
+        // (masked bytes must retain what the sweep above left there).
+        for (int off = 0; off < NBANK_TB; off++) begin
+            ua = 12'h400 + off;
+            for (int k = 0; k < V_BYTES; k++) pat[k*8 +: 8] = 8'hF0 + k;
+            wr_v(ua, pat, 8'b1010_1010);
+            rd_v(ua, "UA-V-strb");
+        end
+
+        // A full-NBANK-width unaligned access: spans every bank and forces the
+        // +1 row select on the wrapped ones. Read back through a narrower port
+        // to confirm the byte view agrees.
+        wr_c(12'h505, {4{32'hDEAD_C0DE}}, {C_BYTES{1'b1}});
+        rd_c(12'h505, "UA-C-full");
+        rd_a(12'h505, "UA-C->A");
+        rd_w(12'h50B, "UA-C->W");
+
+        // --- Address wrap: a window running off the top wraps mod DEPTH ------
+        wr_v(12'hFFC, 64'h0102_0304_0506_0708, {V_BYTES{1'b1}});
+        rd_v(12'hFFC, "wrap-V");
+        rd_dma(12'hFFC, "wrap-DMA");
+        rd_s(12'h000, "wrap-tail");     // the bytes that wrapped to the bottom
+
+        // --- Port sequencing: A, W, C on consecutive cycles -------------------
+        // How the MXU actually drives them (S_LOAD -> S_RUN -> S_WB_RD are
+        // distinct states). Each port's data must be valid the cycle after its
+        // own enable, with the next port's request already in flight.
         wr_s(12'h200, 32'hA1A2_A3A4);
         wr_s(12'h300, 32'hB1B2_B3B4);
-        @(negedge clk);
-        A_re = 1'b1; A_raddr = 12'h040;   // V-region
-        W_re = 1'b1; W_raddr = 12'h200;
-        C_re = 1'b1; C_raddr = 12'h100;   // C-row
-        @(negedge clk);
-        A_re = 1'b0; W_re = 1'b0; C_re = 1'b0;
+
+        @(negedge clk); A_re = 1'b1; A_raddr = 12'h040;
+        @(negedge clk); A_re = 1'b0; W_re = 1'b1; W_raddr = 12'h200;
         check({{(1024-A_BYTES*8){1'b0}}, A_rdata_b}, {{(1024-A_BYTES*8){1'b0}}, A_rdata_r},
-              12'h040, A_BYTES, "MP-A");
+              12'h040, A_BYTES, "SEQ-A");
+        @(negedge clk); W_re = 1'b0; C_re = 1'b1; C_raddr = 12'h100;
         check({{(1024-W_BYTES*8){1'b0}}, W_rdata_b}, {{(1024-W_BYTES*8){1'b0}}, W_rdata_r},
-              12'h200, W_BYTES, "MP-W");
+              12'h200, W_BYTES, "SEQ-W");
+        @(negedge clk); C_re = 1'b0;
         check({{(1024-C_BYTES*8){1'b0}}, C_rdata_b}, {{(1024-C_BYTES*8){1'b0}}, C_rdata_r},
-              12'h100, C_BYTES, "MP-C");
+              12'h100, C_BYTES, "SEQ-C");
 
         // --- Read-first: read and write the same S address in one cycle ------
         wr_s(12'h050, 32'h1234_5678);

@@ -12,6 +12,7 @@ Detailed per-component design notes (this file is the overview):
 | [comms.md](comms.md)             | 2D inter-TPU link for scale-out                       |
 | [scalar_unit.md](scalar_unit.md) | Control processor microarchitecture                   |
 | [isa.md](isa.md)                 | Guide to writing TPU programs in tpulang (+ encoding/opcode appendix) |
+| [synth.md](synth.md)             | Vivado build flow, Cmod A7-35T deployment, sizing reality check |
 
 The assembly language that lowers 1:1 onto the ISA is documented in
 [`accel/tpulang/README.md`](../../tpulang/README.md).

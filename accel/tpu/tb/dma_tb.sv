@@ -135,27 +135,18 @@ module dma_tb;
         end
     endtask
 
-    // Read one scratchpad byte at absolute address `a` through the DMA port.
-    // NOTE: static (not automatic): `a`/`b` are referenced in `force` below, which
-    // may not name automatic variables. Called sequentially, so no reentrancy risk.
-    task spad_read_byte(input [SCRATCHPAD_ADDR_W-1:0] a,
-                               output [7:0] b);
-        // @(negedge clk);
-        // force u_spad.dma_re    = 1'b1;
-        // force u_spad.dma_raddr = a;
-        // @(negedge clk);
-        // force u_spad.dma_re    = 1'b0;
-        // @(negedge clk);                 // rdata valid now
-        // b = u_spad.dma_rdata[7:0];
-        // release u_spad.dma_re;
-        // release u_spad.dma_raddr;
-        b = u_spad.g_mem.mem[a];
+    // Seed / check individual scratchpad bytes without disturbing the DMA port
+    // the DUT is driving. These go through the scratchpad's own simulation
+    // backdoor rather than reaching into its storage: the array is byte-lane
+    // banked, so a byte does not live at `mem[a]` and the owning bank cannot be
+    // selected by a runtime index from out here. See scratchpad.sv bd_peek/bd_poke.
+    task spad_read_byte(input [SCRATCHPAD_ADDR_W-1:0] a, output [7:0] b);
+        u_spad.bd_peek(a, b);
     endtask
 
-    // Write one scratchpad byte at absolute address `a` through the DMA port.
-    // static (not automatic): `a`/`b` are referenced in `force` below.
+    // Write one scratchpad byte at absolute address `a`.
     task static spad_write_byte(input [SCRATCHPAD_ADDR_W-1:0] a, input [7:0] b);
-        u_spad.g_mem.mem[a] = b; 
+        u_spad.bd_poke(a, b);
     endtask
 
     // -------------------------------------------------------------------------

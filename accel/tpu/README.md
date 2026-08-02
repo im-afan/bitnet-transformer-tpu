@@ -17,14 +17,18 @@ by simulating it against vectors produced by that reference (the same role the C
 | `tb/`          | Testbenches and simulation-only SystemVerilog (drivers, scoreboards, assertions). |
 | `sim/`         | Simulator run scripts and generated artifacts (waveforms, logs — gitignored).   |
 | `constraints/` | Pin assignment and timing constraints, one file per target board (`.xdc` / `.sdc` / `.pcf`). |
-| `synth/`       | Synthesis / place-and-route / bitstream build scripts, one flow per toolchain.  |
+| `synth/`       | Synthesis / place-and-route / bitstream build scripts, one flow per toolchain. Vivado lives in `synth/vivado/`, with per-board definitions and top-level wrappers under `synth/vivado/boards/<board>/`. Build output goes to `synth/build/` (gitignored). |
 | `host/`        | Host-side driver + Python runtime that streams weights/activations to the FPGA and exposes it as a model backend. |
 | `docs/`        | Microarchitecture notes: ISA / command format, register + memory map, dataflow, numerics. |
 
-## Roadmap (no RTL written yet)
+## Roadmap
 
-1. `docs/` — pin down datatype (e.g. int8/bf16), tile size, and the systolic-array dataflow.
-2. `rtl/` — single processing element, then the array, then the surrounding control + memory map.
-3. `tb/` + `sim/` — unit-test each block against golden vectors exported from `model/`.
-4. `constraints/` + `synth/` — target a concrete board, synthesize, flash.
+1. ~~`docs/` — pin down datatype, tile size, and the systolic-array dataflow.~~ **done**
+2. ~~`rtl/` — the blocks, the array, control + memory map.~~ **done**
+3. ~~`tb/` — unit-test each block, then end-to-end over the UART link against golden
+   vectors from `tpulang/gen_vectors.py`.~~ **done**
+4. `constraints/` + `synth/` — **in progress.** Target is the Digilent Cmod A7-35T; the
+   Vivado flow and board wrapper are in place (see [`docs/synth.md`](docs/synth.md)).
+   Remaining blocker: `scratchpad.sv` is a behavioural model with six read ports on a
+   flat byte array and needs banking into true 2-port BRAM before the design fits.
 5. `host/` — wire the FPGA in as a selectable backend, mirroring the `use_custom_attention` path.

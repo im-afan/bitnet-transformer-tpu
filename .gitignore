@@ -13,9 +13,41 @@ accel/tpu/sim/*.wdb
 accel/tpu/sim/*.vvp
 accel/tpu/sim/*.out
 
+# tb/Makefile writes compiled/waveform output next to the testbenches, not into
+# sim/. (Some of these are already tracked from before this rule existed —
+# `git rm --cached accel/tpu/tb/*.vvp accel/tpu/tb/*.vcd` to drop them.)
+accel/tpu/tb/*.vvp
+accel/tpu/tb/*.vcd
+accel/tpu/tb/*.fst
+
 # --- hardware: synthesis / place-and-route / bitstreams ---
 accel/tpu/synth/build/
 *.bit
 *.bin
 *.jou
 *.log
+
+# --- hardware: Vivado ---
+# No Vivado *project* is version controlled. synth/vivado/build.tcl is the
+# recipe; everything it produces goes to synth/build/<board>/ (ignored above).
+# The rest of these catch the debris Vivado drops into whatever directory it
+# happens to be launched from, which is often the repo root.
+*.xpr
+*.xpr.bak
+.Xil/
+.srcs/
+*.cache/
+*.gen/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.dcp
+*.mcs
+*.prm
+*.ltx
+*.str
+usage_statistics_webtalk.*
+tight_setup_hold_pins.txt
+hs_err_pid*.log
+clockInfo.txt
