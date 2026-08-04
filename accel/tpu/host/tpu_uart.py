@@ -38,16 +38,31 @@ is NAK'd and touches nothing, so preload/readback only works while the core is
 idle. There is no status-read command, so the host cannot poll ``busy``/``done``
 over this link — after :meth:`TPUUart.go` you wait out-of-band (see README).
 
+Both failure modes are byte-level, so the driver can log every byte it moves
+(see :class:`UartTrace`)::
+
+    with TPUUart("COM3", trace=True) as tpu:    # live hexdump to stderr
+        tpu.go(0)
+
+    tpu = TPUUart("COM3", trace=UartTrace(sink=None))   # record silently
+    ...
+    tpu.dump_trace()                            # print it after the fact
+
+From the CLI, ``--trace`` / ``--trace-file FILE``.
+
 Requires ``pyserial``.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import re
 import sys
 import time
-from typing import Iterable, Sequence
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Iterable, Iterator, Sequence
 
 # ---- Protocol constants (mirror rtl/uart_interface.sv) -----------------------
 
@@ -151,6 +166,258 @@ def pack_words(words: Iterable[int]) -> bytes:
     return bytes(out)
 
 
+# ---- Byte-level tracing -----------------------------------------------------
+#
+# Debugging this link means answering "which byte went where, and when" — a
+# desync shows up as the device replying to bytes the host thought were payload,
+# which is invisible at the level of "write_mem raised NakError".
+#
+# Every transfer goes through _TracedSerial, a transparent proxy around the
+# pyserial port, so the trace covers the driver's own traffic *and* anything a
+# caller does with ``tpu.ser`` directly (the raw frame pokes in
+# test_uart_link.py, say). Bytes thrown away by reset_input_buffer() are
+# recorded too: stale reply bytes sitting in the input buffer are exactly the
+# evidence that the previous command desynced.
+
+TRACE_TX = "TX"      # host -> device
+TRACE_RX = "RX"      # device -> host
+TRACE_DROP = "DROP"  # device -> host, discarded unread by the driver
+TRACE_NOTE = "--"    # no bytes; a decode ("ACK") or a driver-side remark
+
+
+@dataclass
+class TraceEvent:
+    """One serial operation: a run of bytes moving in one direction."""
+
+    t: float            # seconds since the trace started
+    kind: str           # TRACE_TX | TRACE_RX | TRACE_DROP | TRACE_NOTE
+    data: bytes = b""
+    context: str = ""   # driver call in flight, e.g. "write_mem[0x1000+8]"
+    note: str = ""      # decode ("ACK") or anomaly ("short read: ...")
+
+
+class UartTrace:
+    """A log of every byte crossing the link.
+
+    Args:
+        sink: where to emit events as they happen — a text file object, a
+            ``callable(line)``, or ``None`` to only accumulate them in
+            :attr:`events` (dump later with :meth:`dump`).
+        width: bytes per hexdump row.
+        max_events: keep only the most recent N events (``None`` = keep all).
+            Byte counters stay exact regardless.
+        enabled: recording can be flipped at runtime via this attribute, so a
+            long session can trace just the interesting command.
+    """
+
+    def __init__(
+        self,
+        sink: Any = sys.stderr,
+        width: int = 16,
+        max_events: int | None = None,
+        enabled: bool = True,
+    ):
+        self.sink = sink
+        self.width = width
+        self.enabled = enabled
+        self.events: deque[TraceEvent] = deque(maxlen=max_events)
+        self.n_tx = 0
+        self.n_rx = 0
+        self.n_dropped = 0
+        self._t0 = time.monotonic()
+        self._ctx: list[str] = []
+
+    # -- recording ------------------------------------------------------------
+
+    def record(self, kind: str, data: bytes = b"", note: str = "") -> None:
+        if not self.enabled:
+            return
+        data = bytes(data)
+        ev = TraceEvent(
+            t=time.monotonic() - self._t0,
+            kind=kind,
+            data=data,
+            context=self._ctx[-1] if self._ctx else "",
+            note=note,
+        )
+        if kind == TRACE_TX:
+            self.n_tx += len(data)
+        elif kind == TRACE_RX:
+            self.n_rx += len(data)
+        elif kind == TRACE_DROP:
+            self.n_dropped += len(data)
+        self.events.append(ev)
+        if self.sink is not None:
+            self._emit(ev)
+
+    def note(self, text: str) -> None:
+        """Record a zero-byte annotation at the current point in the stream."""
+        self.record(TRACE_NOTE, b"", text)
+
+    @contextlib.contextmanager
+    def context(self, label: str) -> Iterator["UartTrace"]:
+        """Tag every event recorded inside the block with ``label``."""
+        self._ctx.append(label)
+        try:
+            yield self
+        finally:
+            self._ctx.pop()
+
+    def reset(self) -> None:
+        """Drop recorded events and restart the clock."""
+        self.events.clear()
+        self.n_tx = self.n_rx = self.n_dropped = 0
+        self._t0 = time.monotonic()
+
+    # -- rendering ------------------------------------------------------------
+
+    def format_event(self, ev: TraceEvent) -> list[str]:
+        size = "      " if ev.kind == TRACE_NOTE else f"{len(ev.data):5d}B"
+        tail = "  ".join(s for s in (ev.context, ev.note) if s)
+        lines = [f"{ev.t:9.4f}  {ev.kind:<4} {size}  {tail}".rstrip()]
+        lines += _hexdump(ev.data, self.width, indent=" " * 11)
+        return lines
+
+    def summary(self) -> str:
+        elapsed = self.events[-1].t if self.events else 0.0
+        drop = f", {self.n_dropped} B dropped" if self.n_dropped else ""
+        return (
+            f"uart trace: {len(self.events)} events, TX {self.n_tx} B, "
+            f"RX {self.n_rx} B{drop}, {elapsed:.3f} s"
+        )
+
+    def format(self) -> str:
+        """The whole trace as text, one block per event plus a summary line."""
+        lines: list[str] = []
+        for ev in self.events:
+            lines += self.format_event(ev)
+        lines.append(self.summary())
+        return "\n".join(lines)
+
+    def dump(self, sink: Any = None) -> None:
+        """Write the whole trace to ``sink`` (default: this trace's own sink,
+        else stderr). Useful when constructed with ``sink=None``."""
+        _write_lines(sink if sink is not None else (self.sink or sys.stderr),
+                     self.format().splitlines())
+
+    def _emit(self, ev: TraceEvent) -> None:
+        _write_lines(self.sink, self.format_event(ev))
+
+    def __len__(self) -> int:
+        return len(self.events)
+
+    def __iter__(self) -> Iterator[TraceEvent]:
+        return iter(self.events)
+
+
+def _hexdump(data: bytes, width: int = 16, indent: str = "") -> list[str]:
+    """``offset  hex bytes  |printable|`` rows — every byte, none elided."""
+    rows = []
+    for off in range(0, len(data), width):
+        chunk = data[off : off + width]
+        text = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+        rows.append(
+            f"{indent}{off:04x}  {chunk.hex(' '):<{width * 3 - 1}}  |{text}|"
+        )
+    return rows
+
+
+def _write_lines(sink: Any, lines: Sequence[str]) -> None:
+    """Emit to a file object or a ``callable(line)``."""
+    if hasattr(sink, "write"):
+        sink.write("\n".join(lines) + "\n")
+        flush = getattr(sink, "flush", None)
+        if flush:
+            flush()
+    else:
+        for line in lines:
+            sink(line)
+
+
+def _as_trace(spec: Any) -> UartTrace:
+    """Normalise the ``trace=`` argument into a (possibly disabled) UartTrace.
+
+    ``None``/``False`` -> disabled, ``True`` -> live to stderr, a file object or
+    ``callable(line)`` -> live to that, a UartTrace -> itself.
+    """
+    if isinstance(spec, UartTrace):
+        return spec
+    if spec is None or spec is False:
+        return UartTrace(sink=None, enabled=False)
+    if spec is True:
+        return UartTrace(sink=sys.stderr)
+    return UartTrace(sink=spec)
+
+
+class _TracedSerial:
+    """Transparent proxy around a ``serial.Serial`` that records every byte.
+
+    Everything not overridden here (``in_waiting``, ``close``, assignments to
+    ``timeout``, ...) passes straight through to the real port, so this is a
+    drop-in for code that reaches into ``tpu.ser``.
+    """
+
+    def __init__(self, ser: Any, trace: UartTrace):
+        object.__setattr__(self, "_ser", ser)
+        object.__setattr__(self, "_trace", trace)
+
+    # -- the traced surface ---------------------------------------------------
+
+    def write(self, data: bytes) -> int:
+        n = self._ser.write(data)
+        if self._trace.enabled:
+            short = "" if n is None or n == len(data) else f"short write: {n}/{len(data)}"
+            self._trace.record(TRACE_TX, data, short)
+        return n
+
+    def read(self, size: int = 1) -> bytes:
+        data = self._ser.read(size)
+        self._record_rx(data, size)
+        return data
+
+    def read_until(self, *args, **kwargs) -> bytes:
+        data = self._ser.read_until(*args, **kwargs)
+        self._record_rx(data)
+        return data
+
+    def read_all(self) -> bytes:
+        data = self._ser.read_all()
+        self._record_rx(data)
+        return data
+
+    def reset_input_buffer(self) -> None:
+        # Consume-then-discard rather than discard, so the trace shows what was
+        # thrown away — that is the tell-tale of a previous desync.
+        if self._trace.enabled:
+            pending = self._ser.in_waiting
+            if pending:
+                self._trace.record(
+                    TRACE_DROP, self._ser.read(pending), "discarded (input buffer reset)"
+                )
+        self._ser.reset_input_buffer()
+
+    def _record_rx(self, data: bytes, wanted: int | None = None) -> None:
+        if not self._trace.enabled:
+            return
+        note = ""
+        if wanted is not None and len(data) != wanted:
+            note = f"short read: wanted {wanted}, got {len(data)} (timeout)"
+        elif not data:
+            note = "nothing received (timeout)"
+        self._trace.record(TRACE_RX, data, note)
+
+    # -- pass-through ---------------------------------------------------------
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ser, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._ser, name, value)
+
+    def __repr__(self) -> str:
+        return f"<traced {self._ser!r}>"
+
+
 # ---- Driver -----------------------------------------------------------------
 
 class TPUUart:
@@ -163,6 +430,9 @@ class TPUUart:
             tpu.load_program(0, words)
             tpu.go(0)
             result = tpu.read_mem(0x2000, 256)
+
+    Pass ``trace=True`` (or a :class:`UartTrace`) to log every byte in both
+    directions; see :attr:`trace` and :meth:`dump_trace`.
     """
 
     def __init__(
@@ -171,6 +441,7 @@ class TPUUart:
         baud: int = DEFAULT_BAUD,
         timeout: float = 2.0,
         rx_timeout_s: float = 0.01,
+        trace: Any = None,
     ):
         """
         Args:
@@ -183,6 +454,11 @@ class TPUUart:
                 how long :meth:`resync` idles the line to make a mid-frame FSM
                 abort. Only meaningful if the device was built with a non-zero
                 ``RX_TIMEOUT``.
+            trace: byte-level logging. ``None``/``False`` off, ``True`` for a
+                live hexdump on stderr, a file object or ``callable(line)`` to
+                send it elsewhere, or a :class:`UartTrace` you configured
+                yourself (e.g. ``UartTrace(sink=None)`` to record quietly and
+                :meth:`dump_trace` later).
         """
         try:
             import serial  # noqa: PLC0415  (optional dep, imported lazily)
@@ -195,15 +471,26 @@ class TPUUart:
         self.baud = baud
         self.timeout = timeout
         self.rx_timeout_s = rx_timeout_s
+        self.trace = _as_trace(trace)
         # 8N1 — the device's uart_receiver/uart_transmitter take no other format.
-        self.ser = serial.Serial(
-            port, baud, bytesize=8, parity="N", stopbits=1, timeout=timeout
+        # Wrapped so `self.ser` records everything, including callers' raw pokes.
+        self.ser = _TracedSerial(
+            serial.Serial(
+                port, baud, bytesize=8, parity="N", stopbits=1, timeout=timeout
+            ),
+            self.trace,
         )
+        self.trace.note(f"open {port} @ {baud} 8N1, reply timeout {timeout}s")
 
     # ---- plumbing -----------------------------------------------------------
 
     def close(self) -> None:
+        self.trace.note(f"close {self.port}")
         self.ser.close()
+
+    def dump_trace(self, sink: Any = None) -> None:
+        """Print the recorded byte trace (see :meth:`UartTrace.dump`)."""
+        self.trace.dump(sink)
 
     def __enter__(self) -> "TPUUart":
         return self
@@ -234,12 +521,16 @@ class TPUUart:
         """Consume the one-byte reply of a W / I / G command."""
         st = self._recv(1)[0]
         if st == STAT_ACK:
+            self.trace.note("ACK")
             return
         if st == STAT_NAK:
+            self.trace.note("NAK")
             raise NakError(
                 "device sent NAK — the core was busy, or host and device are "
                 "out of sync (the frame itself was validated before sending)"
             )
+        self.trace.note(f"bogus status byte {st:#04x} (expected ACK/NAK)")
+
         raise ProtocolError(f"expected ACK/NAK, got {st:#04x}")
 
     def resync(self) -> None:
@@ -251,9 +542,10 @@ class TPUUart:
         can only be recovered by resetting it — this call still drains stale
         reply bytes, which is what a NAK-after-write leaves behind.
         """
-        self.ser.reset_input_buffer()
-        time.sleep(max(self.rx_timeout_s, self._byte_time(4)))
-        self.ser.reset_input_buffer()
+        with self.trace.context("resync"):
+            self.ser.reset_input_buffer()
+            time.sleep(max(self.rx_timeout_s, self._byte_time(4)))
+            self.ser.reset_input_buffer()
 
     # ---- commands -----------------------------------------------------------
 
@@ -273,19 +565,24 @@ class TPUUart:
 
     def _read_chunk(self, addr: int, length: int) -> bytes:
         _check_mem(addr, length)
-        self.ser.reset_input_buffer()
-        self.ser.write(_header(CMD_READ, addr, length))
-        self.ser.flush()
-        # The reply is header-less, so allow for the whole block on the wire.
-        try:
-            return self._recv(length, timeout=self.timeout + self._byte_time(length))
-        except ReplyTimeout as exc:
-            # A rejected read answers with a lone NAK and no data. len == 1 is
-            # inherently ambiguous (a data byte of 0x15 looks identical), but a
-            # short reply of exactly that byte is a rejection for every len > 1.
-            if length > 1 and exc.partial == bytes([STAT_NAK]):
-                raise NakError("device rejected the read command") from exc
-            raise
+        with self.trace.context(f"read_mem[{addr:#08x}+{length}]"):
+            self.ser.reset_input_buffer()
+            self.ser.write(_header(CMD_READ, addr, length))
+            self.ser.flush()
+            # The reply is header-less, so allow for the whole block on the wire.
+            try:
+                return self._recv(
+                    length, timeout=self.timeout + self._byte_time(length)
+                )
+            except ReplyTimeout as exc:
+                # A rejected read answers with a lone NAK and no data. len == 1
+                # is inherently ambiguous (a data byte of 0x15 looks identical),
+                # but a short reply of exactly that byte is a rejection for
+                # every len > 1.
+                if length > 1 and exc.partial == bytes([STAT_NAK]):
+                    self.trace.note("NAK (read rejected)")
+                    raise NakError("device rejected the read command") from exc
+                raise
 
     def write_mem(self, addr: int, data: bytes) -> None:
         """``W`` — write ``data`` to external SRAM at ``addr``, waiting for the ACK."""
@@ -313,16 +610,22 @@ class TPUUart:
     def _payload_cmd(self, cmd: int, addr: int, payload: bytes, check) -> None:
         """Header + data phase + status, for the two commands that carry data."""
         check(addr, len(payload))
-        self.ser.reset_input_buffer()
-        self.ser.write(_header(cmd, addr, len(payload)) + payload)
-        self.ser.flush()
-        try:
-            self._status()
-        except ProtocolError:
-            # The device NAKs before the data phase, so it will have decoded our
-            # payload as command bytes. Clear the wreckage before propagating.
-            self.resync()
-            raise
+        name = "write_mem" if cmd == CMD_WRITE else "load_program"
+        with self.trace.context(f"{name}[{addr:#08x}+{len(payload)}]"):
+            self.ser.reset_input_buffer()
+            # One write() so the trace shows the header and data phase as the
+            # single burst the device actually sees.
+            self.ser.write(_header(cmd, addr, len(payload)) + payload)
+            self.ser.flush()
+            try:
+                self._status()
+            except ProtocolError as exc:
+                # The device NAKs before the data phase, so it will have decoded
+                # our payload as command bytes. Clear the wreckage before
+                # propagating.
+                self.trace.note(f"{type(exc).__name__}: {exc} — resyncing")
+                self.resync()
+                raise
 
     def go(self, pc: int = 0) -> None:
         """``G`` — start the scalar unit at ``pc`` (a 4-byte frame, no length).
@@ -331,10 +634,11 @@ class TPUUart:
         asynchronously and this link has no way to poll for completion.
         """
         _check_pc(pc)
-        self.ser.reset_input_buffer()
-        self.ser.write(_header(CMD_GO, pc))
-        self.ser.flush()
-        self._status()
+        with self.trace.context(f"go[pc={pc}]"):
+            self.ser.reset_input_buffer()
+            self.ser.write(_header(CMD_GO, pc))
+            self.ser.flush()
+            self._status()
 
 
 # ---- Program file parsing ---------------------------------------------------
@@ -373,6 +677,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("-p", "--port", required=True, help="serial port, e.g. /dev/ttyUSB0")
     p.add_argument("-b", "--baud", type=int, default=DEFAULT_BAUD)
     p.add_argument("-t", "--timeout", type=float, default=2.0, help="reply timeout (s)")
+    p.add_argument(
+        "-T", "--trace", action="store_true",
+        help="hexdump every byte sent and received to stderr",
+    )
+    p.add_argument(
+        "--trace-file", metavar="FILE",
+        help="write that trace to FILE instead of stderr (implies --trace)",
+    )
+    p.add_argument(
+        "--trace-width", type=int, default=16, metavar="N",
+        help="bytes per hexdump row (default 16)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("read", help="read SRAM ('R')")
@@ -400,8 +716,17 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
+    # Trace lives outside the `with` so a failure to even open the port, or an
+    # exception mid-command, still leaves the summary printed.
+    trace: UartTrace | None = None
+    trace_fh = None
+    if args.trace or args.trace_file:
+        if args.trace_file:
+            trace_fh = open(args.trace_file, "w", encoding="utf-8")
+        trace = UartTrace(sink=trace_fh or sys.stderr, width=args.trace_width)
+
     try:
-        with TPUUart(args.port, args.baud, args.timeout) as tpu:
+        with TPUUart(args.port, args.baud, args.timeout, trace=trace) as tpu:
             if args.cmd == "read":
                 data = tpu.read_mem(args.addr, args.length)
                 if args.out:
@@ -438,6 +763,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ProtocolError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if trace is not None:
+            print(trace.summary(), file=sys.stderr)
+            if trace_fh is not None:
+                trace_fh.write(trace.summary() + "\n")
+                trace_fh.close()
+                print(f"trace written to {args.trace_file}", file=sys.stderr)
     return 0
 
 

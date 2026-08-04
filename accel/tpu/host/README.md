@@ -9,6 +9,13 @@ Host-PC side of the TPU's serial link. Device side is
 runs standalone (`python accel/tpu/host/tpu_uart.py ...`) rather than as a
 `-m` package module.
 
+`run_program.py` — the end-to-end runner built on that driver: assembles a
+tpulang program, preloads it and its tensors, runs it, reads the results back
+and checks them. See [Running a program](#running-a-program) below.
+
+`test_uart_link.py` — self-checking tests for the link itself, no program and no
+toolchain involved. See [Testing the link](#testing-the-link) below.
+
 ## Commands
 
 | CMD       | Method                    | Frame                                  | Reply            |
@@ -55,6 +62,120 @@ python accel/tpu/host/tpu_uart.py -p /dev/ttyUSB0 go 0
 
 `load` takes the `$readmemh`-style program format used by `tb/vectors/` — one
 32-bit hex word per line, `//` comments allowed.
+
+## Seeing the bytes
+
+Both link failure modes (a desync, a NAK you didn't expect) are byte-level, so
+the driver can log every byte in both directions — `-T/--trace` for a live
+hexdump on stderr, `--trace-file FILE` to capture it instead:
+
+```bash
+python accel/tpu/host/tpu_uart.py -p COM5 -T write 0x1000 --hex deadbeef
+```
+
+```
+   0.0000  --           open COM5 @ 115200 8N1, reply timeout 2.0s
+   0.0013  TX      10B  write_mem[0x00001000+4]
+           0000  57 00 10 00 00 04 de ad be ef                     |W.........|
+   0.0498  RX       1B  write_mem[0x00001000+4]
+           0000  06                                                |.|
+   0.0498  --           write_mem[0x00001000+4]  ACK
+   0.0499  --           close COM5
+uart trace: 5 events, TX 10 B, RX 1 B, 0.050 s
+```
+
+`DROP` rows are bytes the driver found sitting in the input buffer and threw
+away — the tell-tale of a previous command desyncing. From Python:
+
+```python
+from tpu_uart import TPUUart, UartTrace
+
+with TPUUart("COM5", trace=True) as tpu:      # live to stderr
+    ...
+
+tpu = TPUUart("COM5", trace=UartTrace(sink=None))   # record quietly
+try:
+    tpu.load_program(0, words)
+finally:
+    tpu.dump_trace()                          # ...print it only on failure
+```
+
+`trace=` also takes any file object or `callable(line)` (e.g. `logging.info`).
+`tpu.trace.enabled` flips recording at runtime, `tpu.trace.events` is the raw
+list of `TraceEvent`s. The proxy sits on `tpu.ser` itself, so raw frame pokes
+like the ones in `test_uart_link.py` show up in the trace too.
+
+## Running a program
+
+`run_program.py` is the whole flow in one command — the hardware counterpart of
+`tb/tpu_top_uart_tb.sv`:
+
+```bash
+python accel/tpu/host/run_program.py -p COM5                 # tiled_matmul.tpu
+python accel/tpu/host/run_program.py -p COM5 --verify-inputs # read the tensors back too
+python accel/tpu/host/run_program.py --program ../../tpulang/examples/relu_layer.tpu -p COM5
+python accel/tpu/host/run_program.py --dry-run               # toolchain only, no board
+```
+
+1. assemble the `.tpu` source (`tpulang/assembler.py`);
+2. build the DRAM input image and the golden output image with the *same*
+   builders `tpulang/gen_vectors.py` uses for the testbench vectors — host and
+   simulation cannot drift on layout;
+3. `I` the program into IMEM, `W` the tensors into DRAM, `G` at PC 0;
+4. wait for the core to go idle, `R` the outputs back, compare to the golden
+   image (and, for the tiled matmul, print the [8x32] @ [32x16] result matrix).
+
+Defaults to `tpulang/examples/tiled_matmul.tpu`; any example works, since the
+image builder is chosen from the program's own `.equ` constants exactly as
+`gen_vectors.py` chooses it. It needs the toolchain on disk (it imports
+`assembler` / `iss` / `gen_vectors` by path), unlike `tpu_uart.py` itself.
+
+**How it waits for the run.** There is no status command, but there is the
+arbitration rule below: while the core runs, everything is NAK'd. So the runner
+probes with a harmless 2-byte read — NAK means "still running", data means
+"idle, results are readable". `--run-timeout` bounds the wait; on the Cmod A7 the
+same state is on `led[1]` (`done`). Port defaults to the one FTDI device found
+(`--port` if there are several).
+
+Geometry must match the bitstream: `boards/cmod_a7/board.tcl` builds the 8x8
+array these programs and vectors are written against.
+
+## Testing the link
+
+`test_uart_link.py` answers "is the link and the SRAM good?" separately from "is
+the core computing the right answer?" — run it first when a board misbehaves.
+Every test writes its own expected data and checks the readback, so a run is
+pass/fail with nothing to eyeball.
+
+```bash
+python accel/tpu/host/test_uart_link.py -p COM5              # ~10 s
+python accel/tpu/host/test_uart_link.py -p COM5 --slow       # + the >64 KiB transfer
+python accel/tpu/host/test_uart_link.py -p COM5 --length 16384 --base 0x10000
+python accel/tpu/host/test_uart_link.py -p COM5 --only sram_roundtrip
+python accel/tpu/host/test_uart_link.py --offline            # driver checks, no board
+```
+
+| Test                       | What it catches                                            |
+| -------------------------- | ---------------------------------------------------------- |
+| `sram_roundtrip`           | `W` then `R` a block, six data patterns — the core check    |
+| `sram_isolation`           | one command's write landing in another's region             |
+| `sram_address_bus`         | shorted/open address lines (one byte per one-hot address)   |
+| `sram_short_frames`        | off-by-one in the FSM's `idx + 1 == len` termination        |
+| `link_rejects_bad_command` | unknown command byte → NAK, and the FSM returns to IDLE     |
+| `link_rejects_out_of_range`| the device's VALIDATE rules, with the host's check bypassed |
+| `sram_long_transfer`       | (`--slow`) the driver's >64 KiB frame splitting             |
+| `host_validation`          | (offline) host frame rules still a superset of the RTL's    |
+| `frame_encoding`           | (offline) header/word endianness — no readback can catch it |
+
+Two things it assumes. **It overwrites SRAM**, all of it (`sram_address_bus`
+touches the top of the space) — nothing on the board survives a run, which is
+fine because `run_program.py` reloads its tensors every time. **The core must be
+idle**, since a running program NAKs every command; the suite checks that up
+front and stops with a message instead of reporting 20 bogus failures.
+
+Not covered: anything requiring a program to be running (the `core_busy`
+arbitration path, `I` + `G` end to end) — that is `run_program.py`'s job, and
+`tb/tpu_top_uart_tb.sv`'s in simulation.
 
 ## Two things to know
 

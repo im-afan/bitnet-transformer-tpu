@@ -64,7 +64,7 @@ module tpu_top #(
     parameter int SRAM_CPA   = 2,    // sram_controller CLOCKS_PER_ACCESS
 
     // ---- UART host link (bring-up / debug over serial; docs/uart_host.md) ----
-    parameter int UART_CPB        = 868, // UART clocks-per-bit (115200 @ 100 MHz)
+    parameter int UART_CPB        = 104, // UART clocks-per-bit (115200 @ 12 MHz)
     parameter int UART_RX_TIMEOUT = 0,   // UART inter-byte abort (clocks; 0 = off)
 
     // ---- Memory / init ------------------------------------------------------

@@ -261,24 +261,8 @@ module tpu_top_uart_tb;
         end
     endtask
 
-    // =========================================================================
-    // Stimulus
-    // =========================================================================
-    initial begin
-        int nprog;
-
-        for (int i = 0; i < SRAM_SZ; i++) sram_mem[i] = 8'h00;
-        $readmemh(`PROG_FILE, prog_words);
-        $readmemh(`SPAD_IN_FILE, in_bytes);
-        $readmemh(`SPAD_EXP_FILE, exp_bytes);
-
-        repeat (4) @(posedge clk);
-        rst_n = 1'b1;
-        repeat (4) @(posedge clk);
-
-        $display("==== TPU UART end-to-end testbench (%0dx%0d array) ====", ROWS, COLS);
-
-        // count the dense program words (stop at the first hole)
+    int nprog;
+    task automatic test_program();
         nprog = 0;
         while (nprog < IMEM_DEP && defined32(prog_words[nprog])) nprog++;
 
@@ -303,6 +287,31 @@ module tpu_top_uart_tb;
         $display("==== done: %0d checks, %0d errors ====", checks, errors);
         if (errors == 0) $display("TPU_TOP_UART: ALL TESTS PASSED");
         else             $display("TPU_TOP_UART: FAILED (%0d errors)", errors);
+    endtask
+
+    // =========================================================================
+    // Stimulus
+    // =========================================================================
+    initial begin
+        // int nprog;
+
+        for (int i = 0; i < SRAM_SZ; i++) sram_mem[i] = 8'h00;
+        $readmemh(`PROG_FILE, prog_words);
+        $readmemh(`SPAD_IN_FILE, in_bytes);
+        $readmemh(`SPAD_EXP_FILE, exp_bytes);
+
+        repeat (4) @(posedge clk);
+        rst_n = 1'b1;
+        repeat (4) @(posedge clk);
+
+
+        $display("==== TPU UART end-to-end testbench (%0dx%0d array) ====", ROWS, COLS);
+
+        // run program twice without reset
+        test_program();
+        repeat (100) @(posedge clk);
+        test_program();
+        
         $finish;
     end
 

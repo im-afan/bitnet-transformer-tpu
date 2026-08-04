@@ -50,7 +50,7 @@ set UART_CPB [expr {int(round(double($CLK_MHZ) * 1.0e6 / $BAUD))}]   ;# 104
 # (see docs/synth.md "Sizing").
 set ROWS       8
 set COLS       8
-set VPU_BYTES  64
+set VPU_BYTES  32
 set ADDR_W     16
 set XLEN       32
 set IMEM_AW    10
