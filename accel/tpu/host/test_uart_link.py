@@ -305,6 +305,45 @@ def sram_write(tpu, cfg):
             print(f"     iteration {i:5d}  {n} B @{cfg.base:#07x}  ok  ({dt:.2f}s)")
 
 
+@board_test("sram_write_simple")
+def sram_write_simple(tpu, cfg):
+    """The same W/R hammer as `sram_write`, with none of the forensics.
+
+    `sram_write` wraps every command in input-buffer assertions, a drain to
+    silence and a reply-length analysis. That is all machinery standing between
+    the link and the verdict, and machinery can be wrong: an `in_waiting` check
+    that trips on its own timing, or a drain that swallows a byte the next
+    command needed, would look exactly like the bug it is hunting.
+
+    So this is the control. Write, read back, compare, repeat — nothing else
+    touches the port. Whatever the driver raises propagates to the harness,
+    which reports it as an ERROR and moves on. Run both over the same traffic:
+    if this one passes where `sram_write` fails, the difference is in the
+    instrumentation and not in the link, and that is worth knowing before
+    another day goes into chasing the device.
+
+        python accel/tpu/host/test_uart_link.py -p COM5 --only simple
+
+    `--only sram_write` matches both tests (it is a substring filter); `--only
+    simple` selects this one alone.
+    """
+    n = cfg.length
+    rng = random.Random(cfg.seed)
+
+    for i in range(1000):
+        # Fresh data every iteration, so a readback of stale buffered bytes
+        # cannot be mistaken for a pass. The one guard worth keeping, because it
+        # costs nothing and its absence makes a pass meaningless.
+        data = rng.randbytes(n)
+
+        t0 = time.monotonic()
+        roundtrip(tpu, cfg.base, data, f"iteration {i}")
+        dt = max(time.monotonic() - t0, 1e-6)
+
+        if i % 1 == 0:
+            print(f"     iteration {i:5d}  {n} B @{cfg.base:#07x}  ok  ({dt:.2f}s)")
+
+
 @board_test("sram_roundtrip")
 def sram_roundtrip(tpu, cfg):
     """`W` a block of SRAM, `R` it back, compare — once per data pattern.
