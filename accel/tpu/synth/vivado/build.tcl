@@ -15,6 +15,7 @@
 #   vivado -mode batch -source build.tcl
 #   vivado -mode batch -source build.tcl -tclargs mode=synth
 #   vivado -mode batch -source build.tcl -tclargs mode=ooc module=mxu rows=8 cols=8
+#   vivado -mode batch -source build.tcl -tclargs board=cmod_a7_mem mode=deploy
 #
 # Arguments are key=value, order independent. Run with `mode=help` for a list.
 # =============================================================================
@@ -28,7 +29,7 @@ set TPU_DIR    [file normalize [file join $VIVADO_DIR .. ..]]
 # Flow-level defaults. Everything else (part, top, geometry) comes from the
 # board file and may be overridden by argv below.
 # -----------------------------------------------------------------------------
-set MODE    bit          ;# help | rtl | ooc | synth | impl | bit | program | mcs
+set MODE    bit          ;# help | rtl | ooc | synth | impl | bit | mcs | program | deploy
 set BOARD   cmod_a7
 set MODULE  ""           ;# mode=ooc: which RTL module to synthesize standalone
 set OUTDIR  ""           ;# defaults to synth/build/<board>
@@ -68,6 +69,18 @@ array set ARGMAP {
     cpb         UART_CPB
 }
 
+# Every directory under boards/ that actually defines a target. Enumerated
+# rather than hard-coded so adding a board makes it show up in `mode=help`
+# without anyone remembering to edit this file.
+proc board_list {} {
+    global VIVADO_DIR
+    set names {}
+    foreach d [lsort [glob -nocomplain -directory [file join $VIVADO_DIR boards] *]] {
+        if {[file exists [file join $d board.tcl]]} { lappend names [file tail $d] }
+    }
+    return $names
+}
+
 proc usage {} {
     puts ""
     puts "build.tcl — Vivado batch build for accel/tpu"
@@ -83,7 +96,20 @@ proc usage {} {
     puts "  bit       everything, ending in a .bit           \[default\]"
     puts "  mcs       bit, then write a .mcs image for the QSPI flash"
     puts "  program   download an existing .bit to a connected board (no build)"
+    puts "  deploy    bit, then program the connected board — build and flash in"
+    puts "            one command, so what is on the board is what was just built"
     puts "  help      this message"
+    puts ""
+    puts "Boards (board=...), from boards/<name>/board.tcl:"
+    foreach b [board_list] {
+        switch -- $b {
+            cmod_a7      { set what "the full TPU (production image)" }
+            cmod_a7_mem  { set what "UART link + external SRAM, no core (rtl/uart_memory.sv)" }
+            cmod_a7_echo { set what "UART loopback self-test (docs/uart_selftest.md)" }
+            default      { set what "" }
+        }
+        puts [format "  %-14s %s" $b $what]
+    }
     puts ""
     puts "Common overrides:"
     puts "  board=<name>      target under boards/            \[cmod_a7\]"
@@ -310,6 +336,29 @@ proc timing_verdict {} {
     return $bad
 }
 
+# Download a bitstream to the attached board. Factored out of `mode=program` so
+# `mode=deploy` runs the identical sequence rather than a second copy of it —
+# the two must not be able to drift.
+proc program_device {bitfile} {
+    if {![file exists $bitfile]} {
+        error "build.tcl: no bitstream at '$bitfile' (build one first, or pass bit=<path>)"
+    }
+    banner "program — $bitfile"
+    open_hw_manager
+    connect_hw_server
+    open_hw_target
+    set dev [lindex [get_hw_devices] 0]
+    current_hw_device $dev
+    refresh_hw_device -update_hw_probes false $dev
+    set_property PROGRAM.FILE $bitfile $dev
+    program_hw_devices $dev
+    # Read the part before closing the manager: the device handle is not valid
+    # afterwards.
+    set part [get_property PART $dev]
+    close_hw_manager
+    puts "  programmed $part."
+}
+
 # -----------------------------------------------------------------------------
 # Read the design.
 # -----------------------------------------------------------------------------
@@ -365,7 +414,7 @@ switch -- $MODE {
         write_checkpoint -force [file join $OUTDIR ooc_${MODULE}.dcp]
     }
 
-    synth - impl - bit - mcs {
+    synth - impl - bit - mcs - deploy {
         set reuse [expr {$INCR && [file exists $DCP_SYNTH]}]
         if {$reuse} {
             foreach f [concat $RTL_SRCS $RTL_UNUSED $BOARD_SRCS $XDC_FILES] {
@@ -429,27 +478,27 @@ switch -- $MODE {
         if {$timing_failed} {
             puts "\n  NOTE: bitstream written despite a timing violation.\n"
         }
+
+        if {$MODE eq "deploy"} {
+            # Build then flash, in one command, so the board is running exactly
+            # what was just built with exactly these arguments. Deliberately
+            # placed after the timing verdict: a design that missed timing still
+            # writes a .bit, and this is where you get told before it lands on
+            # the board.
+            if {$timing_failed} {
+                puts "  programming anyway (mode=deploy) — the board will be"
+                puts "  running a bitstream that does not meet timing.\n"
+            }
+            program_device $BIT
+        }
     }
 
     program {
         # No build — just download. Separated so re-flashing does not risk
         # silently rebuilding with different arguments than the .bit was made
-        # with.
+        # with. Use mode=deploy when you *do* want both.
         if {$BITFILE eq ""} { set BITFILE $BIT }
-        if {![file exists $BITFILE]} {
-            error "build.tcl: no bitstream at '$BITFILE' (build one first, or pass bit=<path>)"
-        }
-        banner "program — $BITFILE"
-        open_hw_manager
-        connect_hw_server
-        open_hw_target
-        set dev [lindex [get_hw_devices] 0]
-        current_hw_device $dev
-        refresh_hw_device -update_hw_probes false $dev
-        set_property PROGRAM.FILE $BITFILE $dev
-        program_hw_devices $dev
-        close_hw_manager
-        puts "  programmed [get_property PART $dev]."
+        program_device $BITFILE
     }
 
     default {

@@ -651,6 +651,8 @@ def main(argv=None) -> int:
                     help="also run the >64 KiB transfer test (~12 s)")
     ap.add_argument("--offline", action="store_true",
                     help="run only the tests that need no board")
+    ap.add_argument("--trace", action="store_true",
+                    help="use tracer")
     cfg = ap.parse_args(argv)
 
     if not 1 <= cfg.length <= MAX_LEN:
@@ -673,7 +675,7 @@ def main(argv=None) -> int:
               f"(SRAM is {MEM_LIMIT // 1024} KiB — these tests overwrite it)")
         print(f"tests   : {len(tests)} — {names}")
         try:
-            with TPUUart(port, cfg.baud, cfg.timeout, trace=True) as tpu:
+            with TPUUart(port, cfg.baud, cfg.timeout, trace=cfg.trace) as tpu:
                 require_idle(tpu)
                 failed = run(tests, tpu, cfg)
         except OSError as exc:

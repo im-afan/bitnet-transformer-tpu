@@ -76,6 +76,45 @@ When touching attention numerics, keep the three implementations in sync: `mha_t
 (reference), the CUDA kernel, and any future TPU block — they all implement the same 5-D layout
 and masking convention.
 
+## In progress: intermittent UART corruption (as of 2026-08-05)
+
+Live bug hunt on branch `uart-debug`. `host/test_uart_link.py` passes most of the time and
+fails after tens of seconds of traffic. **The visible symptom — the device sending more bytes
+than the host asked for — is the aftermath, not the fault.** A single lost/extra byte desyncs
+the command FSM permanently, it lands back in `IDLE` mid-payload, and every payload byte that
+isn't `R`/`W`/`I`/`G` then produces a NAK byte (`uart_interface.sv:201`). Don't chase the byte
+count; chase the one divergence that precedes it.
+
+**Ruled out — do not re-litigate these.** Each cost a real experiment:
+
+| Hypothesis | Killed by |
+|---|---|
+| Off-centre sample point (`START` runs `CLK_PER_BIT+1`; CPB 104 vs 104.1667) | Echo image clean across ±3% baud. Bias is ~4 clocks of the 52 available |
+| Metastability / no `ASYNC_REG` on `uart_receiver.sv:16` | 83 ns period gives astronomical MTBF; echo clean for 5 min (~3.3 MiB each way) |
+| `uart_receiver` / `uart_transmitter` themselves | Same 5-min echo soak — it instantiates both **unmodified** |
+| Switching noise / SSO from the 30 bank-14 SRAM pins | No failure clustering across `sram_roundtrip`'s six patterns |
+| TX→RX crosstalk (J17/J18 are the `IO_L7P`/`L7N` pair, physically adjacent) | Echo image has the identical pinout and runs full duplex |
+| Timing closure | `build/cmod_a7/reports/`: WNS 34.129 ns of 83.333 ns, TNS 0, 0 failing endpoints. DRC is advisory-only |
+
+**Leading hypothesis.** The fault is logical and lives in `uart_interface.sv`, not in the UART
+primitives or the physical layer. `uart_echo.sv` pushes on `rx_byte` unconditionally every
+cycle; `uart_interface` consumes it **only** in `IDLE`, `RX_ADDR`, `RX_LEN`, `WR_RX`, `IMEM_RX`
+and silently drops it everywhere else. `SEND_STATUS` + `SEND_STATUS_WAIT` is a ~1050-clock
+blind window — a full byte time — sitting exactly where the host sends its next command. There
+is no recovery because `UART_RX_TIMEOUT = 0` (`tpu_top.sv:68`, `cmod_a7_top.sv:56`) compiles
+the mid-frame abort at `uart_interface.sv:346` out entirely. **This is why the echo image
+cannot reproduce it** — the echo has no blind states and no protocol to desync.
+
+**Next experiments**, in value order: (1) `write_mem` with `len=1` in a loop vs `len=4096` —
+same byte count, wildly different turnaround-to-payload ratio, so failure rate scaling with
+*commands* vs *bytes* localises it; (2) set `UART_RX_TIMEOUT` non-zero (~`20 * UART_CPB`) —
+masks rather than fixes, but turns a NAK flood into one legible timeout; (3) add RX→TX
+turnaround to the echo image, which is the one traffic shape it never exercises.
+
+See `docs/uart_selftest.md` for the echo self-test (`make echo`, `board=cmod_a7_echo`,
+`host/uart_echo.py`). **Reflash `board=cmod_a7` before running `test_uart_link.py` or
+`run_program.py`** — they time out against the echo bitstream.
+
 ## Coding Practices
 
 - **Do**: read files to gain a good understanding of code, ask questions when design choices are unclear,

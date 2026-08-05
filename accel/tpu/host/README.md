@@ -16,6 +16,10 @@ and checks them. See [Running a program](#running-a-program) below.
 `test_uart_link.py` — self-checking tests for the link itself, no program and no
 toolchain involved. See [Testing the link](#testing-the-link) below.
 
+`uart_echo.py` — one layer below that: a pure loopback check against a separate
+bitstream that contains nothing but the UART blocks. See
+[Testing the UART alone](#testing-the-uart-alone) below.
+
 ## Commands
 
 | CMD       | Method                    | Frame                                  | Reply            |
@@ -176,6 +180,44 @@ front and stops with a message instead of reporting 20 bogus failures.
 Not covered: anything requiring a program to be running (the `core_busy`
 arbitration path, `I` + `G` end to end) — that is `run_program.py`'s job, and
 `tb/tpu_top_uart_tb.sv`'s in simulation.
+
+## Testing the UART alone
+
+`test_uart_link.py` still exercises seven blocks at once: a bad byte there could
+come from `uart_receiver`, `uart_transmitter`, `uart_interface`, the SRAM
+controller, the arbitration mux, the cable or the host. `uart_echo.py` deletes
+four of those by talking to a **different bitstream** — `cmod_a7_echo`, which
+contains the two UART blocks, a FIFO and nothing else. Full details and the
+design rationale are in [`docs/uart_selftest.md`](../docs/uart_selftest.md).
+
+```bash
+# build and flash the echo image (once)
+vivado -mode batch -source synth/vivado/build.tcl -tclargs board=cmod_a7_echo mode=bit
+vivado -mode batch -source synth/vivado/build.tcl -tclargs board=cmod_a7_echo mode=program
+
+python accel/tpu/host/uart_echo.py -p COM5                # 30-second run
+python accel/tpu/host/uart_echo.py -p COM5 --minutes 30   # soak until it breaks
+python accel/tpu/host/uart_echo.py -p COM5 --baud 117000  # +1.6% sampling-margin check
+python accel/tpu/host/uart_echo.py --offline              # check the forensics, no board
+```
+
+The device echoes every byte from reset — there is no protocol to get out of
+sync with. The host streams fresh random blocks and reads them back on a
+concurrent thread, so both directions are live at once, as they are on the real
+link. On a mismatch it reports whether the received stream is the sent stream
+shifted by a whole **bit** (a mis-framed byte), by a whole **byte** (a lost or
+invented frame), or by neither (a single mis-sampled bit) — three different bugs
+that a byte-by-byte diff renders identically.
+
+`--baud` is the cheap experiment: 8N1 tolerates about ±5% of bit-period error, so
+sweeping the host a few percent either side of 115200 measures where the receiver
+actually falls over. Asymmetric margin ⇒ the sample point is off-centre and the
+fix is arithmetic. Symmetric and wide, but still failing at 0% ⇒ noise or
+metastability.
+
+This image has no SRAM and no core, so **reflash `cmod_a7` before running
+anything else** — `test_uart_link.py` and `run_program.py` will time out against
+it (it answers, but it echoes rather than obeying commands).
 
 ## Two things to know
 
