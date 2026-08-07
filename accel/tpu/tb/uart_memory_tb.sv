@@ -28,10 +28,10 @@
 //   quiet           after every exchange: nothing more may come out. A phantom
 //                   frame here is the hardware symptom that started all this.
 //
-// Then one DIAGNOSTIC, deliberately outside the pass/fail count, which sends a
-// command byte while the device is still transmitting its previous reply. See
-// the note above `diagnostic_overlap` for why it is reported rather than
-// asserted.
+//   turnaround      a command byte sent while the device is still transmitting
+//                   its previous reply must survive. Runs last because it
+//                   deliberately leaves the FSM mid-frame; see the note above
+//                   `diagnostic_overlap`.
 // -----------------------------------------------------------------------------
 
 module uart_memory_tb;
@@ -322,19 +322,18 @@ module uart_memory_tb;
     endtask
 
     // =========================================================================
-    // DIAGNOSTIC — reported, not asserted.
+    // TURNAROUND — the byte that arrives while the device is still replying.
     //
     // The host sends a command byte while the device is still transmitting the
-    // previous reply. uart_interface consumes `rx_byte` only in IDLE, RX_ADDR,
-    // RX_LEN, WR_RX and IMEM_RX; SEND_STATUS + SEND_STATUS_WAIT consume nothing
-    // and last a full byte time, so a byte landing there is silently dropped and
-    // the frame after it is decoded one byte out of phase — permanently.
+    // previous reply. This used to be a diagnostic rather than a check: the FSM
+    // consumed `rx_byte` only in IDLE, RX_ADDR, RX_LEN, WR_RX and IMEM_RX, so a
+    // byte landing in SEND_STATUS + SEND_STATUS_WAIT — a full byte time, sitting
+    // exactly at the turnaround — was dropped, and every frame after it decoded
+    // one byte out of phase, permanently.
     //
-    // This is not asserted as a failure because the protocol says the host waits
-    // for each reply, so a device that drops the byte is not violating anything
-    // it promised. It is here because it is the cheapest reproduction of the
-    // standing hypothesis: if the FSM ever grows a one-byte RX holding register,
-    // this flips from "dropped" to "consumed" and says so.
+    // uart_interface now captures into a one-byte holding register in every
+    // state (docs/uart_host.md §5), so the byte survives and this is a real
+    // assertion. It runs last because it deliberately leaves the FSM mid-frame.
     // =========================================================================
     task automatic diagnostic_overlap();
         logic [7:0] st;
@@ -342,7 +341,7 @@ module uart_memory_tb;
         int         rx0;
 
         $display("");
-        $display("---- DIAGNOSTIC: command byte arriving during the reply ----");
+        $display("---- turnaround: command byte arriving during the reply ----");
 
         sent[0] = 8'hA5;
         rx0 = rx_frames;
@@ -370,25 +369,26 @@ module uart_memory_tb;
         $display("  receiver delivered : %0d of the 8 bytes the host sent",
                  rx_frames - rx0);
 
-        if (dut.collision)
-            $display("  collision flag     : SET — a byte landed mid-transmit");
+        if (dut.uart_rx_overrun)
+            $display("  rx_overrun         : SET — the FSM ran out of room");
         else
-            $display("  collision flag     : clear — the overlap did not materialise");
+            $display("  rx_overrun         : clear — one byte of buffering was enough");
 
         // The pipelined byte was 'R'. If uart_interface consumed it, the FSM is
         // now in RX_ADDR waiting for three address bytes and host_busy is high.
         // If it dropped it, the FSM fell back to IDLE and host_busy is low —
-        // which is the failure: the receiver handed the byte over (the count
-        // above says 8) and the command FSM threw it away.
+        // which is the failure: the receiver delivered every byte (the count
+        // above says 8) and the command FSM threw the last one away.
+        checks++;
         if (dut.uart_host_busy) begin
             $display("  verdict            : CONSUMED — 'R' was accepted; the FSM is mid-frame");
             $display("                       and will sit in RX_ADDR until three more bytes");
             $display("                       arrive (RX_TIMEOUT = 0, so forever).");
         end else begin
-            $display("  verdict            : DROPPED — the receiver delivered every byte and");
-            $display("                       uart_interface discarded the last one. This is");
-            $display("                       the SEND_STATUS blind window, confirmed:");
-            $display("                       uart_interface.sv:328 consumes no rx_byte.");
+            errors++;
+            $display("  FAIL verdict       : DROPPED — the receiver delivered every byte and");
+            $display("                       uart_interface discarded the last one. The RX");
+            $display("                       holding register is not doing its job.");
         end
         $display("------------------------------------------------------------");
         $display("");
@@ -442,14 +442,14 @@ module uart_memory_tb;
             errors++;
         end
 
+        // Last, because it deliberately leaves the FSM mid-frame.
+        diagnostic_overlap();
+
         if (errors == 0)
             $display("ALL TESTS PASSED (%0d checks, %0d bytes in, %0d frames out)",
                      checks, rx_frames, tx_frames);
         else
             $display("FAIL %0d ERRORS (%0d checks)", errors, checks);
-
-        // Last, because it deliberately desyncs the FSM.
-        diagnostic_overlap();
 
         $finish;
     end

@@ -64,6 +64,7 @@ array set ARGMAP {
     mem_addr_w  MEM_ADDR_W
     mem_data_w  MEM_DATA_W
     sram_cpa    SRAM_CPA
+    bram_aw     BRAM_AW
     clk_mhz     CLK_MHZ
     baud        BAUD
     cpb         UART_CPB
@@ -105,6 +106,7 @@ proc usage {} {
         switch -- $b {
             cmod_a7      { set what "the full TPU (production image)" }
             cmod_a7_mem  { set what "UART link + external SRAM, no core (rtl/uart_memory.sv)" }
+            cmod_a7_bram { set what "UART link + on-chip block RAM, no core (rtl/uart_bram.sv)" }
             cmod_a7_echo { set what "UART loopback self-test (docs/uart_selftest.md)" }
             default      { set what "" }
         }
@@ -116,6 +118,7 @@ proc usage {} {
     puts "  part=<part>       Vivado part string              \[from board.tcl\]"
     puts "  rows=N cols=N     MXU systolic array size         \[8 8\]"
     puts "  addr_w=N          scratchpad address width        \[16\]"
+    puts "  bram_aw=N         cmod_a7_bram: built memory      \[16\] (2**N bytes)"
     puts "  clk_mhz=N         core clock; UART_CPB follows it \[12\]"
     puts "  outdir=<path>     build directory                 \[synth/build/<board>\]"
     puts "  threads=N         Vivado max threads              \[8\]"

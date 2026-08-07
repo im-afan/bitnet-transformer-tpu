@@ -16,8 +16,8 @@ and checks them. See [Running a program](#running-a-program) below.
 `test_uart_link.py` — self-checking tests for the link itself, no program and no
 toolchain involved. See [Testing the link](#testing-the-link) below.
 
-`uart_echo.py` — one layer below that: a pure loopback check against a separate
-bitstream that contains nothing but the UART blocks. See
+`uart_echo.py` — one layer below that: a 64-byte block loopback check against a
+separate bitstream that contains nothing but the UART blocks. See
 [Testing the UART alone](#testing-the-uart-alone) below.
 
 ## Commands
@@ -187,8 +187,9 @@ arbitration path, `I` + `G` end to end) — that is `run_program.py`'s job, and
 come from `uart_receiver`, `uart_transmitter`, `uart_interface`, the SRAM
 controller, the arbitration mux, the cable or the host. `uart_echo.py` deletes
 four of those by talking to a **different bitstream** — `cmod_a7_echo`, which
-contains the two UART blocks, a FIFO and nothing else. Full details and the
-design rationale are in [`docs/uart_selftest.md`](../docs/uart_selftest.md).
+contains the two UART blocks, a 64-byte register file and nothing else. Full
+details and the design rationale are in
+[`docs/uart_selftest.md`](../docs/uart_selftest.md).
 
 ```bash
 # build and flash the echo image (once)
@@ -201,10 +202,21 @@ python accel/tpu/host/uart_echo.py -p COM5 --baud 117000  # +1.6% sampling-margi
 python accel/tpu/host/uart_echo.py --offline              # check the forensics, no board
 ```
 
-The device echoes every byte from reset — there is no protocol to get out of
-sync with. The host streams fresh random blocks and reads them back on a
-concurrent thread, so both directions are live at once, as they are on the real
-link. On a mismatch it reports whether the received stream is the sent stream
+The device is store-and-forward: it buffers **64 bytes** in registers, sends
+those 64 back, and repeats. The block length is the entire protocol, so
+`--block` must match the synthesised `BLOCK_LEN` — the host checks that at
+startup and says so rather than leaving you to infer it from a byte diff. It
+first walks the device's block counter to a known position (`resync`), since a
+half-finished block from an interrupted run would otherwise make every
+subsequent exchange short.
+
+The exchange is half duplex by construction, so unlike the earlier streaming
+echo it does not test both directions live at once; what it does test is the
+**turnaround** — burst in, gap, burst out, next block's first byte arriving right
+behind the reply — which is the shape of the real protocol's traffic. A byte that
+arrives while the reply is going out is dropped and latched on `led[0]`.
+
+On a mismatch it reports whether the received stream is the sent stream
 shifted by a whole **bit** (a mis-framed byte), by a whole **byte** (a lost or
 invented frame), or by neither (a single mis-sampled bit) — three different bugs
 that a byte-by-byte diff renders identically.
@@ -217,7 +229,8 @@ metastability.
 
 This image has no SRAM and no core, so **reflash `cmod_a7` before running
 anything else** — `test_uart_link.py` and `run_program.py` will time out against
-it (it answers, but it echoes rather than obeying commands).
+it (it says nothing at all until 64 bytes have piled up, and then replies with
+those bytes rather than obeying any command).
 
 ## Two things to know
 

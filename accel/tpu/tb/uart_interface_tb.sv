@@ -25,25 +25,40 @@
 //   8. 'G' start program: run pulse fires with the right boot PC
 //   9. arbitration: any command while core_busy -> NAK; works again once idle
 //  10. new-command validation: bad IMEM length/range and bad boot PC -> NAK
+//  11. a 256-byte payload at an odd base (length high byte, idx carry, page cross)
+//  12. turnaround: a byte sent while the device is mid-reply must NOT be lost
+//  13. every exchange is followed by "and nothing else came out"
+//  14. outrunning the one-byte holding register sets `rx_overrun` (last: it
+//      deliberately desyncs the FSM)
 //
 // Build:
-//   make TEST=uart_interface \
-//     RTL="../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv ../rtl/sram.sv" sim
+//   make TEST=uart_interface sim        (RTL_uart_interface in tb/Makefile)
+//
+// RX_TIMEOUT is a *module parameter*, not a localparam, so the as-built
+// configuration can be simulated without editing this file:
+//
+//   iverilog -g2012 -Puart_interface_tb.RX_TIMEOUT=0 -o t.vvp <sources> && vvp t.vvp
+//
+// Both board targets set UART_RX_TIMEOUT = 0 (synth/vivado/boards/*/board.tcl),
+// which compiles the mid-frame abort out of the design entirely. A testbench that
+// only ever runs with a non-zero timeout is testing a configuration nobody
+// builds; test 5 is skipped when it is 0 and everything else must still pass.
 // -----------------------------------------------------------------------------
 
 `timescale 1ns / 1ps
 
-module uart_interface_tb;
+module uart_interface_tb #(
+    // clocks; > one byte (10*CPB) so normal frames never trip it, but small
+    // enough to exercise mid-frame abort quickly. 0 = as built on both boards.
+    parameter int RX_TIMEOUT = 1000
+);
 
     // ---- Parameters ---------------------------------------------------------
     localparam int CPB         = 16;    // UART clocks per bit (fast, for sim)
     localparam int MEM_ADDR_W  = 19;
     localparam int MEM_DATA_W  = 8;
     localparam int IMEM_AW     = 10;
-    localparam int RX_TIMEOUT  = 1000;  // clocks; > one byte (10*CPB) so normal
-                                        // frames never trip it, but small enough
-                                        // to exercise mid-frame abort quickly.
-    localparam int MAXLEN      = 16;    // largest SRAM payload used by any test
+    localparam int MAXLEN      = 256;   // largest SRAM payload used by any test
     localparam int MAXW        = 8;     // largest IMEM payload (words) used
 
     localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47;
@@ -76,6 +91,7 @@ module uart_interface_tb;
     logic [MEM_DATA_W-1:0]  sram_din, sram_dout;
     logic                   sram_busy, sram_done;
     logic                   host_busy;
+    logic                   rx_overrun;
 
     // ---- FSM -> IMEM write / run trigger ------------------------------------
     logic                imem_we;
@@ -114,8 +130,14 @@ module uart_interface_tb;
         .sram_busy(sram_busy), .sram_done(sram_done),
         .imem_we(imem_we), .imem_waddr(imem_waddr), .imem_wdata(imem_wdata),
         .run_start(run_start), .run_pc(run_pc),
-        .host_busy(host_busy)
+        .host_busy(host_busy), .rx_overrun(rx_overrun)
     );
+
+    // One strobe per transmitted frame, taken from inside the DUT. Counting the
+    // wire instead would mean telling a start bit from a data bit that happens
+    // to be low — see `expect_quiet`, which is the whole reason this exists.
+    int tx_frames = 0;
+    always @(posedge clk) if (rst_n && tx_start) tx_frames++;
 
     sram_controller #(
         .CLOCKS_PER_ACCESS(2), .ADDR_W(MEM_ADDR_W), .DATA_W(MEM_DATA_W)
@@ -257,6 +279,19 @@ module uart_interface_tb;
         chk(st === (exp_ack ? ACK : NAK), $sformatf("go status (got %02h)", st));
     endtask
 
+    // Nothing more may come out of the device. The hardware symptom this whole
+    // branch exists for is the device sending *more* bytes than the host asked
+    // for, and none of the tasks above would notice: each reads exactly the
+    // number of frames it expects and leaves anything extra on the wire.
+    task automatic expect_quiet(input string tag);
+        int quiet_tx;
+        quiet_tx = tx_frames;
+        repeat (20 * CPB) @(posedge clk);
+        chk(tx_frames == quiet_tx,
+            $sformatf("%s: %0d extra frame(s) after the exchange",
+                      tag, tx_frames - quiet_tx));
+    endtask
+
     // Send a header only (no payload) and expect a single NAK — used for
     // commands the device rejects at validation, before any data phase.
     task automatic expect_nak(input [7:0] cmd, input [23:0] a, input [15:0] n);
@@ -284,11 +319,13 @@ module uart_interface_tb;
         // ---- Test 1: round-trip a multi-byte block --------------------------
         for (int i = 0; i < 8; i++) wbuf[i] = 8'(8'hA0 + i);
         do_write(24'h00_0100, 16'd8);
+        expect_quiet("write ack");
         for (int i = 0; i < 8; i++)
             chk(sram_mem[24'h000100 + i] === wbuf[i],
                 $sformatf("mem[%0h]", 24'h000100 + i));
 
         do_read(24'h00_0100, 16'd8);
+        expect_quiet("read reply");
         for (int i = 0; i < 8; i++)
             chk(rbuf[i] === wbuf[i],
                 $sformatf("readback[%0d] got %02h exp %02h", i, rbuf[i], wbuf[i]));
@@ -341,15 +378,22 @@ module uart_interface_tb;
             chk(rbuf[i] === sram_mem[24'h000100 + i], "valid cmd after bad cmd");
 
         // ---- Test 5: mid-frame abort + RX_TIMEOUT, then fresh command --------
-        tx_bit_byte(WCMD);
-        tx_bit_byte(8'h00);
-        repeat (RX_TIMEOUT + 4 * CPB) @(posedge clk);   // let the timeout elapse
-        chk(host_busy === 1'b0, "timeout returned FSM to idle");
+        // Only meaningful when the abort exists. Both board targets build with
+        // UART_RX_TIMEOUT = 0, so under that configuration a half-sent frame
+        // wedges the FSM until reset by design — skip rather than hang.
+        if (RX_TIMEOUT != 0) begin
+            tx_bit_byte(WCMD);
+            tx_bit_byte(8'h00);
+            repeat (RX_TIMEOUT + 4 * CPB) @(posedge clk);   // let the timeout elapse
+            chk(host_busy === 1'b0, "timeout returned FSM to idle");
 
-        wbuf[0] = 8'hDE; wbuf[1] = 8'hAD;
-        do_write(24'h00_0300, 16'd2);
-        do_read(24'h00_0300, 16'd2);
-        chk(rbuf[0] === 8'hDE && rbuf[1] === 8'hAD, "command after timeout abort");
+            wbuf[0] = 8'hDE; wbuf[1] = 8'hAD;
+            do_write(24'h00_0300, 16'd2);
+            do_read(24'h00_0300, 16'd2);
+            chk(rbuf[0] === 8'hDE && rbuf[1] === 8'hAD, "command after timeout abort");
+        end else begin
+            $display("  skip: mid-frame abort (RX_TIMEOUT = 0, as built)");
+        end
 
         // ---- Test 6: back-to-back commands, no idle gap ---------------------
         wbuf[0] = 8'h01; wbuf[1] = 8'h02; wbuf[2] = 8'h03;
@@ -401,9 +445,78 @@ module uart_interface_tb;
 
         // ---- Test 10: validation of the new commands ------------------------
         expect_nak(ICMD, 24'h00_0010, 16'd3);   // IMEM len not a multiple of 4
+        expect_quiet("imem bad length");
         expect_nak(ICMD, 24'h00_0400, 16'd4);   // IMEM addr out of range (>=1024)
         expect_nak(ICMD, 24'h00_03FF, 16'd8);   // IMEM addr+words overflow
         do_go     (24'h00_0400, 1'b0);          // boot PC out of range -> NAK
+        expect_quiet("bad boot pc");
+
+        // ---- Test 11: a payload longer than one address byte ----------------
+        // Every payload above is <= 16 bytes, which exercises neither the length
+        // field's high byte nor `idx`'s carry out of bit 7. 256 bytes at an odd
+        // base does both, and crosses a 256-byte SRAM page while it is at it.
+        for (int i = 0; i < 256; i++) wbuf[i] = 8'((i * 8'h1B) ^ 8'h5A);
+        do_write(24'h00_10FF, 16'd256);
+        expect_quiet("256B write");
+        do_read (24'h00_10FF, 16'd256);
+        expect_quiet("256B read");
+        begin
+            int bad;
+            bad = 0;
+            for (int i = 0; i < 256; i++) if (rbuf[i] !== wbuf[i]) bad++;
+            chk(bad == 0, $sformatf("256-byte round trip (%0d bytes wrong)", bad));
+        end
+
+        // ---- Test 12: turnaround — a byte arriving mid-reply is not lost -----
+        //
+        // The regression test for the RX holding register, and the one gap that
+        // let the hardware bug through: no test above ever sends a byte while
+        // the device is transmitting. SEND_STATUS + SEND_STATUS_WAIT last a full
+        // byte time and sit exactly where a pipelined host puts its next command
+        // byte, and before the holding register existed the FSM consumed
+        // `rx_byte` only in IDLE/RX_ADDR/RX_LEN/WR_RX/IMEM_RX and silently threw
+        // that byte away — one lost byte, permanently desynced link.
+        wbuf[0] = 8'h7E;
+        begin
+            logic [7:0] st, b;
+            fork
+                begin
+                    send_header(WCMD, 24'h00_0500, 16'd1);
+                    tx_bit_byte(wbuf[0]);
+                    tx_bit_byte(RCMD);     // pipelined: lands inside the ACK
+                end
+                rx_bit_byte(st);
+            join
+            chk(st === ACK, $sformatf("pipelined write ack (got %02h)", st));
+            chk(rx_overrun === 1'b0, "single pipelined byte is not an overrun");
+
+            repeat (4 * CPB) @(posedge clk);
+            chk(host_busy === 1'b1,
+                "pipelined 'R' survived the reply turnaround (FSM is in RX_ADDR)");
+
+            if (host_busy === 1'b1) begin
+                // Finish the frame the pipelined byte started and check the data.
+                fork
+                    begin
+                        tx_bit_byte(8'h00); tx_bit_byte(8'h05); tx_bit_byte(8'h00);
+                        tx_bit_byte(8'h00); tx_bit_byte(8'h01);
+                    end
+                    rx_bit_byte(b);
+                join
+                chk(b === wbuf[0],
+                    $sformatf("read from the pipelined command (got %02h exp %02h)",
+                              b, wbuf[0]));
+                expect_quiet("pipelined read");
+            end
+        end
+
+        // Nothing above overlapped by more than one byte, so the device must
+        // never have run out of room.
+        chk(rx_overrun === 1'b0, "no RX overrun across the whole protocol suite");
+
+        // Last, because it deliberately overruns the holding register and leaves
+        // the FSM desynced.
+        test_overrun_is_reported();
 
         repeat (4) @(posedge clk);
 
@@ -412,6 +525,43 @@ module uart_interface_tb;
 
         $finish;
     end
+
+    // =========================================================================
+    // Overrun reporting — runs last, because it leaves the FSM desynced.
+    //
+    // One byte of buffering is what docs/uart_host.md §5 specifies and what the
+    // protocol needs (the host cannot be more than one byte ahead without having
+    // seen the reply). Two is beyond it. What matters is that going beyond it is
+    // *reported* rather than silent: `rx_overrun` is the difference between "a
+    // byte was lost, and here is the clock it happened on" and four kilobytes of
+    // NAKs with no idea where they started.
+    // =========================================================================
+    task automatic test_overrun_is_reported();
+        logic [7:0] b;
+        $display("");
+        $display("---- overrun reporting ----");
+        chk(rx_overrun === 1'b0, "overrun clear before the deliberate overrun");
+
+        // Read 4 bytes and shove 4 command bytes in behind it. The first is held,
+        // the rest have nowhere to go.
+        fork
+            begin
+                send_header(RCMD, 24'h00_0100, 16'd4);
+                repeat (2 * CPB) @(posedge clk);
+                tx_bit_byte(8'hAA);
+                tx_bit_byte(8'hBB);
+                tx_bit_byte(8'hCC);
+                tx_bit_byte(8'hDD);
+            end
+            begin
+                for (int i = 0; i < 4; i++) rx_bit_byte(b);
+            end
+        join
+        chk(rx_overrun === 1'b1,
+            "rx_overrun set when the host outran the holding register");
+        $display("---------------------------");
+        $display("");
+    endtask
 
     // Safety net so a hang (e.g. an expected reply that never comes) fails loudly
     // instead of running forever.

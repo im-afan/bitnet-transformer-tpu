@@ -20,6 +20,10 @@ accel/tpu/tb/*.vvp
 accel/tpu/tb/*.vcd
 accel/tpu/tb/*.fst
 
+# `make cosim` (host/sim_link.py) builds the testbench and both halves of its
+# host<->device byte stream here.
+accel/tpu/tb/cosim/
+
 # --- hardware: synthesis / place-and-route / bitstreams ---
 accel/tpu/synth/build/
 *.bit

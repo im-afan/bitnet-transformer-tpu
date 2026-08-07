@@ -12,6 +12,7 @@
 //
 //   cmod_a7        everything. The image that fails.
 //   cmod_a7_mem    this one: the protocol and the memory, no core.
+//   cmod_a7_bram   the protocol only — same FSM, on-chip block RAM behind it.
 //   cmod_a7_echo   neither. Just the wire framing. Runs clean for 5 minutes.
 //
 // So it splits the remaining search space in half. If test_uart_link.py still
@@ -20,6 +21,10 @@
 // core present, which points at the arbitration mux, `core_busy`, or the DMA
 // engine's half of the shared controller, none of which the echo image could
 // say anything about.
+//
+// rtl/uart_bram.sv is the next cut after this one, and the only one that
+// separates the two suspects this image leaves: identical protocol, identical
+// uart_interface, bram_controller in place of sram_controller.
 //
 // Two things behave differently to tpu_top, both deliberate and both visible
 // only to commands this rig is not meant to be driven with:
@@ -105,6 +110,7 @@ module uart_memory #(
     logic [31:0]            uart_imem_wdata;
     logic                   uart_run_start;
     logic [IMEM_AW-1:0]     uart_run_pc;
+    logic                   uart_rx_overrun;
 
     // =========================================================================
     // SRAM controller — chip-side pins go straight to the top level.
@@ -195,7 +201,8 @@ module uart_memory #(
         .run_start  (uart_run_start),
         .run_pc     (uart_run_pc),
 
-        .host_busy  (uart_host_busy)
+        .host_busy  (uart_host_busy),
+        .rx_overrun (uart_rx_overrun)
     );
 
     // =========================================================================
@@ -206,16 +213,21 @@ module uart_memory #(
     // until half way through the next start bit. Counting it here means the
     // status logic sees precisely the bytes the command FSM sees, no more.
     //
-    // `collision` is the one output worth watching. It sets when a byte lands
-    // while the device is mid-transmit, which on this link should never happen:
-    // the host is the sole master and waits for each reply before sending the
-    // next command. It is the direct test of the standing hypothesis — that the
-    // FSM's blind window (SEND_STATUS + SEND_STATUS_WAIT consume nothing, and
-    // sit exactly where the host's next command arrives) is where a byte goes
-    // missing. A single dropped byte desyncs the FSM permanently and every
-    // payload byte after it reads as a bad command, so by the time the host
-    // notices, the evidence is 4 kB downstream. This catches the moment itself,
-    // on an LED, with no host involvement.
+    // `collision` is the one output worth watching. It sets on either of two
+    // things, both of which mean "the host got ahead of the device":
+    //
+    //   * a byte landed while the device was mid-transmit. On this link the host
+    //     is the sole master and waits for each reply before sending the next
+    //     command, so it should never happen. Since uart_interface grew its RX
+    //     holding register this is survivable rather than fatal — the byte is
+    //     kept, not dropped — so it is now information about the *host*, not a
+    //     device fault on its own.
+    //   * uart_interface's `rx_overrun`: a byte arrived with the holding
+    //     register still full, so one really was lost. That is the fault.
+    //
+    // Either way the evidence is a one-clock event that a 4 kB block will have
+    // buried by the time the host notices, so it is caught here, on an LED, with
+    // no host involvement.
     //
     // Sticky until reset, like uart_echo's `overflow`: the interesting event is
     // "did this ever happen", and a one-clock pulse 40 minutes into a soak is
@@ -241,6 +253,8 @@ module uart_memory #(
         end else begin
             uart_rx_valid_prev <= uart_rx_valid;
             hb_cnt             <= hb_cnt + 1'b1;
+
+            if (uart_rx_overrun) collision <= 1'b1;   // sticky until reset
 
             if (rx_byte) begin
                 act_cnt <= '1;

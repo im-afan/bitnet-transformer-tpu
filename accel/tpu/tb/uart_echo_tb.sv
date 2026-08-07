@@ -4,14 +4,23 @@
 //
 //   make echo
 //
-// Drives bytes into uart_rx and decodes uart_tx concurrently, so the DUT is
-// receiving and transmitting at the same time — the condition the real link runs
-// under, and the one a "send everything, then read everything" testbench never
-// reaches.
+// The DUT is store-and-forward: it takes BLOCK_LEN bytes in, then sends the same
+// BLOCK_LEN bytes back. So the checks are about the *exchange*, not about
+// keeping up with a stream:
 //
-// The headline case is `back-to-back`: 256 bytes with zero inter-byte gap. That
-// is where an echo has to actually keep up, and where any re-arm timing problem
-// in uart_receiver's return to IDLE would show. See docs/uart_selftest.md.
+//   * nothing comes out until the block is complete — the device must not reply
+//     to the first BLOCK_LEN-1 bytes,
+//   * all BLOCK_LEN come back, in order, and then it goes quiet,
+//   * consecutive blocks work, i.e. the sequencer returns to RECV cleanly and
+//     the second block is not off by a byte,
+//   * a byte arriving during the reply is dropped, flagged on `overrun`, and
+//     does not corrupt the reply or desync the next block.
+//
+// The reply decoder still runs in a `fork` alongside the driver even though the
+// protocol is half duplex. It has to: uart_receiver raises `valid` entering the
+// stop bit, so the device starts transmitting roughly a bit period *before* the
+// last byte's stop bit finishes on the wire. A decoder started after the drive
+// loop returns would miss the first reply frame.
 //
 // CLK_PER_BIT is 104, matching the hardware image (12 MHz / 115200), rather than
 // the 868 the other UART testbenches use for a 100 MHz core. The sampling margin
@@ -20,21 +29,20 @@
 
 module uart_echo_tb;
     localparam int CLK_PER_BIT = 104;      // 12 MHz / 115200, as on the board
-    localparam int FIFO_AW     = 8;
-    localparam int MAX_BYTES   = 256;
+    localparam int BLOCK_LEN   = 64;       // as on the board (board.tcl BLOCK_LEN)
 
     logic clk = 0, rst_n = 0;
     logic uart_rx = 1, uart_tx;
-    logic blink_slow, blink_fast, activity, overflow;
+    logic blink_slow, blink_fast, activity, overrun;
 
     int errors = 0;
 
-    logic [7:0] sent [0:MAX_BYTES-1];
-    logic [7:0] got  [0:MAX_BYTES-1];
+    logic [7:0] sent [0:BLOCK_LEN-1];
+    logic [7:0] got  [0:BLOCK_LEN-1];
 
     uart_echo #(
         .CLK_PER_BIT (CLK_PER_BIT),
-        .FIFO_AW     (FIFO_AW),
+        .BLOCK_LEN   (BLOCK_LEN),
         .ACT_W       (6),               // tiny, so the LED logic still toggles in sim
         .HB_W        (8)
     ) dut (
@@ -45,7 +53,7 @@ module uart_echo_tb;
         .blink_slow (blink_slow),
         .blink_fast (blink_fast),
         .activity   (activity),
-        .overflow   (overflow)
+        .overrun    (overrun)
     );
 
     always #5 clk = ~clk;
@@ -99,9 +107,14 @@ module uart_echo_tb;
     endtask
 
     // =========================================================================
-    // One full-duplex pass: stream `n` bytes in while decoding `n` back out.
+    // One exchange: BLOCK_LEN bytes in, BLOCK_LEN bytes back.
+    //
+    // `extra_byte` (>= 0) injects one more byte immediately after the block, so
+    // it lands while the reply is going out. It must be dropped and flagged, not
+    // stored — that is the overrun case.
     // =========================================================================
-    task automatic run_stream(input int n, input int gap_bits, input string what);
+    task automatic run_block(input int gap_bits, input int extra_byte,
+                             input string what);
         logic       ok;
         logic [7:0] b;
         int         rx0, tx0, err0, quiet_tx;
@@ -114,10 +127,24 @@ module uart_echo_tb;
 
         fork
             begin : drive_host_tx
-                for (int i = 0; i < n; i++) tx_byte(sent[i], gap_bits);
+                for (int i = 0; i < BLOCK_LEN; i++) begin
+                    tx_byte(sent[i], gap_bits);
+
+                    // With BLOCK_LEN-1 bytes delivered the device must still be
+                    // silent. A streaming echo would already have replied to
+                    // most of them; this one owes nothing until the block is
+                    // whole.
+                    if (i == BLOCK_LEN - 2 && tx_frames != tx0) begin
+                        $display("  FAIL %s: %0d frame(s) came back before the block was complete",
+                                 what, tx_frames - tx0);
+                        errors++;
+                    end
+                end
+                // Truncated to 8 bits by the task's port width.
+                if (extra_byte >= 0) tx_byte(extra_byte, 0);
             end
             begin : decode_device_tx
-                for (int i = 0; i < n; i++) begin
+                for (int i = 0; i < BLOCK_LEN; i++) begin
                     // Decoded into a scalar first: passing an array element as a
                     // task output argument is legal SystemVerilog but not
                     // uniformly supported.
@@ -132,7 +159,7 @@ module uart_echo_tb;
             end
         join
 
-        for (int i = 0; i < n; i++) begin
+        for (int i = 0; i < BLOCK_LEN; i++) begin
             if (got[i] !== sent[i]) begin
                 if (first_bad < 0) begin
                     first_bad = i;
@@ -143,67 +170,93 @@ module uart_echo_tb;
             end
         end
 
-        if (rx_frames - rx0 != n) begin
+        if (rx_frames - rx0 != BLOCK_LEN + (extra_byte >= 0 ? 1 : 0)) begin
             $display("  FAIL %s: receiver saw %0d bytes, host sent %0d",
-                     what, rx_frames - rx0, n);
+                     what, rx_frames - rx0,
+                     BLOCK_LEN + (extra_byte >= 0 ? 1 : 0));
             errors++;
         end
-        if (tx_frames - tx0 != n) begin
+        if (tx_frames - tx0 != BLOCK_LEN) begin
             $display("  FAIL %s: transmitter sent %0d frames, expected %0d",
-                     what, tx_frames - tx0, n);
+                     what, tx_frames - tx0, BLOCK_LEN);
             errors++;
         end
 
         // Nothing more may come out. A phantom frame here is the hardware
-        // symptom that started all this (the device over-running a reply).
+        // symptom that started all this (the device over-running a reply), and
+        // in the overrun case it would mean the dropped byte was not dropped.
         quiet_tx = tx_frames;
         repeat (20 * CLK_PER_BIT) @(posedge clk);
         if (tx_frames != quiet_tx) begin
-            $display("  FAIL %s: %0d extra frame(s) after the stream ended",
+            $display("  FAIL %s: %0d extra frame(s) after the reply ended",
                      what, tx_frames - quiet_tx);
             errors++;
         end
 
         if (errors == err0)
-            $display("  ok   %s: %0d bytes echoed intact, %0d bit gap",
-                     what, n, gap_bits);
+            $display("  ok   %s: %0d bytes in and back, %0d bit gap",
+                     what, BLOCK_LEN, gap_bits);
+    endtask
+
+    // Refill `sent` from the LFSR, so consecutive blocks carry different data
+    // and a stale buffer cannot pass as a correct reply.
+    logic [15:0] lfsr;
+
+    task automatic fill_payload();
+        for (int i = 0; i < BLOCK_LEN; i++) begin
+            for (int k = 0; k < 8; k++)
+                lfsr = {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
+            sent[i] = lfsr[7:0];
+        end
     endtask
 
     // =========================================================================
     // Stimulus.
     // =========================================================================
-    logic [15:0] lfsr;
-
     initial begin
         // Deterministic pseudo-random payload. An LFSR rather than $random so
         // the vector is identical under any simulator.
         lfsr = 16'hACE1;
-        for (int i = 0; i < MAX_BYTES; i++) begin
-            for (int k = 0; k < 8; k++)
-                lfsr = {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
-            sent[i] = lfsr[7:0];
-        end
 
         repeat (4) @(posedge clk);
         rst_n = 1'b1;
         repeat (4) @(posedge clk);
 
-        // The case that matters: a completely gapless stream, long enough that
-        // any per-byte drift in the echo path would have accumulated.
-        run_stream(MAX_BYTES, 0, "back-to-back");
+        // The case that matters: a completely gapless block, so the receiver
+        // gets no slack between frames and any per-byte drift accumulates.
+        fill_payload();
+        run_block(0, -1, "back-to-back");
 
-        // Same payload with room to breathe. If this passes and the one above
-        // fails, the fault is in the re-arm/turnaround timing, not in sampling.
-        run_stream(64, 3, "3-bit gaps");
+        // A second gapless block with fresh data, immediately after the first.
+        // This is what catches a sequencer that returns to RECV with a stale
+        // count: the payload would come back shifted, not corrupted.
+        fill_payload();
+        run_block(0, -1, "second block");
 
-        // Single bytes, well separated — the trivial case, checked last so a
-        // failure here means something very basic is wrong.
-        run_stream(8, 20, "isolated bytes");
+        // Same shape with room to breathe. If this passes and the ones above
+        // fail, the fault is in the re-arm/turnaround timing, not in sampling.
+        fill_payload();
+        run_block(3, -1, "3-bit gaps");
 
-        if (overflow) begin
-            $display("  FAIL echo FIFO overflowed (depth %0d)", 1 << FIFO_AW);
+        if (overrun) begin
+            $display("  FAIL overrun set during normal exchanges");
             errors++;
         end
+
+        // Last, because `overrun` is sticky: a byte sent while the reply is
+        // going out must be dropped (reply intact, no extra frame, and the next
+        // block still lines up) and must be visible on the status output.
+        fill_payload();
+        run_block(0, 8'h5A, "byte during reply");
+        if (!overrun) begin
+            $display("  FAIL a byte arrived during the reply but overrun stayed low");
+            errors++;
+        end
+
+        // And the dropped byte must not have left the sequencer half a block
+        // out of step.
+        fill_payload();
+        run_block(0, -1, "block after overrun");
 
         if (errors == 0)
             $display("ALL TESTS PASSED (%0d bytes in, %0d frames out)",
@@ -214,10 +267,12 @@ module uart_echo_tb;
         $finish;
     end
 
-    // Watchdog. The full run is about 3.4 ms of simulated time; anything past
-    // 20 ms means a task is blocked waiting for a frame that never came.
+    // Watchdog. Each exchange is 128 frames — 1280 bit periods of 104 clocks at
+    // 10 ns, so ~1.4 ms of simulated time; the six here plus gaps land around
+    // 9 ms. Anything past this means a task is blocked waiting for a frame that
+    // never came.
     initial begin
-        #20_000_000;
+        #40_000_000;
         $display("FAIL timeout — %0d bytes in, %0d frames out", rx_frames, tx_frames);
         $finish;
     end

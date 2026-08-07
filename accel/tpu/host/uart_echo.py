@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """uart_echo.py — host side of the UART echo self-test (``docs/uart_selftest.md``).
 
-Streams random bytes at the `cmod_a7_echo` bitstream and checks that exactly
-those bytes come back. The device runs `rtl/uart_echo.sv`: no commands, no
-protocol, no modes — it echoes from reset until power-off, so there is nothing
-here to get out of sync with.
+Sends fixed-size blocks of random bytes at the `cmod_a7_echo` bitstream and
+checks that exactly those bytes come back. The device runs `rtl/uart_echo.sv`,
+which is store-and-forward: it buffers ``BLOCK_LEN`` bytes in registers, sends
+those ``BLOCK_LEN`` bytes back, and repeats. No commands, no addresses, no modes.
 
     python accel/tpu/host/uart_echo.py -p COM5                # 30-second run
     python accel/tpu/host/uart_echo.py -p COM5 --minutes 30   # soak until it breaks
     python accel/tpu/host/uart_echo.py -p COM5 --baud 117000  # margin check, below
     python accel/tpu/host/uart_echo.py --offline              # check the forensics, no board
 
-**Full duplex.** A reader thread drains the port while the main thread writes, so
-the device is transmitting and receiving simultaneously — the condition the real
-link runs under. Writing a whole block and only then reading it back would not
-reach it.
+**``--block`` must equal the device's ``BLOCK_LEN``** (``BLOCK_LEN`` in
+`boards/cmod_a7_echo/board.tcl`, 64 by default). Nothing on the wire negotiates
+it: the block length *is* the protocol. Get it wrong and the run fails in the
+first block — see :func:`resync`, which says so explicitly rather than leaving
+you to read it out of a byte diff.
+
+**Half duplex, by construction.** The device is never transmitting and receiving
+at once, so this no longer exercises simultaneous traffic the way a streaming
+echo did. What it does exercise instead is the *turnaround*: a burst in, a gap,
+a burst out, then the next block's first byte arriving right behind the reply —
+the shape of the real protocol's traffic.
 
 **Fresh random data every block**, so a readback of stale buffered bytes can never
 be mistaken for a pass.
@@ -39,19 +46,17 @@ from __future__ import annotations
 import argparse
 import random
 import sys
-import threading
 import time
 
 DEFAULT_BAUD = 115200
-DEFAULT_BLOCK = 4096          # ~0.36 s each way at 115200
+DEFAULT_BLOCK = 64            # = BLOCK_LEN in boards/cmod_a7_echo/board.tcl
 DEFAULT_SECONDS = 30.0
 
-# Bytes per block are bounded by the device's 256-entry echo FIFO. The FPGA's
-# transmitter is a couple of clocks per byte slower than the host's stream, so
-# occupancy creeps up over one unbroken block; waiting for each block to return
-# before sending the next resets it. 4096 bytes costs about 1.3 bytes of that
-# headroom, so there are three orders of magnitude in hand. See rtl/uart_echo.sv.
-MAX_BLOCK = 262144
+# Bytes per block are the device's register file, not a buffer the host can pick
+# freely: this has to match the synthesised BLOCK_LEN. The cap is only here to
+# keep a fat-fingered --block from producing a run that appears to hang while it
+# waits for a reply that will never be BLOCK_LEN bytes long.
+MAX_BLOCK = 4096
 
 
 # ---- Bit-level forensics ----------------------------------------------------
@@ -166,6 +171,8 @@ def report_mismatch(sent: bytes, got: bytes, block_no: int,
         elif len(got) < len(sent):
             print(f"    every byte received was correct — {len(sent) - len(got)} "
                   f"never arrived. A frame was lost, not corrupted.")
+            print(f"    (if this is the first block: --block {len(sent)} may not "
+                  f"be the device's BLOCK_LEN — {len(got)} came back)")
         else:
             print(f"    every expected byte was correct, plus "
                   f"{len(got) - len(sent)} extra — the device invented a frame.")
@@ -211,29 +218,75 @@ def report_mismatch(sent: bytes, got: bytes, block_no: int,
 # ---- Link -------------------------------------------------------------------
 
 def echo_block(ser, data: bytes, quiet: float) -> bytes:
-    """Write ``data`` while concurrently reading the echo back.
+    """Write one whole block, then read the reply back.
+
+    Sequential because the device is: it says nothing until the last byte of the
+    block has arrived. There is no concurrency to arrange here, and a reader
+    thread would only obscure that.
 
     ``quiet`` is an inter-chunk timeout, not a total one: the clock restarts
-    every time bytes arrive, so a large block is not penalised for taking as
-    long as the baud rate says it must, while a device that has stopped talking
-    is noticed within ``quiet`` seconds.
+    every time bytes arrive, so a block is not penalised for taking as long as
+    the baud rate says it must, while a device that has stopped talking is
+    noticed within ``quiet`` seconds. It also bounds the failure case that
+    matters — a device stuck mid-block, waiting for bytes the host has already
+    sent — instead of hanging the run.
+
+    **The wait before reading is not politeness, it is the measurement.**
+    Reading the port while the USB-serial bridge is still shifting the block out
+    corrupts the byte in flight — see ``tpu_uart.TPUUart._send``. Without it this
+    function reports one mangled byte per block and blames the FPGA for it,
+    which is exactly the trap this script exists to avoid: on a 64-byte block,
+    reading immediately corrupted 72/6400 bytes and waiting first corrupted 0.
     """
-    got = bytearray()
-
-    def reader():
-        deadline = time.monotonic() + quiet
-        while len(got) < len(data) and time.monotonic() < deadline:
-            chunk = ser.read(min(4096, len(data) - len(got)))
-            if chunk:
-                got.extend(chunk)
-                deadline = time.monotonic() + quiet
-
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
     ser.write(data)
     ser.flush()
-    t.join(quiet + 2.0)
+    time.sleep(10.0 * len(data) / ser.baudrate * 1.02 + 0.005)
+
+    got = bytearray()
+    deadline = time.monotonic() + quiet
+    while len(got) < len(data) and time.monotonic() < deadline:
+        chunk = ser.read(len(data) - len(got))
+        if chunk:
+            got.extend(chunk)
+            deadline = time.monotonic() + quiet
     return bytes(got)
+
+
+def resync(ser, block: int, quiet: float = 0.3) -> int | None:
+    """Bring the device's block counter to a known position, and say what it was.
+
+    A store-and-forward device has state the streaming echo did not: a partial
+    block. Interrupt a previous run (or feed the board stray bytes) and it sits
+    holding ``k`` bytes, expecting ``block - k`` more — after which every
+    exchange is short by ``k`` and a byte diff blames the link for what is really
+    a bookkeeping problem.
+
+    One block of zero padding fixes it whatever ``k`` was. The device completes
+    its block after ``block - k`` of them and replies; the remaining ``k`` land
+    during that reply and are dropped, since the reply occupies a full ``block``
+    byte times and ``k < block``. Either way it ends up back at zero.
+
+    The reply is also the diagnostic. It is the ``k`` stale bytes the device was
+    holding followed by our zeros, so the count of leading non-zero bytes *is*
+    ``k`` — reported, not just corrected. (A stale byte that was itself zero
+    hides in the padding and undercounts; that costs nothing, since the
+    alignment is fixed regardless.)
+
+    Returns ``k``, or ``None`` if the device did not return a full block: wrong
+    bitstream, wrong port, wrong baud, or a ``BLOCK_LEN`` that is not ``block``.
+
+    One deliberate side effect: if ``k`` was non-zero, the padding that gets
+    dropped latches the board's sticky ``overrun`` flag (led[0]). That is why the
+    caller prints the recovery — a fast-blinking led[0] afterwards is this, not a
+    fault found during the run.
+    """
+    drain(ser, quiet)
+    got = echo_block(ser, b"\x00" * block, quiet)
+    drain(ser, quiet)
+
+    if len(got) != block:
+        return None
+    return next((i for i, b in enumerate(got) if b == 0), len(got))
 
 
 def drain(ser, quiet: float = 0.3) -> bytes:
@@ -287,7 +340,8 @@ def run(cfg) -> int:
         err = 100.0 * (cfg.baud - DEFAULT_BAUD) / DEFAULT_BAUD
         print(f"          {err:+.2f}% off the device's {DEFAULT_BAUD} "
               f"— margin check, mismatches here are the point")
-    print(f"block   : {cfg.block} bytes, fresh random data each time")
+    print(f"block   : {cfg.block} bytes in then {cfg.block} back, fresh random "
+          f"data each time (must match the device's BLOCK_LEN)")
     print(f"run for : {duration:.0f}s")
     print()
 
@@ -297,6 +351,22 @@ def run(cfg) -> int:
         stale = drain(ser)
         if stale:
             print(f"  note: dropped {len(stale)} stale byte(s) left on the link")
+
+        held = resync(ser, cfg.block)
+        if held is None:
+            print(f"  {cfg.block} bytes of padding did not produce a "
+                  f"{cfg.block}-byte reply — the device never completed a block.")
+            print( "  check: the echo bitstream is loaded, --port, --baud, and "
+                   "that --block matches BLOCK_LEN in board.tcl (a BLOCK_LEN "
+                   "larger than --block looks exactly like this).")
+            return 1
+        if held:
+            print(f"  note: device was holding {held} byte(s) of a previous "
+                  f"block; realigned. led[0] will be flagging the padding this "
+                  f"discarded — that is the recovery, not a fault")
+        else:
+            print( "  aligned: device was empty and returned the padding block")
+        print()
 
         t0 = time.monotonic()
         blocks = 0
@@ -351,11 +421,58 @@ def run(cfg) -> int:
 
 # ---- Offline checks ---------------------------------------------------------
 
-def offline() -> int:
-    """Exercise the forensics on known corruptions.
+class FakeDevice:
+    """`rtl/uart_echo.sv`'s protocol in twenty lines, enough for :func:`resync`.
 
-    Worth having: this reporting code only ever runs on the day something breaks,
-    which is the worst moment to discover it was wrong.
+    Buffers ``block`` bytes, then returns them; a byte written while a reply is
+    still outstanding is dropped and sets ``overrun``, as on the board. ``held``
+    seeds it mid-block, which is the state `resync` exists to clear.
+
+    Not a serial port simulator — no timing, no framing, no corruption. It models
+    exactly the one thing under test: the block counter.
+    """
+
+    def __init__(self, block: int, held: bytes = b""):
+        self.block = block
+        self.buf = bytearray(held)
+        self.out = bytearray()
+        self.sending = False
+        self.overrun = False
+        self.timeout = 0.2
+        self.baudrate = DEFAULT_BAUD
+
+    def write(self, data: bytes) -> int:
+        for b in data:
+            if self.sending:            # nothing is listening during the reply
+                self.overrun = True
+                continue
+            self.buf.append(b)
+            if len(self.buf) == self.block:
+                self.out += self.buf
+                self.buf.clear()
+                self.sending = True
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def read(self, n: int = 1) -> bytes:
+        chunk = bytes(self.out[:n])
+        del self.out[:n]
+        if not self.out:
+            self.sending = False
+        return chunk
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self.out)
+
+
+def offline() -> int:
+    """Exercise the forensics and the alignment logic on known cases.
+
+    Worth having: this code only ever runs on the day something breaks, which is
+    the worst moment to discover it was wrong.
     """
     failed = 0
 
@@ -399,6 +516,27 @@ def offline() -> int:
     check(first_difference(ramp, bytes(noisy)) == 5,
           "first_difference: finds the index")
 
+    # --- the block protocol, against FakeDevice ---
+    payload = bytes(range(64))
+    check(echo_block(FakeDevice(64), payload, 0.05) == payload,
+          "echo_block: a full block goes out and comes back")
+
+    check(resync(FakeDevice(64), 64, 0.05) == 0,
+          "resync: an empty device reports 0 stale bytes")
+
+    dev = FakeDevice(64, held=b"\xaa\xbb\xcc")
+    check(resync(dev, 64, 0.05) == 3,
+          "resync: a device 3 bytes into a block reports 3")
+    check(dev.overrun,
+          "resync: realigning discards padding, which the board flags")
+    check(echo_block(dev, payload, 0.05) == payload,
+          "resync: the exchange after it is aligned")
+
+    check(resync(FakeDevice(32), 64, 0.05) is None,
+          "resync: a device whose BLOCK_LEN is smaller returns None")
+    check(resync(FakeDevice(128), 64, 0.05) is None,
+          "resync: a device whose BLOCK_LEN is larger returns None")
+
     print()
     if failed:
         print(f"FAILED: {failed} offline check(s)")
@@ -416,7 +554,9 @@ def main(argv=None) -> int:
                     help="host baud. The device is fixed at %(default)s; setting "
                          "this a few %% either side measures the sampling margin")
     ap.add_argument("--block", type=lambda s: int(s, 0), default=DEFAULT_BLOCK,
-                    help="bytes per block (default: %(default)s)")
+                    help="bytes per exchange. Must equal the device's BLOCK_LEN "
+                         "(board.tcl, default %(default)s) — this is not a host "
+                         "buffer size, it is the protocol")
     ap.add_argument("-s", "--seconds", type=float, default=DEFAULT_SECONDS,
                     help="how long to run (default: %(default)s)")
     ap.add_argument("-m", "--minutes", type=float,

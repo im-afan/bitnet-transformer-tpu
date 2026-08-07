@@ -19,13 +19,23 @@
 # All examples are self-contained over DRAM (rdmem inputs in, wrmem outputs out);
 # a custom program must also match gen_vectors.py's geometry/address map.
 #
-# UART echo self-test (docs/uart_selftest.md) — the loopback core that goes into
-# the cmod_a7_echo bitstream, driven full duplex:
+# UART echo self-test (docs/uart_selftest.md) — the block-loopback core that goes
+# into the cmod_a7_echo bitstream: 64 bytes in, the same 64 bytes back:
 #   make echo
 #
 # UART + external SRAM, no TPU core — the cmod_a7_mem bitstream's core, driven
 # with real 'W'/'R' command frames against a behavioral SRAM chip model:
 #   make mem
+#
+# The same protocol with the external memory removed as well — the cmod_a7_bram
+# bitstream's core, backed by on-chip block RAM (rtl/bram.sv):
+#   make bram
+#
+# The cmod_a7_mem image again, but driven by host/test_uart_link.py itself
+# instead of by hand-written stimulus — the real host driver, the real RTL, no
+# board (tb/uart_memory_cosim_tb.sv + host/sim_link.py):
+#   make cosim
+#   make cosim COSIM_ARGS="--only sram_roundtrip --sim-fsm"
 
 TEST ?= mxu
 
@@ -36,8 +46,12 @@ TB  := $(TEST)_tb.sv
 # `make TEST=<name>` works without spelling the list out on the command line.
 # An explicit RTL="..." on the command line still wins over both.
 RTL_uart_echo := ../rtl/uart_echo.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv
+RTL_uart_interface := ../rtl/uart_interface.sv ../rtl/uart_receiver.sv \
+                      ../rtl/uart_transmitter.sv ../rtl/sram.sv
 RTL_uart_memory := ../rtl/uart_memory.sv ../rtl/uart_interface.sv \
                    ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv ../rtl/sram.sv
+RTL_uart_bram := ../rtl/uart_bram.sv ../rtl/uart_interface.sv \
+                 ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv ../rtl/bram.sv
 
 RTL ?= $(if $(RTL_$(TEST)),$(RTL_$(TEST)),../rtl/$(TEST).sv)
 
@@ -52,10 +66,12 @@ UART_RTL := ../rtl/tpu_top.sv ../rtl/scalar_unit.sv ../rtl/mxu.sv ../rtl/vpu.sv 
             ../rtl/scratchpad.sv ../rtl/dma.sv ../rtl/sram.sv \
             ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv
 
-# Every test discoverable from the *_tb.sv files present.
-TESTS := $(patsubst %_tb.sv,%,$(wildcard *_tb.sv))
+# Every test discoverable from the *_tb.sv files present. uart_memory_cosim is
+# excluded: it has no rtl/<name>.sv and cannot run without host/sim_link.py
+# driving it, so `make all` would only fail on it. Use `make cosim`.
+TESTS := $(filter-out uart_memory_cosim,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
 
-.PHONY: sim wave list all clean uart echo mem
+.PHONY: sim wave list all clean uart echo mem bram cosim
 
 sim: $(TB) $(RTL)
 	$(IVERILOG) -o $(TOP).vvp $(RTL) $(TB)
@@ -75,6 +91,17 @@ echo:
 # Alias for `make TEST=uart_memory sim`.
 mem:
 	@$(MAKE) --no-print-directory TEST=uart_memory sim
+
+# Alias for `make TEST=uart_bram sim`.
+bram:
+	@$(MAKE) --no-print-directory TEST=uart_bram sim
+
+# The Python host driving the RTL directly. sim_link.py compiles the testbench
+# itself (it has to pass +plusargs and own the process), so there is no iverilog
+# line here -- this target only exists so the entry point is where the others are.
+COSIM_ARGS ?=
+cosim:
+	python ../host/test_uart_link.py --sim $(COSIM_ARGS)
 
 wave: sim
 	@echo "open $(TOP).vcd in gtkwave"

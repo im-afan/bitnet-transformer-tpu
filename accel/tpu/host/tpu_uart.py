@@ -85,6 +85,28 @@ MAX_LEN = 0xFFFF           # 16-bit length field
 MAX_IMEM_LEN = MAX_LEN & ~0x3   # 'I' payloads must be a multiple of 4 bytes
 ADDR_LIMIT = 1 << 24       # 3-byte address field
 
+# ---- Transmit settling (see TPUUart._send) ----------------------------------
+#
+# Reading the port while the USB-serial bridge is still shifting a frame out
+# corrupts the byte in flight, so _send waits for the frame to clear the wire
+# before anything reads. Both guards sit on top of the computed wire time
+# because that time cannot be measured, only predicted:
+#
+#   TX_SETTLE_S    write() returns when the bytes reach the driver, not when
+#                  the bridge starts transmitting; the USB OUT is scheduled a
+#                  frame or two later. A fixed pad covers that start-up skew,
+#                  which does not scale with the transfer.
+#   TX_RATE_SLACK  the real bit rate is only nominally the baud we asked for
+#                  (the FT2232H divides 120 MHz, the device divides its own
+#                  clock), so the true wire time drifts from the computed one
+#                  in proportion to the transfer. 2% covers a 4 KiB frame with
+#                  room to spare.
+#
+# Costs one settling time per command. That is invisible next to the wire time
+# of a block transfer and a few ms on a short one.
+TX_SETTLE_S = 0.005
+TX_RATE_SLACK = 1.02
+
 
 class ProtocolError(Exception):
     """The device answered, but not the way the protocol says it should."""
@@ -502,6 +524,39 @@ class TPUUart:
         """Wire time for ``n`` bytes at 10 bits/byte (8N1)."""
         return 10.0 * n / self.baud
 
+    def _send(self, frame: bytes) -> None:
+        """Put ``frame`` on the wire and wait until it has actually left.
+
+        **Do not read from the port before this returns.** Reading while the
+        USB-serial bridge is still shifting a frame out corrupts the byte in
+        flight: the host's IN requests disturb the transmitter's bit timing by
+        about half a bit, so the device samples that byte on its bit boundaries
+        and decodes ``sent[k]`` or ``sent[k-1]`` for every bit k. In practice
+        that is one mangled byte per command, and because the read is issued
+        the moment the write returns, it lands in the first few bytes — i.e.
+        the header, where a wrong length or address does the most damage. A
+        16-bit length field that comes out one bit left-shifted is why the
+        device used to "send more bytes than the host asked for".
+
+        Measured on a Cmod A7 (FT2232H, 115200 8N1) with the echo image, which
+        reports every received byte: reading immediately corrupted 72/6400
+        bytes, all in burst positions 1..6; sleeping past the burst first
+        corrupted 0/6400; sleeping over only the first half moved the damage to
+        positions 33..46, i.e. exactly where the read began. The FPGA is not
+        involved — the same RTL decodes a bit-identical stream perfectly in
+        simulation, and the fault reproduces on all three board images.
+
+        ``flush()`` is not enough on its own: on Windows it returns once the
+        bytes reach the driver, not once they reach the wire. There is no API
+        that reports the UART shift register, so the wire time is computed and
+        waited out, with two guards on top of it (:data:`TX_SETTLE_S`,
+        :data:`TX_RATE_SLACK`) — see those constants for why a bare wire time
+        is not enough.
+        """
+        self.ser.write(frame)
+        self.ser.flush()
+        time.sleep(self._byte_time(len(frame)) * TX_RATE_SLACK + TX_SETTLE_S)
+
     def _recv(self, n: int, timeout: float | None = None) -> bytes:
         """Read exactly ``n`` bytes or raise, leaving whatever arrived in the message."""
         if timeout is not None:
@@ -567,8 +622,7 @@ class TPUUart:
         _check_mem(addr, length)
         with self.trace.context(f"read_mem[{addr:#08x}+{length}]"):
             self.ser.reset_input_buffer()
-            self.ser.write(_header(CMD_READ, addr, length))
-            self.ser.flush()
+            self._send(_header(CMD_READ, addr, length))
             # The reply is header-less, so allow for the whole block on the wire.
             try:
                 return self._recv(
@@ -615,8 +669,7 @@ class TPUUart:
             self.ser.reset_input_buffer()
             # One write() so the trace shows the header and data phase as the
             # single burst the device actually sees.
-            self.ser.write(_header(cmd, addr, len(payload)) + payload)
-            self.ser.flush()
+            self._send(_header(cmd, addr, len(payload)) + payload)
             try:
                 self._status()
             except ProtocolError as exc:
@@ -636,8 +689,7 @@ class TPUUart:
         _check_pc(pc)
         with self.trace.context(f"go[pc={pc}]"):
             self.ser.reset_input_buffer()
-            self.ser.write(_header(CMD_GO, pc))
-            self.ser.flush()
+            self._send(_header(CMD_GO, pc))
             self._status()
 
 

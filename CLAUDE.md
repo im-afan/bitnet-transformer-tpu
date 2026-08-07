@@ -76,44 +76,73 @@ When touching attention numerics, keep the three implementations in sync: `mha_t
 (reference), the CUDA kernel, and any future TPU block — they all implement the same 5-D layout
 and masking convention.
 
-## In progress: intermittent UART corruption (as of 2026-08-05)
+## Solved: intermittent UART corruption (root-caused 2026-08-07)
 
-Live bug hunt on branch `uart-debug`. `host/test_uart_link.py` passes most of the time and
-fails after tens of seconds of traffic. **The visible symptom — the device sending more bytes
-than the host asked for — is the aftermath, not the fault.** A single lost/extra byte desyncs
-the command FSM permanently, it lands back in `IDLE` mid-payload, and every payload byte that
-isn't `R`/`W`/`I`/`G` then produces a NAK byte (`uart_interface.sv:201`). Don't chase the byte
-count; chase the one divergence that precedes it.
+**The fault was on the host, not the FPGA. Reading the serial port while the USB-serial
+bridge is still transmitting corrupts the byte in flight.** The host's IN requests disturb
+the FT2232H's transmit bit timing by roughly half a bit, so the device samples that byte on
+its bit boundaries and decodes `sent[k]` **or** `sent[k-1]` for every bit `k` — usually
+`value << 1`, sometimes `value | (value << 1)`. Fixed in `host/tpu_uart.py`: `TPUUart._send`
+now waits for a frame to clear the wire before anything reads (see that docstring and
+`TX_SETTLE_S` / `TX_RATE_SLACK`). All four commands and `test_uart_link.py`'s `raw_exchange`
+route through it.
 
-**Ruled out — do not re-litigate these.** Each cost a real experiment:
+`tpu_uart.py` had always issued `ser.write(frame)` then read the reply immediately, so the
+read landed on the *first few bytes of every command* — i.e. the header, where a corrupted
+length or address does the most damage. A 16-bit length field arriving one bit left-shifted
+is the whole of the original symptom: the device really did read 0x0180 bytes when asked for
+0x0140, so "the device sent more bytes than the host asked for" was literal, not a desync
+artefact.
+
+**How it was pinned down**, on the echo image (`cmod_a7_echo` reports every byte it received,
+so no protocol can hide anything), 64-byte bursts, 6400 bytes per arm:
+
+| host behaviour | corrupted | positions in the burst |
+|---|---|---|
+| read immediately after write | 72/6400 | 1–6 |
+| sleep past the whole burst, then read | **0/6400** | — |
+| sleep over only the *first half*, then read | 77/6400 | **33–46** |
+
+The third row is the proof: delaying the read moves the damage to exactly where the read
+begins. It is not a probability spread over the burst — it is one mangled byte per burst,
+located wherever the host started reading.
+
+**Ruled out — do not re-litigate.** Each cost a real experiment:
 
 | Hypothesis | Killed by |
 |---|---|
-| Off-centre sample point (`START` runs `CLK_PER_BIT+1`; CPB 104 vs 104.1667) | Echo image clean across ±3% baud. Bias is ~4 clocks of the 52 available |
-| Metastability / no `ASYNC_REG` on `uart_receiver.sv:16` | 83 ns period gives astronomical MTBF; echo clean for 5 min (~3.3 MiB each way) |
-| `uart_receiver` / `uart_transmitter` themselves | Same 5-min echo soak — it instantiates both **unmodified** |
-| Switching noise / SSO from the 30 bank-14 SRAM pins | No failure clustering across `sram_roundtrip`'s six patterns |
-| TX→RX crosstalk (J17/J18 are the `IO_L7P`/`L7N` pair, physically adjacent) | Echo image has the identical pinout and runs full duplex |
-| Timing closure | `build/cmod_a7/reports/`: WNS 34.129 ns of 83.333 ns, TNS 0, 0 failing endpoints. DRC is advisory-only |
+| Anything in the RTL | `uart_receiver` alone, and the whole `uart_memory` path, decode a bit-exact back-to-back stream perfectly at the real 104.1667 clocks/bit — all 256 byte values, 40 frames. See "the simulation blind spot" below |
+| `uart_interface`'s `SEND_STATUS` blind window | Co-simulation passes identically with and without the `rx_hold` fix; `rx_overrun`/`collision` never set on hardware either |
+| External SRAM, `sram_controller`, the 30 bank-14 pins, SSO | `cmod_a7_bram` (on-chip BRAM, no SRAM chip, no SRAM pins) reproduces at 23.8% vs 27.5% — indistinguishable |
+| Byte value, and the byte before it on the wire | 0x40 corrupts 15.8% in a header slot and 0/5184 in a payload slot; sweeping the predecessor over 0x00/0x01/0x03/0x0f/0x40/0xff changes nothing |
+| Position in the burst per se | The damage tracks the *read*, not the offset — see the table above |
+| Baud mismatch / sampling phase | Host baud swept 108k–122k: flat 12–30% across ±3%, so no phase minimum. Device sample points are within 1.5 clocks of centre by construction |
+| Long low runs on the line, DC/slew recovery | Corruption rate is flat as the predecessor's low run goes 9 → 4 bit times |
+| The `activity` LED's load step | Flat ~1.1% at every inter-burst idle from 0 ms to 200 ms, including idles shorter than the LED's 43.7 ms hold |
+| `reset_input_buffer()` (PurgeComm) perturbing the bridge | With it, without it, and with it 20 ms early: all ~1.1% |
+| Metastability, TX→RX crosstalk, timing closure | Previously ruled out; nothing since contradicts them |
 
-**Leading hypothesis.** The fault is logical and lives in `uart_interface.sv`, not in the UART
-primitives or the physical layer. `uart_echo.sv` pushes on `rx_byte` unconditionally every
-cycle; `uart_interface` consumes it **only** in `IDLE`, `RX_ADDR`, `RX_LEN`, `WR_RX`, `IMEM_RX`
-and silently drops it everywhere else. `SEND_STATUS` + `SEND_STATUS_WAIT` is a ~1050-clock
-blind window — a full byte time — sitting exactly where the host sends its next command. There
-is no recovery because `UART_RX_TIMEOUT = 0` (`tpu_top.sv:68`, `cmod_a7_top.sv:56`) compiles
-the mid-frame abort at `uart_interface.sv:346` out entirely. **This is why the echo image
-cannot reproduce it** — the echo has no blind states and no protocol to desync.
+**The simulation blind spot, now fixed in understanding.** `tb/uart_memory_cosim_tb.sv`'s
+`drive_byte` clocks every bit for exactly `CPB` clocks, so its host is bit-exact with the
+device and has *zero* baud error — a real 115200 host against a 12 MHz CPB=104 device runs at
+104.1667. That is why `make cosim` could never see this, and it is worth remembering before
+trusting a green co-simulation run about anything analogue or timing-related. Driving the same
+RTL at a fractional bit period (accumulator carrying the remainder across bits and bytes) is
+still clean, which is what exonerated the RTL.
 
-**Next experiments**, in value order: (1) `write_mem` with `len=1` in a loop vs `len=4096` —
-same byte count, wildly different turnaround-to-payload ratio, so failure rate scaling with
-*commands* vs *bytes* localises it; (2) set `UART_RX_TIMEOUT` non-zero (~`20 * UART_CPB`) —
-masks rather than fixes, but turns a NAK flood into one legible timeout; (3) add RX→TX
-turnaround to the echo image, which is the one traffic shape it never exercises.
+**Still worth doing.** `UART_RX_TIMEOUT = 0` is what turns one corrupted byte into a
+permanently wedged link: the FSM sits mid-frame forever and only a reflash clears it, which
+is why a single failure used to cascade into every later test in the suite. Setting it to
+`20 * UART_CPB` in `boards/*/board.tcl` makes a corrupted frame cost one legible timeout
+instead. That is hardening, not the fix — the fix is in the host — but the link should not
+depend on the host never glitching. Measured floor is one byte time; at `200` clocks (~2 bit
+times) the abort fires mid-frame during ordinary streaming and every command NAKs.
 
 See `docs/uart_selftest.md` for the echo self-test (`make echo`, `board=cmod_a7_echo`,
 `host/uart_echo.py`). **Reflash `board=cmod_a7` before running `test_uart_link.py` or
-`run_program.py`** — they time out against the echo bitstream.
+`run_program.py`** — they time out against the echo bitstream. Note that bitstreams under
+`synth/build/` are not rebuilt by `mode=program`; check their mtime against `rtl/` before
+concluding anything from a board run.
 
 ## Coding Practices
 

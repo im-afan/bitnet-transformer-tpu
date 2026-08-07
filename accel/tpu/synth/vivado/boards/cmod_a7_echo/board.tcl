@@ -42,9 +42,11 @@ set CLK_MHZ  12
 set BAUD     115200
 set UART_CPB [expr {int(round(double($CLK_MHZ) * 1.0e6 / $BAUD))}]   ;# 104
 
-# ---- Echo buffer --------------------------------------------------------------
-# Depth = 2**FIFO_AW. Sizing rationale is in rtl/uart_echo.sv.
-set FIFO_AW 8
+# ---- Echo block length --------------------------------------------------------
+# Bytes buffered per exchange: the device receives this many, then sends them
+# back. host/uart_echo.py's --block must match — nothing on the wire negotiates
+# it. See rtl/uart_echo.sv.
+set BLOCK_LEN 64
 
 # ---- Geometry placeholders ----------------------------------------------------
 # There is no TPU core in this image — no MXU, no scratchpad, no external SRAM.
@@ -63,8 +65,8 @@ set VPU_BYTES 0
 proc board_generics {} {
     uplevel #0 {
         set GENERICS [list \
-            UART_CPB $UART_CPB \
-            FIFO_AW  $FIFO_AW \
+            UART_CPB  $UART_CPB \
+            BLOCK_LEN $BLOCK_LEN \
         ]
     }
 }

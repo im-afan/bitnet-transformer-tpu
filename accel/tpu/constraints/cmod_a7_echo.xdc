@@ -12,6 +12,13 @@
 ## being evidence about the production image at all.
 ##
 ## Port names here must match boards/cmod_a7_echo/cmod_a7_echo_top.sv.
+##
+## Shared with boards/cmod_a7_bram, whose top level declares exactly the same six
+## ports (same names, same widths) and likewise has no external memory. Shared
+## rather than copied for the reason boards/cmod_a7_mem shares cmod_a7.xdc: two
+## debug images whose whole purpose is to be compared against each other must not
+## be able to drift apart in their pinout. Adding a port here breaks the other
+## board's build loudly, which is the intended failure mode.
 ## =============================================================================
 
 ## ---- 12 MHz system clock ----------------------------------------------------

@@ -21,11 +21,12 @@
 // common, and the whole point is to have as few of those as possible.
 //
 // LEDs:
-//   led[0]  ~1.4 Hz heartbeat normally; a fast blink if the echo FIFO ever
-//           overflowed (sticky, cleared by btn[0]). Proves the clock is running
-//           and the FPGA is configured, independently of the serial link.
+//   led[0]  ~1.4 Hz heartbeat normally; a fast blink if a byte ever arrived
+//           while the device was sending a block back (sticky, cleared by
+//           btn[0]). Proves the clock is running and the FPGA is configured,
+//           independently of the serial link.
 //   led[1]  lit for ~44 ms per received byte, so it is solid while a block is
-//           streaming and dark otherwise.
+//           streaming in and dark during the reply.
 // -----------------------------------------------------------------------------
 
 module cmod_a7_echo_top #(
@@ -34,8 +35,10 @@ module cmod_a7_echo_top #(
     // from CLK_MHZ so the two cannot drift.
     parameter int UART_CPB = 104,
 
-    // Echo buffer depth = 2**FIFO_AW. See the sizing note in rtl/uart_echo.sv.
-    parameter int FIFO_AW = 8,
+    // Bytes per exchange: the device buffers this many, then sends them back.
+    // The host (host/uart_echo.py --block) must use the same number — there is
+    // no framing on the wire to negotiate it with.
+    parameter int BLOCK_LEN = 64,
 
     // Power-on reset length, in core clocks (2**POR_W). 2**8 @ 12 MHz ~= 21 us.
     parameter int POR_W = 8
@@ -96,11 +99,11 @@ module cmod_a7_echo_top #(
     // =========================================================================
     // The echo core.
     // =========================================================================
-    logic blink_slow, blink_fast, activity, overflow;
+    logic blink_slow, blink_fast, activity, overrun;
 
     uart_echo #(
         .CLK_PER_BIT (UART_CPB),
-        .FIFO_AW     (FIFO_AW)
+        .BLOCK_LEN   (BLOCK_LEN)
     ) u_echo (
         .clk        (sysclk),
         .rst_n      (rst_n),
@@ -112,10 +115,10 @@ module cmod_a7_echo_top #(
         .blink_slow (blink_slow),
         .blink_fast (blink_fast),
         .activity   (activity),
-        .overflow   (overflow)
+        .overrun    (overrun)
     );
 
-    assign led[0] = overflow ? blink_fast : blink_slow;
+    assign led[0] = overrun ? blink_fast : blink_slow;
     assign led[1] = activity;
 
 endmodule

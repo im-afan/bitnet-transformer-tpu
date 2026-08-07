@@ -597,7 +597,8 @@ module tpu_top #(
         .run_start (uart_run_start),
         .run_pc    (uart_run_pc),
 
-        .host_busy ()   // informational; unused at top level
+        .host_busy  (),  // informational; unused at top level
+        .rx_overrun ()   // ditto — cmod_a7_mem is the image that surfaces it
     );
 
 endmodule

@@ -40,10 +40,17 @@ set RTL_SRCS [list \
 #                  removed. Child of boards/cmod_a7_mem's top level. Its own
 #                  children (uart_interface/receiver/transmitter, sram.sv) are
 #                  already in RTL_SRCS above and are shared, not copied.
+#   uart_bram.sv   the same core with the external memory removed as well:
+#                  bram_controller in place of sram_controller, everything else
+#                  identical. Child of boards/cmod_a7_bram's top level.
+#   bram.sv        bram_controller — on-chip block RAM behind sram_controller's
+#                  user-side handshake. Only uart_bram.sv instantiates it.
 set RTL_UNUSED [list \
     [file join $RTL_DIR requant.sv] \
     [file join $RTL_DIR uart_echo.sv] \
     [file join $RTL_DIR uart_memory.sv] \
+    [file join $RTL_DIR uart_bram.sv] \
+    [file join $RTL_DIR bram.sv] \
 ]
 
 foreach f [concat $RTL_SRCS $RTL_UNUSED] {

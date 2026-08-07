@@ -11,6 +11,16 @@ the SRAM work" from "the core computes the right answer".
     python accel/tpu/host/test_uart_link.py -p COM5 --length 16384 --slow
     python accel/tpu/host/test_uart_link.py -p COM5 --only sram_roundtrip
     python accel/tpu/host/test_uart_link.py --offline      # driver checks, no board
+    python accel/tpu/host/test_uart_link.py --sim          # against RTL, no board
+
+`--sim` puts an Icarus Verilog simulation of `rtl/uart_memory.sv` — the
+cmod_a7_mem bitstream's core — where the serial port would be, so every board
+test below runs against the real RTL with no hardware (see `sim_link.py`). It is
+roughly 10 000x slower than the wire, so it defaults to a shorter `--length` and
+only a few `--iters` of the soak tests; it also has no analogue signalling, no
+FTDI and no clock skew, so it can only find bugs that are in the RTL or in the
+host's idea of the protocol. That is most of the search space, and unlike the
+board it says exactly which clock cycle went wrong.
 
 The core one is `sram_roundtrip`: `W` a block of external SRAM, `R` it back, and
 compare byte for byte, once per data pattern. The rest widen that in the
@@ -32,6 +42,7 @@ Requires `pyserial` (except under `--offline`).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import random
 import sys
@@ -70,6 +81,9 @@ from tpu_uart import (                                        # noqa: E402
 DEFAULT_BASE = 0x0
 DEFAULT_LENGTH = 4096      # ~0.36 s each way at 115200 — long enough to matter
 DEFAULT_SEED = 20260802
+
+SIM_LENGTH = 128           # --sim: a frame or two of turnaround is the whole bug
+SIM_ITERS = 3              # --sim: the 1000-iteration soaks are a board thing
 
 
 # ---- Harness ----------------------------------------------------------------
@@ -147,8 +161,9 @@ def raw_exchange(tpu: TPUUart, frame: bytes, nbytes: int, timeout: float) -> byt
     payload bytes behind to be re-decoded as commands.
     """
     tpu.ser.reset_input_buffer()
-    tpu.ser.write(frame)
-    tpu.ser.flush()
+    # Via the driver's _send, not a bare write: reading while the frame is
+    # still going out corrupts the byte in flight (see TPUUart._send).
+    tpu._send(frame)
     saved, tpu.ser.timeout = tpu.ser.timeout, timeout
     try:
         reply = tpu.ser.read(nbytes)
@@ -266,7 +281,7 @@ def sram_write(tpu, cfg):
     """
     n = cfg.length
 
-    for i in range(1000):
+    for i in range(cfg.iters):
         # Distinct every iteration: stale data cannot look like a pass.
         data = bytes((addr_signature(cfg.base + j) ^ (i * 7 + 1)) & 0xFF
                      for j in range(n))
@@ -330,7 +345,7 @@ def sram_write_simple(tpu, cfg):
     n = cfg.length
     rng = random.Random(cfg.seed)
 
-    for i in range(1000):
+    for i in range(cfg.iters):
         # Fresh data every iteration, so a readback of stale buffered bytes
         # cannot be mistaken for a pass. The one guard worth keeping, because it
         # costs nothing and its absence makes a pass meaningless.
@@ -663,6 +678,13 @@ def run(tests: list[Test], tpu: TPUUart | None, cfg) -> int:
             print(f"   ok     ({time.monotonic() - t0:.2f}s)")
             continue
         if tpu is not None:
+            # Under --sim the exact clock cycle is recoverable, which is the
+            # whole reason for running there — print it while the failure is
+            # still on screen rather than making anyone dig through a VCD.
+            sim = getattr(tpu, "sim", None)
+            if sim is not None:
+                print(f"       {sim.summary()}")
+                sim.dump_fsm()
             # A failure can leave the device mid-frame or with reply bytes still
             # queued; drain before the next test so one failure doesn't cascade.
             tpu.resync()
@@ -680,8 +702,9 @@ def main(argv=None) -> int:
                     help="per-reply timeout in seconds (default: %(default)s)")
     ap.add_argument("--base", type=lambda s: int(s, 0), default=DEFAULT_BASE,
                     help="SRAM byte address the block tests use (default: 0x0)")
-    ap.add_argument("--length", type=lambda s: int(s, 0), default=DEFAULT_LENGTH,
-                    help="bytes per pattern (default: %(default)s)")
+    ap.add_argument("--length", type=lambda s: int(s, 0), default=None,
+                    help=f"bytes per pattern (default: {DEFAULT_LENGTH}, "
+                         f"or {SIM_LENGTH} under --sim)")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
                     help="seed for the random pattern (default: %(default)s)")
     ap.add_argument("--only", metavar="SUBSTR",
@@ -690,9 +713,33 @@ def main(argv=None) -> int:
                     help="also run the >64 KiB transfer test (~12 s)")
     ap.add_argument("--offline", action="store_true",
                     help="run only the tests that need no board")
+    ap.add_argument("--iters", type=int, default=None, metavar="N",
+                    help="iterations of the sram_write soak tests "
+                         "(default: 1000 on a board, 3 under --sim)")
     ap.add_argument("--trace", action="store_true",
                     help="use tracer")
+    sim = ap.add_argument_group("simulation (--sim)")
+    sim.add_argument("--sim", action="store_true",
+                     help="run against an Icarus simulation of rtl/uart_memory.sv "
+                          "instead of a board (see sim_link.py)")
+    sim.add_argument("--sim-fsm", action="store_true",
+                     help="log uart_interface's state machine and print the tail "
+                          "of it whenever a test fails")
+    sim.add_argument("--sim-vcd", metavar="FILE",
+                     help="dump waves to FILE (roughly triples the run time)")
+    sim.add_argument("--sim-keep", action="store_true",
+                     help="keep the bridge's stream files for inspection")
     cfg = ap.parse_args(argv)
+
+    if cfg.sim and cfg.offline:
+        raise SystemExit("--sim and --offline are mutually exclusive")
+    if cfg.iters is None:
+        cfg.iters = SIM_ITERS if cfg.sim else 1000
+    # The simulator moves about 10 000x slower than the wire, so the board
+    # default of 4096 B per pattern would take hours. Anything the link gets
+    # wrong, it gets wrong within a frame or two of a turnaround.
+    if cfg.length is None:
+        cfg.length = SIM_LENGTH if cfg.sim else DEFAULT_LENGTH
 
     if not 1 <= cfg.length <= MAX_LEN:
         raise SystemExit(f"--length must be 1..{MAX_LEN} (one frame per pattern)")
@@ -706,6 +753,34 @@ def main(argv=None) -> int:
     if cfg.offline:
         print(f"offline : {len(tests)} test(s) — {names}")
         failed = run(tests, None, cfg)
+    elif cfg.sim:
+        import sim_link                                          # noqa: PLC0415
+
+        work = os.path.join(HERE, "..", "tb", "cosim")
+        print(f"device  : Icarus simulation of rtl/uart_memory.sv "
+              f"(cmod_a7_mem, CPB 104, RX_TIMEOUT 0)")
+        print(f"region  : {cfg.length} B at {cfg.base:#07x} "
+              f"(SRAM is {MEM_LIMIT // 1024} KiB, behavioral chip model)")
+        print(f"tests   : {len(tests)} — {names}")
+        try:
+            vvp = sim_link.build(work)
+            ser = sim_link.SimSerial(
+                vvp, work, fsm_trace=cfg.sim_fsm, vcd=cfg.sim_vcd, verbose=True
+            )
+        except sim_link.SimLinkError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        try:
+            tpu = sim_link.SimTPUUart(ser, cfg.timeout, trace=cfg.trace)
+            require_idle(tpu)
+            failed = run(tests, tpu, cfg)
+            print(f"\n{ser.summary()}")
+        finally:
+            ser.close()
+            if not cfg.sim_keep:
+                for name in ("cosim_h2d.txt", "cosim_d2h.txt"):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(work, name))
     else:
         port = cfg.port or autodetect_port()
         print(f"port    : {port} @ {cfg.baud} baud 8N1"

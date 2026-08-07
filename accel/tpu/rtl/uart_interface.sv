@@ -28,6 +28,10 @@
 // tpu_top); this block consumes decoded bytes (data_in/receiver_valid), emits
 // bytes (transmitter_start/data_out/transmitter_busy), and drives the SRAM
 // user-side port, the IMEM write port, and the run trigger.
+//
+// Received bytes land in a one-byte holding register (docs/uart_host.md §5:
+// "a single holding byte in each direction suffices"), captured unconditionally
+// in every state. See the comment on `rx_hold` for why that is not optional.
 module uart_interface #(
     parameter integer ADDR_W     = 19,   // external SRAM byte-address width
     parameter integer LENGTH_W   = 16,   // transfer length field width
@@ -68,7 +72,13 @@ module uart_interface #(
     output logic [IMEM_AW-1:0] run_pc,
 
     // high while a command is in progress (informational / debug)
-    output logic host_busy
+    output logic host_busy,
+
+    // sticky: a byte arrived while the holding register was still full, i.e.
+    // the FSM could not keep up with the host. Cleared only by reset. On a link
+    // where the host waits for every reply this must never set, so if it does it
+    // is a finding and not a capacity problem — see `rx_hold` below.
+    output logic rx_overrun
 );
     localparam integer ADDR_BYTES   = (ADDR_W + 7) / 8;     // 3
     localparam integer LENGTH_BYTES = (LENGTH_W + 7) / 8;   // 2
@@ -113,8 +123,41 @@ module uart_interface #(
     // work off their edges: a rising valid = one new byte, a falling busy = one
     // completed transmit frame.
     logic receiver_valid_prev, transmitter_busy_prev;
-    wire  rx_byte = receiver_valid & ~receiver_valid_prev;
-    wire  tx_done = transmitter_busy_prev & ~transmitter_busy;
+    wire  rx_strobe = receiver_valid & ~receiver_valid_prev;
+    wire  tx_done   = transmitter_busy_prev & ~transmitter_busy;
+
+    // ---- one-byte receive holding register ----------------------------------
+    //
+    // `rx_strobe` is a single clock wide. Consuming it directly inside the state
+    // case — which is what this FSM used to do — makes every state that is not
+    // IDLE / RX_ADDR / RX_LEN / WR_RX / IMEM_RX a window in which an arriving
+    // byte is destroyed with no error, no retry and no trace.
+    //
+    // The windows are not theoretical:
+    //
+    //   SEND_STATUS + SEND_STATUS_WAIT   ~10*CLK_PER_BIT clocks — a full byte
+    //       time, sitting exactly at the command turnaround. The device starts
+    //       the ACK about one bit *before* the host has finished the last
+    //       payload byte's stop bit, so this window opens straight into where
+    //       the host's next command byte goes.
+    //   WR_ISSUE + WR_WAIT               a few clocks between every pair of
+    //       payload bytes, inside a streaming write.
+    //   VALIDATE, IMEM_WR                one clock each.
+    //   RD_ISSUE .. RD_TX_WAIT           the whole read reply.
+    //
+    // One dropped byte is not one bad command: the FSM re-enters IDLE one byte
+    // out of phase and every subsequent payload byte decodes as an unknown
+    // command and draws a NAK (IDLE's `default` branch below), so the host sees
+    // a flood of bytes it never asked for. With RX_TIMEOUT = 0 — what both board
+    // targets build (synth/vivado/boards/*/board.tcl) — the mid-frame abort is
+    // compiled out and nothing ever recovers.
+    //
+    // So the capture below runs every cycle in every state, ahead of the FSM,
+    // and the FSM reads the register instead of the wire. That is the "single
+    // holding byte in each direction" docs/uart_host.md §5 specifies and the
+    // implementation never had.
+    logic [7:0] rx_hold;
+    logic       rx_pending;   // rx_hold holds a byte the FSM has not taken yet
 
     logic [ADDR_BITS-1:0] addr;    // assembled base address / index (24-bit)
     logic [LEN_BITS-1:0]  len;     // byte count (16-bit)
@@ -143,6 +186,11 @@ module uart_interface #(
 
     // GO ('G'): the boot PC must be a valid instruction address.
     wire go_frame_ok = (addr[ADDR_BITS-1:IMEM_AW] == '0);
+
+    // states that take a byte off the holding register this cycle
+    wire rx_ready   = (state == IDLE)  | (state == RX_ADDR) | (state == RX_LEN) |
+                      (state == WR_RX) | (state == IMEM_RX);
+    wire rx_consume = rx_pending & rx_ready;
 
     // mid-frame states where we are stalled waiting on the host for the next byte
     wire rx_waiting = (state == RX_ADDR) | (state == RX_LEN) |
@@ -176,6 +224,9 @@ module uart_interface #(
             status_byte           <= 8'b0;
             word                  <= 32'b0;
             to_cnt                <= 32'b0;
+            rx_hold               <= 8'b0;
+            rx_pending            <= 1'b0;
+            rx_overrun            <= 1'b0;
         end else begin
             receiver_valid_prev   <= receiver_valid;
             transmitter_busy_prev <= transmitter_busy;
@@ -192,8 +243,8 @@ module uart_interface #(
                     cnt  <= 8'b0;
                     addr <= '0;
                     len  <= '0;
-                    if (rx_byte) begin
-                        case (data_in)
+                    if (rx_consume) begin
+                        case (rx_hold)
                             CMD_READ:  begin op <= OP_RD;   state <= RX_ADDR; end
                             CMD_WRITE: begin op <= OP_WR;   state <= RX_ADDR; end
                             CMD_IMEM:  begin op <= OP_IMEM; state <= RX_ADDR; end
@@ -204,8 +255,8 @@ module uart_interface #(
                 end
 
                 RX_ADDR: begin
-                    if (rx_byte) begin
-                        addr <= {addr[ADDR_BITS-9:0], data_in};   // shift in, MSB first
+                    if (rx_consume) begin
+                        addr <= {addr[ADDR_BITS-9:0], rx_hold};   // shift in, MSB first
                         cnt  <= cnt + 8'd1;
                         if (cnt == ADDR_BYTES - 1) begin
                             cnt   <= 8'b0;
@@ -216,8 +267,8 @@ module uart_interface #(
                 end
 
                 RX_LEN: begin
-                    if (rx_byte) begin
-                        len <= {len[LEN_BITS-9:0], data_in};
+                    if (rx_consume) begin
+                        len <= {len[LEN_BITS-9:0], rx_hold};
                         cnt <= cnt + 8'd1;
                         if (cnt == LENGTH_BYTES - 1) begin
                             cnt   <= 8'b0;
@@ -280,8 +331,8 @@ module uart_interface #(
 
                 // ---------- write SRAM ----------
                 WR_RX: begin
-                    if (rx_byte) begin
-                        wr_byte <= data_in;
+                    if (rx_consume) begin
+                        wr_byte <= rx_hold;
                         state   <= WR_ISSUE;
                     end
                 end
@@ -304,8 +355,8 @@ module uart_interface #(
 
                 // ---------- write instruction memory ----------
                 IMEM_RX: begin
-                    if (rx_byte) begin
-                        word <= {word[23:0], data_in};   // assemble word, MSB first
+                    if (rx_consume) begin
+                        word <= {word[23:0], rx_hold};   // assemble word, MSB first
                         cnt  <= cnt + 8'd1;
                         if (cnt == 8'd3) begin
                             cnt   <= 8'b0;
@@ -339,13 +390,35 @@ module uart_interface #(
                 default: state <= IDLE;
             endcase
 
+            // ---- receive capture --------------------------------------------
+            // Runs in every state, and after the case so that a byte arriving on
+            // the same cycle the FSM takes the previous one still lands: the
+            // `rx_strobe` branch overrides the `rx_consume` clear. That pair of
+            // events is the normal steady state of a streaming write, not a
+            // corner case.
+            if (rx_consume) rx_pending <= 1'b0;
+            if (rx_strobe) begin
+                if (rx_pending & ~rx_consume) begin
+                    // Genuinely out of room. Keep the older byte so the stream
+                    // stays in order and lose the new one, but say so: on this
+                    // link the host waits for every reply, so an overrun means
+                    // either the host got ahead of the protocol or the FSM is
+                    // already desynced. Sticky — a one-clock event forty minutes
+                    // into a soak is not something anyone is watching for.
+                    rx_overrun <= 1'b1;
+                end else begin
+                    rx_hold    <= data_in;
+                    rx_pending <= 1'b1;
+                end
+            end
+
             // Inter-byte timeout: if we sit mid-frame waiting on the host for
             // longer than RX_TIMEOUT clocks, abort silently back to IDLE so a
             // stalled/aborted frame can't wedge the link (docs/uart_host.md §7).
             // This runs after the case, so an abort overrides the state above.
             if (RX_TIMEOUT != 0) begin
                 if (rx_waiting) begin
-                    if (rx_byte)                     to_cnt <= 32'b0;
+                    if (rx_strobe)                   to_cnt <= 32'b0;
                     else if (to_cnt + 1 >= RX_TIMEOUT) begin
                         to_cnt <= 32'b0;
                         state  <= IDLE;
