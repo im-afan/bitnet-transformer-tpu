@@ -1,4 +1,4 @@
-# transformer_impl
+# Bitnet Transformer TPU 
 
 A small transformer (a digit-addition sequence model) plus custom hardware accelerators for
 its core attention/matmul ops.
