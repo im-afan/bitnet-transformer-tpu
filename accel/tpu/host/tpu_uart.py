@@ -1,7 +1,8 @@
 """Host-side driver for the TPU's UART command link (``rtl/uart_interface.sv``).
 
 The FPGA is a pure slave: the host sends a fixed-header command frame and the
-device answers. Four commands, all with a 3-byte big-endian address field:
+device answers. Five commands, four of them with a 3-byte big-endian address
+field:
 
 ===== ====== ============= ========================== =====================
 CMD   byte   frame                                    reply
@@ -12,6 +13,7 @@ CMD   byte   frame                                    reply
 ``I`` 0x49   write IMEM    ``CMD A2 A1 A0 L1 L0`` +    ACK / NAK
                            ``data[len]``
 ``G`` 0x47   go / run      ``CMD A2 A1 A0``            ACK / NAK
+``T`` 0x54   read timer    ``CMD``                     4 counter bytes
 ===== ====== ============= ========================== =====================
 
 * ``R``/``W`` addresses are 19-bit external-SRAM byte addresses; ``len`` is a
@@ -20,6 +22,9 @@ CMD   byte   frame                                    reply
   **bytes** and must be a multiple of 4. Each word is sent MSB first.
 * ``G`` carries no length and no payload — it pulses the scalar unit's run
   trigger with ``run_pc = addr``.
+* ``T`` is a single byte and cannot fail: it returns the scalar unit's
+  run-length counter (``rtl/cycle_timer.sv``) as 4 bytes MSB first — the core
+  clocks the last run took, or how far the current one has got.
 * Read replies are header-less: the host already knows ``len`` and simply reads
   that many bytes. A *rejected* read answers with a lone NAK instead.
 
@@ -35,8 +40,11 @@ error raised) rather than a routine error.
 
 **The core has priority.** Any command arriving while the scalar unit is running
 is NAK'd and touches nothing, so preload/readback only works while the core is
-idle. There is no status-read command, so the host cannot poll ``busy``/``done``
-over this link — after :meth:`TPUUart.go` you wait out-of-band (see README).
+idle. ``T`` is the exception — it reads a counter and contends over nothing, so
+it is answered at any time. There is still no ``busy``/``done`` status command:
+:meth:`TPUUart.read_timer` tells you how long the core has been running, not
+whether it has stopped (the count also sits still if the run never started), so
+completion is inferred as before, from a command that stops being NAK'd.
 
 Both failure modes are byte-level, so the driver can log every byte it moves
 (see :class:`UartTrace`)::
@@ -70,6 +78,9 @@ CMD_READ = 0x52   # 'R'
 CMD_WRITE = 0x57  # 'W'
 CMD_IMEM = 0x49   # 'I'
 CMD_GO = 0x47     # 'G'
+CMD_TIMER = 0x54  # 'T'
+
+TIMER_BYTES = 4   # width of the 'T' reply (device counter is 32-bit)
 
 STAT_ACK = 0x06
 STAT_NAK = 0x15
@@ -692,6 +703,28 @@ class TPUUart:
             self._send(_header(CMD_GO, pc))
             self._status()
 
+    def read_timer(self) -> int:
+        """``T`` — the scalar unit's run-length counter, in core clocks.
+
+        Counts the interval the core was ``busy``: reset at the start of each
+        run ('G' → the first instruction fetch) and frozen when the program
+        halts, so after a run this is exactly how long that run took, and during
+        one it is how far it has got. Answered whether or not the core is
+        running — the one command that is.
+
+        The frame is the single command byte; the reply is 4 bytes MSB first and
+        no status, so unlike every other command there is nothing to validate,
+        nothing to reject, and no NAK to disambiguate from data.
+
+        Divide by the device's clock frequency for seconds (12 MHz on the Cmod
+        A7). ``0xFFFFFFFF`` is the counter saturating rather than wrapping —
+        358 s at 12 MHz, so treat it as "no plausible run is this long".
+        """
+        with self.trace.context("read_timer"):
+            self.ser.reset_input_buffer()
+            self._send(bytes([CMD_TIMER]))
+            return int.from_bytes(self._recv(TIMER_BYTES), "big")
+
 
 # ---- Program file parsing ---------------------------------------------------
 
@@ -762,6 +795,11 @@ def _build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("go", help="start the scalar unit ('G')")
     g.add_argument("pc", type=_auto_int, nargs="?", default=0)
 
+    tm = sub.add_parser("timer", help="read the run-length counter ('T')")
+    tm.add_argument("--clk-mhz", type=float, default=12.0,
+                    help="device clock, to print the count in seconds too "
+                         "(default: %(default)s, the Cmod A7)")
+
     return p
 
 
@@ -811,6 +849,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.cmd == "go":
                 tpu.go(args.pc)
                 print(f"started at pc={args.pc} (ACK)")
+
+            elif args.cmd == "timer":
+                cycles = tpu.read_timer()
+                us = cycles / args.clk_mhz
+                print(f"{cycles} clocks ({us:.1f} us @ {args.clk_mhz:g} MHz)"
+                      + ("  [SATURATED]" if cycles == 0xFFFFFFFF else ""))
 
     except (ProtocolError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

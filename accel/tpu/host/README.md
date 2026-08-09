@@ -28,11 +28,23 @@ separate bitstream that contains nothing but the UART blocks. See
 | `W` 0x57  | `write_mem(addr, data)`   | `CMD A2 A1 A0 L1 L0` + `data[len]`     | ACK / NAK        |
 | `I` 0x49  | `load_program(waddr, ws)` | `CMD A2 A1 A0 L1 L0` + `data[len]`     | ACK / NAK        |
 | `G` 0x47  | `go(pc)`                  | `CMD A2 A1 A0`                         | ACK / NAK        |
+| `T` 0x54  | `read_timer()`            | `CMD`                                  | 4 counter bytes  |
 
 Address is 3 bytes big-endian, length 2 bytes big-endian **in bytes**. `R`/`W`
 address 19-bit SRAM bytes; `I` addresses 10-bit instruction *word* indices and
 its length must be a multiple of 4 (words packed MSB first); `G` has no length
 or payload and pulses the scalar unit's run trigger with `run_pc = addr`.
+
+`T` is one byte and cannot fail. It returns the scalar unit's run-length counter
+(`rtl/cycle_timer.sv`) as 4 bytes MSB first: core clocks the last run took, or
+how far the current one has got, measured on the FPGA between `busy` going high
+and going low. Divide by the device clock (12 MHz on the Cmod A7) for seconds.
+It is the **only** command answered while the core is running — see
+[Two things to know](#two-things-to-know) — because it touches no memory. A
+count that keeps rising means the core is still working; a count that has
+stopped does *not* by itself mean the run finished (it also never moves if the
+run never started), so completion is still inferred from a command that stops
+being NAK'd.
 
 Transfers longer than the 16-bit length field are split into back-to-back
 commands automatically.
@@ -62,6 +74,7 @@ python accel/tpu/host/tpu_uart.py -p /dev/ttyUSB0 read  0x1000 64        # hex d
 python accel/tpu/host/tpu_uart.py -p /dev/ttyUSB0 read  0x1000 64 -o out.bin
 python accel/tpu/host/tpu_uart.py -p /dev/ttyUSB0 load ../tb/vectors/tpu_prog.hex --go
 python accel/tpu/host/tpu_uart.py -p /dev/ttyUSB0 go 0
+python accel/tpu/host/tpu_uart.py -p /dev/ttyUSB0 timer      # clocks of the last run
 ```
 
 `load` takes the `$readmemh`-style program format used by `tb/vectors/` — one
@@ -119,6 +132,7 @@ python accel/tpu/host/run_program.py -p COM5                 # tiled_matmul.tpu
 python accel/tpu/host/run_program.py -p COM5 --verify-inputs # read the tensors back too
 python accel/tpu/host/run_program.py --program ../../tpulang/examples/relu_layer.tpu -p COM5
 python accel/tpu/host/run_program.py --dry-run               # toolchain only, no board
+python accel/tpu/host/run_program.py -p COM5 --no-torch      # skip the PyTorch check
 ```
 
 1. assemble the `.tpu` source (`tpulang/assembler.py`);
@@ -126,13 +140,57 @@ python accel/tpu/host/run_program.py --dry-run               # toolchain only, n
    builders `tpulang/gen_vectors.py` uses for the testbench vectors — host and
    simulation cannot drift on layout;
 3. `I` the program into IMEM, `W` the tensors into DRAM, `G` at PC 0;
-4. wait for the core to go idle, `R` the outputs back, compare to the golden
-   image (and, for the tiled matmul, print the [8x32] @ [32x16] result matrix).
+4. wait for the core to go idle, `T` how many core clocks the run took, `R` the
+   outputs back, compare to the golden image (and, for the tiled matmul, print
+   the [8x32] @ [32x16] result matrix);
+5. compare the same bytes against an independent **PyTorch reference** —
+   [Checking the kernel](#checking-the-kernel-against-pytorch) below.
 
 Defaults to `tpulang/examples/tiled_matmul.tpu`; any example works, since the
 image builder is chosen from the program's own `.equ` constants exactly as
 `gen_vectors.py` chooses it. It needs the toolchain on disk (it imports
 `assembler` / `iss` / `gen_vectors` by path), unlike `tpu_uart.py` itself.
+
+### Checking the kernel against PyTorch
+
+Step 4's golden image comes out of `iss.py`, so on its own it only proves the
+FPGA agrees with the simulator the rest of the toolchain is built on — if the
+kernel and the ISS are wrong the same way, it still passes.
+[`tpulang/torch_ref.py`](../../tpulang/torch_ref.py) is the second, independent
+opinion: it decodes tensors out of the bytes actually written to and read back
+from the board, recomputes the kernel in plain PyTorch, and compares element by
+element. It never calls the ISS, and it takes the DRAM layout from the program's
+own `.equ` symbol table rather than restating it.
+
+The comparison is **exact** — these kernels are integer end to end (int8
+operands, int32 accumulate, fixed-point requant), so there is no tolerance to
+allow. Output looks like:
+
+```
+torch   : tiled_matmul vs PyTorch, over the device output
+  [OK  ] C = requant(A @ W)  [8x32] @ [32x16]  int8  (8, 16)  0/128 differ, max|diff| = 0
+PASSED: the device output matches the PyTorch reference
+```
+
+| Program            | Reference                                                  |
+| ------------------ | ---------------------------------------------------------- |
+| `relu_layer.tpu`   | `Y = requant(A @ W)` int8, `Z = relu(Y)` int32             |
+| `vector_add.tpu`   | `C = A + B`, int8 operands widened to int32                |
+| `tiled_matmul.tpu` | `C = requant(A @ W)`, tiles reassembled into one `[M,K]@[K,N]` |
+| `vpu_matmul.tpu`   | `S32 = Q @ K^T` int32, `S8 = requant(S32)` int8 — attention scores |
+| `softmax_row.tpu`  | none — see the note in `torch_ref.UNSUPPORTED`             |
+
+A program with no reference, or a host without `torch`, prints a `skipped` line
+and leaves the golden-image verdict standing. `--no-torch` turns the stage off.
+
+The same references run without a board, against the ISS instead of the device —
+useful to confirm the reference itself before spending a board run:
+
+```bash
+python accel/tpulang/torch_ref.py                          # every example with a reference
+python accel/tpulang/torch_ref.py -p examples/relu_layer.tpu
+python accel/tpu/host/run_program.py --dry-run             # same check, via the runner
+```
 
 **How it waits for the run.** There is no status command, but there is the
 arbitration rule below: while the core runs, everything is NAK'd. So the runner
@@ -167,6 +225,7 @@ python accel/tpu/host/test_uart_link.py --offline            # driver checks, no
 | `sram_short_frames`        | off-by-one in the FSM's `idx + 1 == len` termination        |
 | `link_rejects_bad_command` | unknown command byte → NAK, and the FSM returns to IDLE     |
 | `link_rejects_out_of_range`| the device's VALIDATE rules, with the host's check bypassed |
+| `link_timer_command`       | `T` replies with 4 bytes, holds still while the core is idle |
 | `sram_long_transfer`       | (`--slow`) the driver's >64 KiB frame splitting             |
 | `host_validation`          | (offline) host frame rules still a superset of the RTL's    |
 | `frame_encoding`           | (offline) header/word endianness — no readback can catch it |
@@ -244,9 +303,12 @@ not as a routine rejection.
 
 **The core has priority.** Any command arriving while the scalar unit is running
 is NAK'd and touches nothing, so preload and readback only work while the core is
-idle. There is no status-read command, so `go()` returns once the launch is
-ACK'd and this link cannot poll `busy`/`done` — wait out-of-band (a known
-run time, or an LED/pin) before reading results back.
+idle. `T` is the one exception: it reads a counter, contends over nothing, and is
+answered mid-run. There is still no `busy`/`done` status command, so `go()`
+returns once the launch is ACK'd and completion is inferred out-of-band (a known
+run time, an LED/pin, or a command that stops being NAK'd) before reading results
+back. `read_timer()` tells you how long the core has been running, not whether it
+stopped.
 
 ## Not covered
 

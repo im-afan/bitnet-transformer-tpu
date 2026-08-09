@@ -1,0 +1,71 @@
+; @primitive add_i8
+; @clobbers r1-r13, cfg vlen/len
+;
+; C[N] int8 = requant(A[N] int8 + B[N] int8)
+;
+; `vecadd` widens int8 + int8 -> int32 (that widening is the point — a residual
+; sum overflows int8 routinely), so the requant back to int8 is not decoration,
+; it is what makes the result consumable by the next VPU op. With A and B in the
+; same scale the {m0,n} word is the identity {1,0} and the requant is a plain
+; int8 clip.
+;
+; Two jobs in the transformer layer, and they are the same op:
+;   * the two **residual adds**;
+;   * the **causal attention mask** — a mask is an int8 tensor of 0 and -128, and
+;     adding -128 drives an entry to the clip floor, which in the exp table's
+;     1/16 input scale is x = -8, where the table stores 0. So masking is data,
+;     not an instruction.
+;
+; @param A      DRAM address of A[N], int8
+; @param B      DRAM address of B[N], int8
+; @param C      DRAM address of C[N], int8 (output; may alias A or B)
+; @param RQW    address of the requant {m0,n} word (DRAM == scratchpad)
+; @param TMP    scratchpad int32 buffer, CHUNK*4 bytes
+; @param N      elements
+; @param CHUNK  elements per pass (<= 1023, divides N)
+
+.equ $NCHUNK {{N}} // {{CHUNK}}
+
+.reg $a     r1
+.reg $b     r2
+.reg $c     r3
+.reg $rqw   r4
+.reg $tmp   r5
+.reg $nch   r6
+.reg $one   r7
+.reg $ch    r8
+.reg $i     r9
+.reg $off   r10
+.reg $ao    r11
+.reg $bo    r12
+.reg $co    r13
+
+    li      $a,   {{A}}
+    li      $b,   {{B}}
+    li      $c,   {{C}}
+    li      $rqw, {{RQW}}
+    setcfg  len, 4
+    rdmem   $rqw, $rqw
+
+    li      $tmp, {{TMP}}
+    setcfg  vlen, {{CHUNK}}
+    li      $nch, $NCHUNK
+    li      $one, 1
+    li      $ch,  {{CHUNK}}
+    li      $i, 0
+$loop:
+    cmps    $i, $nch
+    bge     $done
+    muls    $off, $i, $ch
+    adds    $ao, $off, $a
+    adds    $bo, $off, $b
+    adds    $co, $off, $c
+    setcfg  len, {{CHUNK}}
+    rdmem   $ao, $ao
+    rdmem   $bo, $bo
+    vecadd  $tmp, $ao, $bo         ; int8 + int8 -> int32
+    requant $co, $tmp, $rqw        ; int32 -> int8
+    wrmem   $co, $co
+    adds    $i, $i, $one
+    jmp     $loop
+$done:

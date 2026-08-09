@@ -1,0 +1,64 @@
+; @primitive gelu_block
+; @clobbers r1-r11, cfg vlen/len
+;
+; dst[N] int8 = requant(gelu_lut[src[N] int8])
+;
+; **The input must already be in the LUT's 1/16 input scale.** `gelu` is a
+; 256-entry int8 ROM indexed by the raw operand byte (vpu.sv), so the table *is*
+; the numerics and the input scale is assumed, never checked — feed it something
+; else and it quietly evaluates gelu of the wrong number (luts.py).
+;
+; This primitive therefore does *not* rescale on the way in. Instead the composer
+; makes the producing matmul's requant land its output directly in 1/16, which
+; costs nothing: that requant had to happen anyway. On the way out, the table is
+; scale-preserving (in_scale == out_scale == 1/16, and saturation is unreachable
+; since |gelu(x)| <= |x|), so the exit requant only has to reach the consumer's
+; scale.
+;
+; @param SRC    DRAM address of src[N], int8, **at scale 1/16**
+; @param DST    DRAM address of dst[N], int8
+; @param RQW    address of the exit requant {m0,n} word (DRAM == scratchpad)
+; @param TMP    scratchpad int32 buffer, CHUNK*4 bytes
+; @param N      elements
+; @param CHUNK  elements per pass (<= 1023, divides N)
+
+.equ $NCHUNK {{N}} // {{CHUNK}}
+
+.reg $src   r1
+.reg $dst   r2
+.reg $rqw   r3
+.reg $tmp   r4
+.reg $nch   r5
+.reg $one   r6
+.reg $ch    r7
+.reg $i     r8
+.reg $off   r9
+.reg $so    r10
+.reg $do    r11
+
+    li      $src, {{SRC}}
+    li      $dst, {{DST}}
+    li      $rqw, {{RQW}}
+    setcfg  len, 4
+    rdmem   $rqw, $rqw
+
+    li      $tmp, {{TMP}}
+    setcfg  vlen, {{CHUNK}}
+    li      $nch, $NCHUNK
+    li      $one, 1
+    li      $ch,  {{CHUNK}}
+    li      $i, 0
+$loop:
+    cmps    $i, $nch
+    bge     $done
+    muls    $off, $i, $ch
+    adds    $so, $off, $src
+    adds    $do, $off, $dst
+    setcfg  len, {{CHUNK}}
+    rdmem   $so, $so
+    gelu    $tmp, $so              ; int8 index -> int32 table value
+    requant $do, $tmp, $rqw
+    wrmem   $do, $do
+    adds    $i, $i, $one
+    jmp     $loop
+$done:

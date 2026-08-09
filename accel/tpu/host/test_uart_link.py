@@ -26,7 +26,8 @@ The core one is `sram_roundtrip`: `W` a block of external SRAM, `R` it back, and
 compare byte for byte, once per data pattern. The rest widen that in the
 directions a fresh board actually fails in — address lines (`sram_address_bus`),
 frame boundaries (`sram_short_frames`), one command corrupting another's data
-(`sram_isolation`), and the reject paths (`link_rejects_*`).
+(`sram_isolation`), the reject paths (`link_rejects_*`), and the one command with
+no address, length or status at all (`link_timer_command`).
 
 **These tests overwrite SRAM**, including the region `run_program.py` preloads
 tensors into — that's fine (it rewrites them every run), but nothing on the board
@@ -56,6 +57,7 @@ if HERE not in sys.path:
 
 from tpu_uart import (                                        # noqa: E402
     CMD_READ,
+    CMD_TIMER,
     IMEM_LIMIT,
     MAX_LEN,
     MEM_ADDR_W,
@@ -500,6 +502,40 @@ def link_rejects_out_of_range(tpu, cfg):
             )
     link_alive(tpu, cfg.base)
     print("     3 invalid frames NAK'd with no data phase; link still usable")
+
+
+@board_test("link_timer_command")
+def link_timer_command(tpu, cfg):
+    """'T' answers with 4 bytes, holds still while the core is idle, and does not
+    disturb the link.
+
+    Deliberately makes no claim about the *value*: this suite runs against the
+    bring-up images too (`cmod_a7_mem`, `cmod_a7_bram`), which have no scalar
+    unit and tie the counter to 0, and even on `cmod_a7` the count is whatever
+    the last run left — 0 on a freshly configured board. What is image-
+    independent is the framing: exactly four bytes come back, with no status
+    byte and no NAK, and the FSM is in IDLE afterwards.
+
+    The second read is the one worth having. 'T' is the only command not gated
+    on `core_busy`, so it is also the only one whose reply can move under the
+    host; with the core idle the counter is frozen by definition, so two reads
+    that disagree mean the counter is free-running rather than gated on `busy`.
+    """
+    first = raw_exchange(tpu, bytes([CMD_TIMER]), 4, 0.5)
+    if len(first) != 4:
+        raise Failure(
+            f"'T' answered {first.hex(' ') or '<nothing>'} "
+            f"({len(first)} byte(s)), expected 4"
+        )
+    second = raw_exchange(tpu, bytes([CMD_TIMER]), 4, 0.5)
+    if second != first:
+        raise Failure(
+            f"'T' moved with the core idle: {first.hex(' ')} then "
+            f"{second.hex(' ')} — the counter is not gated on `busy`"
+        )
+    link_alive(tpu, cfg.base)
+    print(f"     'T' = {int.from_bytes(first, 'big')} clocks, stable, "
+          f"link still usable")
 
 
 @board_test("sram_long_transfer", slow=True)

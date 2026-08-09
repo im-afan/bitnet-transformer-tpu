@@ -1,0 +1,130 @@
+; @primitive softmax_rows
+; @clobbers r1-r21, cfg vlen/len
+;
+; P[R,L] int8 (scale 1/128) = softmax(S[R,L] int8, rows)
+;
+; The ISA has no softmax instruction; the scalar unit decomposes it into VPU
+; primitives. This is that sequence made **type-correct**, which is the part
+; examples/softmax_row.tpu gets wrong (see torch_ref.UNSUPPORTED) — VPU ops read
+; int8 and write int32, so every `requant` below exists because the *next* op
+; reads int8. None of them is decoration.
+;
+;     redmax  m       <- row              int32 scalar, into the scratchpad
+;     loads/subs/stores                   -m, staged back as a broadcast scalar
+;     sadd    sh32    <- row, -m          int32:  x_i - max  (<= 0)
+;     requant sh8     <- sh32   {1,0}     int8; the clip floor -128 is x = -8
+;     exp     e32     <- sh8              int32 in the table's 1/127 out_scale
+;     requant e8      <- e32    {1,0}     int8
+;     redsum  D       <- e8               int32 scalar
+;     sdiv    p32     <- e8, D            int32 Q15: round(e_i * 2^15 / D)
+;     requant P       <- p32    {1,8}     int8: >>8 puts probabilities on 1/128
+;
+; **Preconditions**, both the composer's job (getting into a table's input scale
+; is always the compiler's job, never the hardware's — luts.py):
+;   * SRC is already in the exp table's **1/16** input scale, and
+;   * SRC is already masked (add_i8 with an int8 mask of 0 / -128).
+;
+; The max-subtract is what makes the table's negative half the only half that is
+; reached: exp's positive indices all saturate at 127 and a program that reaches
+; them has forgotten the subtract. Here row_max maps to exactly 0, where the
+; table stores +127, so D >= 127 > 0 and the divide can never see a zero.
+;
+; The two {m0,n} words are compile-time constants, so they are built in-program
+; with `li`/`stores` rather than shipped in DRAM.
+;
+; @param SRC   DRAM address of S[R,L], int8, at scale 1/16, masked
+; @param DST   DRAM address of P[R,L], int8, at scale 1/128
+; @param R     rows
+; @param L     row length (= cfg vlen)
+; @param MAXA  scratchpad int32 word: the row max
+; @param NEGA  scratchpad int32 word: -max, the broadcast scalar
+; @param SH32  scratchpad int32 buffer, L*4 bytes
+; @param SH8   scratchpad int8  buffer, L bytes
+; @param E32   scratchpad int32 buffer, L*4 bytes
+; @param E8    scratchpad int8  buffer, L bytes
+; @param DEN   scratchpad int32 word: the denominator
+; @param P32   scratchpad int32 buffer, L*4 bytes
+; @param RQ1   scratchpad int32 word: holds {m0=1, n=0}, built below
+; @param RQ2   scratchpad int32 word: holds {m0=1, n=8}, built below
+
+.equ $BYTES {{R}} * {{L}}
+.equ $M0_W  12                  ; requant word layout: m0 low, n above (isa.md)
+
+.reg $src    r1
+.reg $dst    r2
+.reg $maxa   r3
+.reg $nega   r4
+.reg $sh32   r5
+.reg $sh8    r6
+.reg $e32    r7
+.reg $e8     r8
+.reg $den    r9
+.reg $p32    r10
+.reg $rq1    r11
+.reg $rq2    r12
+.reg $rows   r13
+.reg $ll     r14
+.reg $one    r15
+.reg $r      r16
+.reg $rowsrc r17
+.reg $rowdst r18
+.reg $t      r19
+.reg $u      r20
+.reg $v      r21
+
+    ; ---- build the two constant requant words in the scratchpad ----
+    li      $one, 1
+    li      $rq1, {{RQ1}}
+    stores  $rq1, $one              ; {m0 = 1, n = 0} — a plain int8 clip
+    li      $rq2, {{RQ2}}
+    li      $u, 1 << $M0_W          ; = 4096, the n field's weight
+    li      $v, 8
+    muls    $v, $v, $u
+    adds    $v, $v, $one
+    stores  $rq2, $v                ; {m0 = 1, n = 8} — Q15 -> scale 1/128
+
+    ; ---- stage the whole score block: DRAM -> scratchpad ----
+    li      $src, {{SRC}}
+    li      $dst, {{DST}}
+    setcfg  len, $BYTES
+    rdmem   $src, $src
+
+    li      $maxa, {{MAXA}}
+    li      $nega, {{NEGA}}
+    li      $sh32, {{SH32}}
+    li      $sh8,  {{SH8}}
+    li      $e32,  {{E32}}
+    li      $e8,   {{E8}}
+    li      $den,  {{DEN}}
+    li      $p32,  {{P32}}
+    li      $rows, {{R}}
+    li      $ll,   {{L}}
+
+    setcfg  vlen, {{L}}             ; every op below walks one row
+    li      $r, 0
+$rloop:
+    cmps    $r, $rows
+    bge     $rdone
+    muls    $rowsrc, $r, $ll
+    adds    $rowsrc, $rowsrc, $src
+    muls    $rowdst, $r, $ll
+    adds    $rowdst, $rowdst, $dst
+
+    redmax  $maxa, $rowsrc          ; m = max_i x_i           -> scratchpad
+    loads   $t, $maxa               ; ...bring it back as a scalar
+    subs    $t, r0, $t
+    stores  $nega, $t               ; -m, now broadcastable
+    sadd    $sh32, $rowsrc, $nega   ; x_i - m  (int32, <= 0)
+    requant $sh8, $sh32, $rq1       ; int8; clips at -128 == x = -8
+    exp     $e32, $sh8              ; exp table (int32 out)
+    requant $e8, $e32, $rq1         ; int8, so redsum/sdiv can read it
+    redsum  $den, $e8               ; D = sum_i e_i           -> scratchpad
+    sdiv    $p32, $e8, $den         ; Q15 probabilities (int32)
+    requant $rowdst, $p32, $rq2     ; int8 at scale 1/128
+
+    adds    $r, $r, $one
+    jmp     $rloop
+$rdone:
+    ; ---- spill the probabilities: scratchpad -> DRAM ----
+    setcfg  len, $BYTES
+    wrmem   $dst, $dst

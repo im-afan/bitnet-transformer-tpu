@@ -232,7 +232,10 @@ vecdot  d, a, b     Σ a[i]*b[i] -> scalar redsum  d, a    Σ a[i]      -> scala
 requant d, a, p     clip((a[i]*m0+rnd)>>n) int32->int8, {m0,n} at p
 ```
 
-All read `cfg vlen` elements. `gelu`/`exp` use fixed 256-entry LUTs loaded at init.
+All read `cfg vlen` elements. `gelu`/`exp` use fixed 256-entry LUTs loaded at init
+(`accel/tpulang/luts.py`), which means their operands must **already be at the tables'
+canonical input scale of 1/16** — put a `requant` in front. Nothing checks this; a
+wrongly-scaled operand just reads the wrong table entry. See [vpu.md](vpu.md).
 
 **DMA / comms** (byte length from `cfg len`):
 

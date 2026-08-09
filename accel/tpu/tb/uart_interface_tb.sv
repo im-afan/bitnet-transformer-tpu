@@ -28,7 +28,9 @@
 //  11. a 256-byte payload at an odd base (length high byte, idx carry, page cross)
 //  12. turnaround: a byte sent while the device is mid-reply must NOT be lost
 //  13. every exchange is followed by "and nothing else came out"
-//  14. outrunning the one-byte holding register sets `rx_overrun` (last: it
+//  14. 'T' read timer: the 4-byte reply is `cycle_count`, MSB first, sampled
+//      once; it is answered while core_busy (the one command that is)
+//  15. outrunning the one-byte holding register sets `rx_overrun` (last: it
 //      deliberately desyncs the FSM)
 //
 // Build:
@@ -61,7 +63,8 @@ module uart_interface_tb #(
     localparam int MAXLEN      = 256;   // largest SRAM payload used by any test
     localparam int MAXW        = 8;     // largest IMEM payload (words) used
 
-    localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47;
+    localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47,
+                     TCMD = 8'h54;
     localparam [7:0] ACK  = 8'h06, NAK  = 8'h15;
 
     // ---- Clock / reset ------------------------------------------------------
@@ -75,6 +78,13 @@ module uart_interface_tb #(
 
     // ---- Arbitration --------------------------------------------------------
     logic core_busy = 1'b0; // driven by the TB to model a running program
+
+    // ---- Run-length counter -------------------------------------------------
+    // Stands in for cycle_timer.sv (tested on its own terms in tpu_top_uart_tb,
+    // where a real program runs). Here it only has to be something the 'T' reply
+    // can be compared against, and something that *moves* — a constant would not
+    // catch a reply assembled from a stale or re-sampled snapshot.
+    logic [31:0] cycle_count = 32'h0000_0000;
 
     // ---- receiver <-> FSM ---------------------------------------------------
     logic [7:0] rx_data;
@@ -122,7 +132,7 @@ module uart_interface_tb #(
         .ADDR_W(MEM_ADDR_W), .LENGTH_W(16), .IMEM_AW(IMEM_AW), .RX_TIMEOUT(RX_TIMEOUT)
     ) dut (
         .clk(clk), .rst_n(rst_n),
-        .core_busy(core_busy),
+        .core_busy(core_busy), .cycle_count(cycle_count),
         .data_in(rx_data), .receiver_valid(rx_valid),
         .transmitter_start(tx_start), .data_out(tx_data), .transmitter_busy(tx_busy),
         .sram_start(sram_start), .sram_we(sram_we), .sram_addr(sram_addr),
@@ -277,6 +287,21 @@ module uart_interface_tb #(
             rx_bit_byte(st);
         join
         chk(st === (exp_ack ? ACK : NAK), $sformatf("go status (got %02h)", st));
+    endtask
+
+    // 'T' read timer: a bare 1-byte frame, answered with 4 bytes MSB first and
+    // no status. Returns what the device reported.
+    task automatic do_timer(output [31:0] v);
+        logic [7:0] b;
+        fork
+            tx_bit_byte(TCMD);
+            begin
+                for (int i = 0; i < 4; i++) begin
+                    rx_bit_byte(b);
+                    v = {v[23:0], b};
+                end
+            end
+        join
     endtask
 
     // Nothing more may come out of the device. The hardware symptom this whole
@@ -508,6 +533,51 @@ module uart_interface_tb #(
                               b, wbuf[0]));
                 expect_quiet("pipelined read");
             end
+        end
+
+        // ---- Test 14: 'T' read the run-length counter -----------------------
+        begin
+            logic [31:0] t;
+
+            // 14a: the reply is the counter, MSB first, and nothing else.
+            cycle_count = 32'h1234_5678;
+            do_timer(t);
+            chk(t === 32'h1234_5678,
+                $sformatf("timer reply (got %08h exp 12345678)", t));
+            expect_quiet("timer reply");
+
+            // 14b: the counter is sampled once, at the command byte. It is a
+            // free-running count in the real design, so a reply assembled from
+            // four separate samples would mix bytes from different values —
+            // change it a byte into the reply and none of that may show up.
+            cycle_count = 32'hAABB_CCDD;
+            fork
+                do_timer(t);
+                begin
+                    repeat (12 * CPB) @(posedge clk);   // ~1 reply byte in
+                    cycle_count = 32'h0000_0001;
+                end
+            join
+            chk(t === 32'hAABB_CCDD,
+                $sformatf("timer snapshot is coherent (got %08h exp AABBCCDD)", t));
+
+            // 14c: 'T' is the one command answered while the core is running —
+            // it touches no memory, and watching the count rise mid-run is the
+            // reason it exists.
+            core_busy   = 1'b1;
+            cycle_count = 32'h0000_2A00;
+            repeat (2) @(posedge clk);
+            do_timer(t);
+            chk(t === 32'h0000_2A00,
+                $sformatf("timer answered while core_busy (got %08h)", t));
+            expect_quiet("timer while busy");
+            core_busy = 1'b0;
+            repeat (2) @(posedge clk);
+
+            // ...and the FSM is still in step afterwards.
+            do_read(24'h00_0100, 16'd4);
+            for (int i = 0; i < 4; i++)
+                chk(rbuf[i] === sram_mem[24'h000100 + i], "read after timer command");
         end
 
         // Nothing above overlapped by more than one byte, so the device must

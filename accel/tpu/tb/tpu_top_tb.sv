@@ -37,9 +37,10 @@
 // Small 8x8 array so the systolic drain simulates quickly (RTL default 128x128).
 // The geometry below MUST match gen_vectors.py (ROWS/COLS/T).
 //
-// Run:  make TEST=tpu_top RTL="../rtl/tpu_top.sv ../rtl/scalar_unit.sv \
-//            ../rtl/mxu.sv ../rtl/vpu.sv ../rtl/scratchpad.sv \
-//            ../rtl/dma.sv ../rtl/sram.sv"
+// Run:  make TEST=tpu_top          (RTL_tpu_top in tb/Makefile supplies the
+//                                   sources; tpu_top instantiates the UART
+//                                   blocks and cycle_timer even though this TB
+//                                   drives neither, so they must be compiled in)
 // Override a vector file:  iverilog ... -DPROG_FILE='"vectors/other_prog.hex"'
 // -----------------------------------------------------------------------------
 
@@ -52,6 +53,17 @@
 `endif
 `ifndef SPAD_EXP_FILE
   `define SPAD_EXP_FILE "vectors/tpu_spad_exp.hex"
+`endif
+
+// ---- VPU activation LUTs ----------------------------------------------------
+// Not vectors: these are the fixed ROM contents the bitstream burns in, so the
+// TB loads exactly what the board would (accel/tpulang/luts.py generates both).
+// Passing them makes `gelu`/`exp` mean the same thing here and in the ISS.
+`ifndef GELU_LUT_FILE
+  `define GELU_LUT_FILE "../rtl/luts/gelu_lut.hex"
+`endif
+`ifndef EXP_LUT_FILE
+  `define EXP_LUT_FILE "../rtl/luts/exp_lut.hex"
 `endif
 
 module tpu_top_tb;
@@ -109,7 +121,8 @@ module tpu_top_tb;
         .ROWS(ROWS), .COLS(COLS), .VPU_BYTES(VPU_BYTES), .ADDR_W(ADDR_W),
         .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W),
         .REG_AW(REG_AW), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
-        .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W)
+        .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W),
+        .GELU_INIT(`GELU_LUT_FILE), .EXP_INIT(`EXP_LUT_FILE)
     ) dut (
         .clk(clk), .rst_n(rst_n),
         .host_run(host_run), .boot_pc(boot_pc),

@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import luts
+
 # --- opcode map (must match scalar_unit.sv OP_* and assembler.py SPECS) --------
 OP_MATMUL, OP_VECDOT, OP_VECMUL, OP_VECADD = 0x00, 0x01, 0x02, 0x03
 OP_RELU, OP_GELU, OP_WRMEM, OP_RDMEM = 0x04, 0x05, 0x06, 0x07
@@ -82,8 +84,14 @@ class TPU:
     n_w: int = 4           # requant shift width
     recip_q: int = 31      # VOP_SCALAR_DIV reciprocal exponent (vpu.sv)
     div_q: int = 15        # VOP_SCALAR_DIV quotient fractional bits (Q15)
-    gelu_lut: list | None = None   # 256 x int8, indexed by unsigned input byte
-    exp_lut: list | None = None    # 256 x int8
+    # Activation tables (256 x int8, indexed by the unsigned input byte). These
+    # default to the *same* tables the bitstream burns in (luts.py), because the
+    # ROM contents are a fixed hardware artifact, not a per-program choice — the
+    # ISS is only bit-exact with the RTL if both sides hold the same bytes. The
+    # corollary is that `gelu`/`exp` operands must already be at the tables'
+    # canonical input scale; see luts.py.
+    gelu_lut: list | None = None
+    exp_lut: list | None = None
 
     mem: bytearray = field(init=False)      # on-chip scratchpad
     dram: bytearray = field(init=False)     # external DRAM (DMA source/destination)
@@ -101,6 +109,10 @@ class TPU:
         self.written = set()
         self.dram_written = set()
         self.wcol_bytes = (self.rows * 2) // 8   # packed ternary column bytes
+        if self.gelu_lut is None:
+            self.gelu_lut = luts.GELU_LUT
+        if self.exp_lut is None:
+            self.exp_lut = luts.EXP_LUT
 
     # ---- scratchpad access (addresses wrap mod depth, like the RTL) ----------
     def _a(self, addr: int) -> int:
@@ -347,7 +359,9 @@ class TPU:
 
     def _lut(self, lut, name: str, addr: int) -> int:
         if lut is None:
-            raise ISSError(f"{name} op needs a {name}_lut (256 x int8)")
+            raise ISSError(f"{name} op needs a {name}_lut (256 x int8) — it "
+                           f"defaults to luts.{name.upper()}_LUT, so this only "
+                           f"happens if something cleared it")
         return s8(lut[self.mem[self._a(addr)]])   # indexed by unsigned byte
 
     def _sdiv(self, a8: int, d: int) -> int:

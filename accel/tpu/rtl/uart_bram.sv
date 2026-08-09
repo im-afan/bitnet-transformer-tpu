@@ -178,6 +178,10 @@ module uart_bram #(
         // No core to arbitrate against: nothing is ever NAK'd for being busy.
         .core_busy (1'b0),
 
+        // No scalar unit, so no run to time: 'T' is still decoded and still
+        // answers, and it answers 0 forever.
+        .cycle_count (32'd0),
+
         // receiver / transmitter
         .data_in           (uart_rx_data),
         .receiver_valid    (uart_rx_valid),

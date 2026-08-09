@@ -1,0 +1,72 @@
+; @primitive transpose_i8
+; @clobbers r1-r12, cfg len
+;
+; B[n,m] = A[m,n], int8, in DRAM.
+;
+; Why this has to exist: `vecdot` requires both operands contiguous along the
+; contraction axis, and for attention's second matmul (P @ V) the contraction is
+; over *keys*, so V must be key-contiguous — i.e. V^T. The ISA has no transpose
+; and no strided vector load, so the bytes have to move.
+;
+; The trick is that **a DMA with len = 1 is a byte move between two arbitrary
+; addresses**. This loops over elements doing rdmem (1 byte, DRAM -> a single
+; scratchpad cell) then wrmem (that cell -> the transposed DRAM address). M*N
+; iterations of a 7-instruction body: slow in cycles, tiny in instructions, and
+; correct. Replace it the day a transposing DMA mode lands.
+;
+; Both sides take an explicit row stride, so the source may be a sub-block of a
+; larger tensor (V is columns 2d..3d of the fused QKV matrix).
+;
+; @param SRC         DRAM address of A[M,N] int8
+; @param DST         DRAM address of B[N,M] int8
+; @param M           rows of A
+; @param N           columns of A
+; @param SRC_STRIDE  byte stride between rows of A (>= N)
+; @param DST_STRIDE  byte stride between rows of B (>= M)
+; @param BUF         a 1-byte scratchpad cell used as the staging point
+
+.reg $src   r1
+.reg $dst   r2
+.reg $mm    r3
+.reg $nn    r4
+.reg $ss    r5
+.reg $ds    r6
+.reg $buf   r7
+.reg $one   r8
+.reg $m     r9
+.reg $n     r10
+.reg $s     r11
+.reg $d     r12
+
+    li      $src, {{SRC}}
+    li      $dst, {{DST}}
+    li      $mm,  {{M}}
+    li      $nn,  {{N}}
+    li      $ss,  {{SRC_STRIDE}}
+    li      $ds,  {{DST_STRIDE}}
+    li      $buf, {{BUF}}
+    li      $one, 1
+    setcfg  len, 1              ; one byte per DMA — this is the whole mechanism
+
+    li      $m, 0
+$mloop:
+    cmps    $m, $mm
+    bge     $mdone
+    li      $n, 0
+$nloop:
+    cmps    $n, $nn
+    bge     $ndone
+    muls    $s, $m, $ss
+    adds    $s, $s, $n
+    adds    $s, $s, $src            ; &A[m,n]
+    muls    $d, $n, $ds
+    adds    $d, $d, $m
+    adds    $d, $d, $dst            ; &B[n,m]
+    rdmem   $buf, $s                ; DRAM -> scratchpad cell
+    wrmem   $buf, $d                ; scratchpad cell -> DRAM
+    adds    $n, $n, $one
+    jmp     $nloop
+$ndone:
+    adds    $m, $m, $one
+    jmp     $mloop
+$mdone:

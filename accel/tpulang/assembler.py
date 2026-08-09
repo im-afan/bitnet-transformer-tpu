@@ -516,7 +516,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        with open(args.source) as f:
+        # Explicit UTF-8, not the locale's default — the example sources carry
+        # math notation in their comments that cp1252 cannot decode.
+        with open(args.source, encoding="utf-8") as f:
             text = f.read()
         words, instrs = assemble_verbose(text)
     except AsmError as e:

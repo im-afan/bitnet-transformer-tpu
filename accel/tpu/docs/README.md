@@ -9,13 +9,23 @@ Detailed per-component design notes (this file is the overview):
 | [scratchpad.md](scratchpad.md)   | On-chip BRAM working memory, banking, sizing          |
 | [mxu.md](mxu.md)                 | Weight-stationary ternary systolic matrix unit        |
 | [vpu.md](vpu.md)                 | SIMD vector unit: activations, reductions, attention  |
-| [comms.md](comms.md)             | 2D inter-TPU link for scale-out                       |
+| [dma.md](dma.md)                 | DMA engine and the external SRAM controller ("DRAM")  |
+| [comms.md](comms.md)             | 2D inter-TPU link for scale-out (**stubbed in RTL**)  |
 | [scalar_unit.md](scalar_unit.md) | Control processor microarchitecture                   |
+| [scalar_unit_pipeline.md](scalar_unit_pipeline.md) | Plan to pipeline it — **proposal, not built**; the RTL is still the multi-cycle FSM |
 | [isa.md](isa.md)                 | Guide to writing TPU programs in tpulang (+ encoding/opcode appendix) |
+| [uart_host.md](uart_host.md)     | The host link: frame format, the five commands, arbitration |
+| [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image and how to use it |
 | [synth.md](synth.md)             | Vivado build flow, Cmod A7-35T deployment, sizing reality check |
 
 The assembly language that lowers 1:1 onto the ISA is documented in
-[`accel/tpulang/README.md`](../../tpulang/README.md).
+[`accel/tpulang/README.md`](../../tpulang/README.md), and the host driver that speaks the
+protocol in [`accel/tpu/host/README.md`](../host/README.md).
+
+> **This file is the original design sketch**, kept because §1 is still an accurate
+> statement of intent. Where it disagrees with a component doc above, the component doc
+> wins — §4's instruction list in particular predates the real ISA (see
+> [isa.md](isa.md) for what the machine actually implements).
 
 ## 1. Overview
 
@@ -46,26 +56,32 @@ It contains multiple ALUs that act on data from a single scratchpad memory acces
 
 Furthermore, we implement an inter-TPU interface that allows a TPU to receive requests to write to the RAM of its neighbors. For now, we implement a 2d connection scheme (4 neighbors).
 
+*Status: designed in [comms.md](comms.md), but not built. `tpu_top.sv` ties the `nb_*` port
+off, so the `wrneigh` instruction completes as a no-op in both the RTL and the ISS.*
 
-### 4. Scalar Unit
+### 5. Scalar Unit
 
 Handles all the control, dispatches instructions to the VPU and MXU. Reads from instruction memory.
 Also handles scalar operations such as adding, multiplying numbers in memory.
 
-Instructions:
+The instruction set that grew out of this sketch is specified in [isa.md](isa.md) and
+summarized, with assembler syntax, in
+[`accel/tpulang/README.md`](../../tpulang/README.md#14-instruction-set). Two things about the
+real ISA differ from the shape implied above and are worth stating here, because they change
+how programs are written:
 
-Math (all addresses are within scratchpad memory):
-Matmul(activation addr, weight addr, out addr): performs activation @ weight -> out, fixed size
-VectorDot(vector addr 1, vector addr 2, out addr): 
-VectorMultiply(vector addr, scalar addr, out addr)
-VectorAdd(vector addr 1, vector addr 2, out addr)
-ReLU(vector pad addr, out addr)
-GeLU(vector addr, out addr)
+- **Operands are registers, not immediates.** An instruction names registers; the register
+  *contents* are the byte addresses the unit operates on. So `matmul rout, ract, rweight`,
+  after an `li` puts each address in a register.
+- **Sizes are not in the instruction.** They come from config registers set beforehand —
+  `setcfg tlen` (MXU token count), `setcfg vlen` (VPU vector length), `setcfg len` (DMA byte
+  count). Stale config is the most common silent bug in a tpulang program.
 
-Comms/Memory (all addresses are in ram unless stated)
-WriteNeighbor(neighbor, my addr, neighbor addr): uses inter-TPU interface to write to neighbor's RAM
-WriteMemory(scratchpad (read) addr, write addr)
-ReadMemory(read addr, scratchpad (write) addr)
+The dispatched ops are `matmul` (with `.acc`/`.rq` flags), `vecdot`, `vecadd`, `vecemul`,
+`vecmul`, `sadd`, `sdiv`, `relu`, `gelu`, `square`, `exp`, `redmax`, `redsum`, and
+`requant`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
+`wrneigh`; control is `adds`, `subs`, `muls`, `cmps`, `li`, `loads`, `stores`, `setcfg`,
+`branch` (and the `beq`/`bne`/`blt`/`bge` forms), `jmp`, `wait`, and `halt`.
 
 
 

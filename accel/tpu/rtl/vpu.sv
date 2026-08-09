@@ -33,10 +33,11 @@
 // so the compiler can requantize a division like any other int32 buffer.
 //
 // Activation LUTs. GELU/EXP are 256-entry int8 tables indexed by the signed input
-// byte, generated on the host at a *canonical* input scale (accel/compiler/luts.py)
-// rather than per-program — the table is a fixed hardware artifact, and getting an
-// operand into the table's input scale is the compiler's job (an ordinary REQUANT
-// ahead of the op). See vpu.md §Activation LUTs.
+// byte, generated on the host at a *canonical* input scale (accel/tpulang/luts.py
+// writes rtl/luts/{gelu,exp}_lut.hex) rather than per-program — the table *is* the
+// op's numerics, so it is a fixed hardware artifact and getting an operand into
+// the table's input scale is the compiler's job (an ordinary REQUANT ahead of the
+// op). Both assume in_scale = 1/16. See vpu.md §Activation LUTs.
 //
 // Streaming: a vector of `vpu_vlen` elements is processed LANES elements at a
 // time. Each chunk reads its operand(s), computes all lanes in one cycle, then

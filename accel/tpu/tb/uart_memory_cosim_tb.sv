@@ -271,7 +271,10 @@ module uart_memory_cosim_tb #(
     // host cannot see it any other way.
     // =========================================================================
     bit ovr_seen = 1'b0, col_seen = 1'b0;
-    logic [3:0] fsm_prev = 4'hF;
+    // Width tracks uart_interface's `state` (5 bits since the 'T' command added
+    // TMR_TX/TMR_TX_WAIT); the init value is a code no state uses, so the first
+    // sample always logs.
+    logic [4:0] fsm_prev = 5'h1F;
 
     always @(posedge clk) if (bridge_up) begin
         if (dut.uart_rx_overrun && !ovr_seen) begin

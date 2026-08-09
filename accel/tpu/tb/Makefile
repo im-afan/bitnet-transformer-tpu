@@ -14,8 +14,11 @@
 #
 # UART end-to-end (one command: assemble a tpulang program, generate its golden
 # vectors, then drive the whole thing into the DUT over the UART pins and check):
-#   make uart                          default program (examples/relu_layer.tpu)
-#   make uart PROG=examples/foo.tpu    your own program (path relative to tpulang/)
+#   make uart                          default pair (relu_layer then vector_add)
+#   make uart PROG=examples/foo.tpu PROG2=examples/bar.tpu
+# Two programs, because the TB runs both back to back over one link with no
+# reset between them -- the case that used to leave the second one running the
+# first one's instructions (see the note in scalar_unit.sv's imem/cfg gating).
 # All examples are self-contained over DRAM (rdmem inputs in, wrmem outputs out);
 # a custom program must also match gen_vectors.py's geometry/address map.
 #
@@ -60,11 +63,20 @@ VVP      := vvp
 
 # --- UART end-to-end wiring ---------------------------------------------------
 PROG     ?= examples/relu_layer.tpu
+PROG2    ?= examples/vector_add.tpu
 TPULANG  := ../../tpulang
 UART_TOP := tpu_top_uart_tb
 UART_RTL := ../rtl/tpu_top.sv ../rtl/scalar_unit.sv ../rtl/mxu.sv ../rtl/vpu.sv \
             ../rtl/scratchpad.sv ../rtl/dma.sv ../rtl/sram.sv \
-            ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv
+            ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv \
+            ../rtl/cycle_timer.sv
+
+# Both tpu_top testbenches need the whole core. Declared here (rather than up with
+# the other RTL_<name> lines) so the file list is written once: the backdoor TB
+# does not drive the UART, but tpu_top instantiates the UART blocks either way and
+# will not elaborate without them.
+RTL_tpu_top      := $(UART_RTL)
+RTL_tpu_top_uart := $(UART_RTL)
 
 # Every test discoverable from the *_tb.sv files present. uart_memory_cosim is
 # excluded: it has no rtl/<name>.sv and cannot run without host/sim_link.py
@@ -77,10 +89,15 @@ sim: $(TB) $(RTL)
 	$(IVERILOG) -o $(TOP).vvp $(RTL) $(TB)
 	$(VVP) $(TOP).vvp
 
-# Assemble PROG + generate golden vectors (into vectors_uart/, kept separate from
-# the backdoor tpu_top_tb's vectors/), then run the UART-driven end-to-end TB.
+# Assemble PROG and PROG2 + generate golden vectors (into vectors_uart/ and
+# vectors_uart2/, kept separate from the backdoor tpu_top_tb's vectors/), then
+# run the UART-driven end-to-end TB. It loads and runs *both* programs over one
+# link with no reset in between, which is what run_program.py does when invoked
+# twice with different --program arguments -- PROG2 must be a different program
+# from PROG for that to mean anything.
 uart: $(UART_TOP).sv $(UART_RTL)
 	python $(TPULANG)/gen_vectors.py -p $(TPULANG)/$(PROG) -o vectors_uart
+	python $(TPULANG)/gen_vectors.py -p $(TPULANG)/$(PROG2) -o vectors_uart2
 	$(IVERILOG) -o $(UART_TOP).vvp $(UART_RTL) $(UART_TOP).sv
 	$(VVP) $(UART_TOP).vvp
 

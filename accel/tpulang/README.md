@@ -3,14 +3,16 @@
 **tpulang** is the TPU's assembly language: a human-writable text form that lowers
 **1:1** onto the scalar unit's [instruction set](../tpu/docs/isa.md). A `.tpu` source
 file assembles into the 32-bit machine words the TPU's instruction BRAM executes.
-**pytpu** is a planned higher-level Python DSL that compiles *down* to tpulang; it is
-sketched at the end of this doc and is not yet implemented.
+**pytpu** sits one level up: it *generates* tpulang by instantiating hand-written
+parameterized templates from Python. It exists and builds a whole transformer layer — see
+[§5](#5-pytpu) and [`pytpu/README.md`](pytpu/README.md).
 
 ```
-   kernel.tpu  ──assembler.py──►  32-bit words  ──►  instruction BRAM  ──►  scalar_unit.sv
-       │                              │
-       │                              └──iss.py──►  golden scratchpad image
-       └────────── (pytpu → tpulang, planned) ──────────┘
+   pytpu/lib/*.tpu  ──pytpu──►  kernel.tpu  ──assembler.py──►  32-bit words
+   (templates)                      │                              │
+                                    │                              ├──►  instruction BRAM  ──►  scalar_unit.sv
+                                    │                              └──iss.py──►  golden scratchpad image
+                                    └──torch_ref.py──►  independent PyTorch check
 ```
 
 The toolchain (all in this directory):
@@ -19,8 +21,11 @@ The toolchain (all in this directory):
 | ----------------------------- | -------------------------------------------------------------------- |
 | [`assembler.py`](assembler.py) | `tpuasm` — assemble `.tpu` → machine words (hex/bin image or `list[int]`) |
 | [`iss.py`](iss.py)            | instruction-set simulator; runs the words, bit-exact with the RTL    |
+| [`luts.py`](luts.py)          | generates the VPU's `gelu`/`exp` activation ROMs (`../tpu/rtl/luts/*.hex`) at their canonical input scale; the ISS imports the same tables |
 | [`gen_vectors.py`](gen_vectors.py) | ties both together: assemble + simulate → golden test vectors for `tpu_top_tb.sv` |
-| [`examples/`](examples)       | annotated `.tpu` programs (vector add, tiled matmul, relu layer, softmax) |
+| [`torch_ref.py`](torch_ref.py) | PyTorch references for the examples — an independent check on the ISS *and* the FPGA |
+| [`examples/`](examples)       | annotated `.tpu` programs (vector add, relu layer, tiled matmul, VPU matmul, softmax) |
+| [`pytpu/`](pytpu)             | template composer one level up — builds whole layers out of `.tpu` primitives |
 
 For the machine-level encoding and per-opcode semantics, read the
 [ISA reference](../tpu/docs/isa.md) alongside this — this doc is the *language* (syntax,
@@ -209,7 +214,20 @@ Each stages its own operands over DRAM (§2.2) and ends in `halt`.
 | [`vector_add.tpu`](examples/vector_add.tpu) | smallest VPU program: config + one elementwise op (residual `C=A+B`) |
 | [`relu_layer.tpu`](examples/relu_layer.tpu) | one ternary layer `Y=requant(A@W)` + `relu` — the shape the adder model runs |
 | [`tiled_matmul.tpu`](examples/tiled_matmul.tpu) | streams a big `A@W` tile-by-tile: nested M/N/K loops (`li/muls/adds/cmps/branch/jmp`) `rdmem` each tile into fixed buffers, then `matmul` → `matmul.acc` → `matmul.acc.rq` — scratchpad use is fixed regardless of matrix size |
-| [`softmax_row.tpu`](examples/softmax_row.tpu) | a multi-op micro-sequence + scalar↔vector interplay (`redmax → sadd → exp → redsum → sdiv`) |
+| [`vpu_matmul.tpu`](examples/vpu_matmul.tpu) | a matmul with **no** ternary operand, so the MXU cannot help: attention's `S = Q@K^T` as a `T x T` nest of `vecdot`, contracting over the head dim — `K^T` is never materialised — then a per-row `requant` back to int8 for softmax |
+| [`softmax_row.tpu`](examples/softmax_row.tpu) | a multi-op micro-sequence + scalar↔vector interplay (`redmax → sadd → exp → redsum → sdiv`) — illustrative only, see the caveat below |
+
+> **`softmax_row.tpu` does not compute a correct softmax.** It is not type-correct:
+> `exp`, `redsum` and `sdiv` read int8 operands at stride 1, but the `sadd` and `exp`
+> feeding them write int32 at stride 4. Two `requant` ops — one to reach the exp table's
+> `1/16` `in_scale`, one after `exp` — are what
+> [vpu.md](../tpu/docs/vpu.md#activation-luts) says belong there. Read it for the op
+> sequence; don't trust its output. It is registered in `torch_ref.UNSUPPORTED` with that
+> reason.
+>
+> **The exp LUT is no longer the blocker.** [`luts.py`](luts.py) generates it, the ISS
+> defaults to it, and `cmod_a7_top.sv` loads it into the VPU ROM — so the program now
+> assembles and runs; it just computes the wrong thing.
 
 **Softmax, annotated** — no single instruction; the scalar unit decomposes it into VPU
 primitives, using `loads`/`stores` to bring the reduction result back as a broadcast
@@ -267,13 +285,50 @@ The expected file contains exactly the bytes the program wrote, so the SystemVer
 testbench checks precisely that program's outputs — the loop that keeps hardware honest
 against the golden model.
 
+**Check a kernel against PyTorch.** The golden model is `iss.py`, so agreeing with it
+proves consistency, not correctness — a kernel and the ISS can be wrong the same way.
+[`torch_ref.py`](torch_ref.py) closes that gap: it decodes the tensors out of the DRAM
+byte images, recomputes each kernel in plain PyTorch, and compares exactly (these
+kernels are integer end to end, so there is no tolerance to allow). It calls neither
+the ISS nor the RTL, and reads the DRAM layout from the program's own `.equ` symbol
+table rather than restating it.
+
+```bash
+python torch_ref.py                          # every example with a reference, vs the ISS
+python torch_ref.py -p examples/relu_layer.tpu
+```
+
+`relu_layer`, `vector_add`, `tiled_matmul` and `vpu_matmul` have references;
+`softmax_row` is registered as unsupported with the reason in `torch_ref.UNSUPPORTED`.
+The same references run against **real hardware** — `accel/tpu/host/run_program.py`
+calls `torch_ref.verify()` on the bytes it reads back off the FPGA, so one command
+checks the device against both the ISS and PyTorch.
+
 ---
 
-## 5. pytpu (planned)
+## 5. pytpu
 
-pytpu is a higher-level Python DSL intended to compile down to tpulang, so kernels can be
-written in terms of tensors and primitives instead of hand-managed registers and
-addresses. **It is not yet implemented** (`core.py` is a stub); the design intent:
+[`pytpu/`](pytpu) is the Python layer above tpulang: kernels written in terms of tensors
+and primitives instead of hand-managed registers and addresses. It exists — see
+[`pytpu/README.md`](pytpu/README.md) — but it is a **composer, not a compiler**, which is a
+smaller and more concrete thing than the DSL sketched below.
+
+A primitive is a hand-written, parameterized `.tpu` template (`pytpu/lib/*.tpu`); Python
+instantiates them with concrete shapes and addresses and concatenates the result into one
+ordinary `.tpu` file that this toolchain then handles unchanged. So the tiling stays
+hand-written tpulang, and `tiled_matmul.tpu`'s loop nest gets *reused* rather than
+re-derived by codegen. The worked example builds one quantized transformer layer —
+attention, softmax, GELU feed-forward and two LayerNorms — in 861 of the 1024 available
+instruction words, and checks every intermediate against an exact integer reference:
+
+```bash
+python pytpu/examples/transformer_layer.py
+```
+
+What is **not** implemented from the design below is the compiler part: no automatic
+tiling, no fusion, no liveness-driven elision of the DMA between primitives. The ISA has no
+call/return, so every instantiation is inlined and instruction memory (2¹⁰ words) is the
+binding budget. The original design intent, for reference:
 
 ### Tensor
 

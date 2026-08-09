@@ -209,11 +209,21 @@ module scalar_unit #(
 
     // -------------------------------------------------------------------------
     // Config register file. Host presets while idle; SETCFG writes at runtime.
+    //
+    // "Idle" here — and for the instruction memory below — means `!busy`, not
+    // `state == S_IDLE`. S_IDLE is only ever reached out of reset: once a program
+    // HALTs the FSM parks in S_HALT and stays there until the next `host_run`.
+    // Gating the host write ports on S_IDLE therefore made every load after the
+    // first one a silent no-op, so a second, different program would run the
+    // *first* program's instructions until the board was reset. `!busy` is
+    // (S_IDLE | S_HALT), and is the same condition uart_interface arbitrates on
+    // (`core_busy`), so the host's view of "safe to load" now matches the
+    // scalar unit's.
     // -------------------------------------------------------------------------
     logic [XLEN-1:0] cfg [0:(1<<CFG_AW)-1];
     logic            cfg_prog_we;   // SETCFG write strobe
     always_ff @(posedge clk) begin
-        if (cfg_we && state == S_IDLE)
+        if (cfg_we && !busy)
             cfg[cfg_waddr] <= cfg_wdata;
         else if (cfg_prog_we)
             cfg[a_dst[CFG_AW-1:0]] <= {{(XLEN-16){1'b0}}, imm16};
@@ -231,7 +241,7 @@ module scalar_unit #(
     logic [31:0] imem [0:(1<<IMEM_AW)-1];
     logic [31:0] imem_rdata;
     always_ff @(posedge clk) begin
-        if (imem_we && state == S_IDLE)
+        if (imem_we && !busy)          // !busy == S_IDLE | S_HALT; see cfg above
             imem[imem_waddr] <= imem_wdata;
         imem_rdata <= imem[pc];      // valid the cycle after pc is presented
     end

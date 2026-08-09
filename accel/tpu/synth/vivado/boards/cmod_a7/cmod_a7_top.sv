@@ -29,7 +29,14 @@
 // String parameters (MEM_STYLE, SPAD_INIT, GELU_INIT, EXP_INIT) are fixed here
 // rather than exposed as build-time generics -- Vivado's `synth_design -generic`
 // does not pass Verilog string parameters cleanly. Edit them here if you need a
-// preloaded scratchpad or the VPU activation LUTs.
+// preloaded scratchpad.
+//
+// The two activation-LUT paths are relative to accel/tpu, which build.tcl cds
+// into before reading the design precisely so they resolve the same way whatever
+// directory Vivado was launched from. The files are generated, not written by
+// hand -- `python accel/tpulang/luts.py` -- and their contents are the numerics
+// of the `gelu`/`exp` instructions, so a program's operands must already be at
+// the canonical input scale those tables assume (docs/vpu.md, luts.py).
 // -----------------------------------------------------------------------------
 
 module cmod_a7_top #(
@@ -150,8 +157,8 @@ module cmod_a7_top #(
         .UART_RX_TIMEOUT (UART_RX_TIMEOUT),
         .MEM_STYLE       ("BRAM"),
         .SPAD_INIT       (""),
-        .GELU_INIT       (""),
-        .EXP_INIT        ("")
+        .GELU_INIT       ("rtl/luts/gelu_lut.hex"),
+        .EXP_INIT        ("rtl/luts/exp_lut.hex")
     ) u_tpu (
         .clk   (sysclk),
         .rst_n (rst_n),

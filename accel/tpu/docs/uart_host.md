@@ -94,6 +94,32 @@ Header-less read replies mean the host, which already knows `len`, can simply
 `read(len)` from its serial port. The write reply is a single byte the host waits on
 to serialize back-to-back commands.
 
+### 4.2b Zero-address commands ('G', 'T')
+
+Two commands added past the v1 memory-only scope do not use the layout above:
+
+```
+byte:   0      1     2     3                    byte:   0
+      +-----+-----+-----+-----+                       +-----+
+go    | 'G' | A2  | A1  | A0  |               timer   | 'T' |
+      +-----+-----+-----+-----+                       +-----+
+```
+
+- **`'G'` = 0x47** pulses the scalar unit's run trigger with `run_pc = addr`; no
+  length, no payload. Reply is `ACK`/`NAK`.
+- **`'T'` = 0x54** is the whole frame. Reply is **4 bytes, MSB first, no status**:
+  the scalar unit's run-length counter (`rtl/cycle_timer.sv`) in core clocks —
+  reset when `busy` rises, frozen when it falls, so it is the length of the last
+  run, or of the current one so far. It saturates at `0xFFFFFFFF` rather than
+  wrapping (358 s at 12 MHz).
+
+`'T'` is the only command **not** subject to the arbitration rule in §6: it reads
+a counter, contends over nothing, and cannot corrupt a run, so it is answered
+whether or not the core is busy. That is also its point — a rising count is the
+only live evidence this link can give that a long program is still progressing.
+It is not a completion signal: the count also sits still if the run never
+started, so "has it halted" is still inferred from a command that stops NAK'ing.
+
 ### 4.3 Status byte values
 
 | Name  | Value | Meaning                                         |
@@ -109,6 +135,7 @@ Single command channel, one op in flight.
 IDLE
   └─ on valid byte → latch CMD
        CMD == 'R' or 'W' → RX_ADDR
+       CMD == 'T'        → sample the counter → TMR_TX (4 bytes) → IDLE
        else              → send NAK, back to IDLE   (resync, see §7)
 
 RX_ADDR   collect 3 bytes → addr[23:0]
@@ -138,7 +165,8 @@ In `tpu_top.sv` the `sram_controller` user port is currently owned by the DMA en
 {DMA, UART host} may drive it at a time.
 
 **v1 policy: the UART host only touches SRAM while the core is idle** (`busy == 0`,
-no program running). Recommended wiring:
+no program running). `'T'` is exempt — it touches no memory at all (§4.2b).
+Recommended wiring:
 
 - A 2:1 mux on the `sram_controller` user side, selected by "core idle". When idle the
   UART FSM drives `start`/`we`/`addr`/`din` and observes `dout`/`busy`/`done`; while a

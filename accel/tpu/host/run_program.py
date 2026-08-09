@@ -11,8 +11,18 @@ The end-to-end host flow, over the UART link only — the same sequence
   3. ``I`` load the program into instruction memory;
   4. ``W`` write the input tensors into external SRAM ("DRAM");
   5. ``G`` start the scalar unit at PC 0;
-  6. wait for the core to go idle, then ``R`` read the output bytes back and
-     compare them to the golden image.
+  6. wait for the core to go idle, ``T`` read how many core clocks the run took,
+     then ``R`` read the output bytes back and compare them to the golden image;
+  7. check the same bytes a second time against an **independent PyTorch
+     reference** (``tpulang/torch_ref.py``).
+
+Step 7 is what makes this a real check of the kernel. The golden image in step 2
+comes out of the ISS, so step 6 only proves the FPGA agrees with the simulator
+the whole toolchain is built on — if both are wrong in the same way, it passes.
+``torch_ref`` shares no code with either: it decodes the tensors out of the bytes
+that were actually written to and read from the board and recomputes the kernel
+in PyTorch. Skipped with a note if ``torch`` is absent or the program has no
+registered reference; ``--no-torch`` disables it.
 
 Default program is ``tpulang/examples/tiled_matmul.tpu``: a [8x32] @ [32x16]
 int8-by-ternary matmul streamed tile-by-tile through fixed 180-byte scratchpad
@@ -135,12 +145,9 @@ def build_plan(path: str) -> Plan:
     words, consts = gv.assemble_program(path)
     tpu = TPU(rows=gv.ROWS, cols=gv.COLS, addr_w=gv.ADDR_W, m0_w=gv.M0_W, n_w=gv.N_W)
 
-    ref, shape = None, None
-    if "MTILES" in consts:                       # the streaming tiled matmul
-        in_img, ref, dims = gv.build_matmul_image(tpu, consts)
-        shape = f"[{dims['M']}x{dims['K']}] @ [{dims['K']}x{dims['N']}]"
-    else:                                        # fixed-geometry programs
-        in_img = gv.build_default_image(tpu)
+    in_img, ref, dims = gv.build_image(tpu, consts)
+    shape = (f"[{dims['M']}x{dims['K']}] @ [{dims['K']}x{dims['N']}]"
+             if dims else None)
 
     tpu.run(words)
     exp_img = {a: tpu.dram[a] for a in sorted(tpu.dram_written)}
@@ -208,6 +215,29 @@ def wait_until_idle(tpu: TPUUart, limit: float, interval: float) -> float:
         time.sleep(interval)
 
 
+def report_run_time(tpu: TPUUart, clk_mhz: float) -> int | None:
+    """Print how many core clocks the run took, per the device's own timer.
+
+    This is the only honest measure of the kernel's cost: the wall-clock wait
+    above is dominated by the poll interval and USB latency, and says nothing
+    about the hardware. ``cycle_timer`` counts the scalar unit's ``busy``
+    interval on the FPGA, so it is exactly 'G' to HALT and nothing else.
+
+    Non-fatal if the device does not answer: 'T' is newer than the other four
+    commands, and a bitstream flashed before it existed NAKs the byte as an
+    unknown command instead (``synth/build/`` is not rebuilt by ``mode=program``
+    — check its mtime). The run's results are unaffected either way.
+    """
+    try:
+        cycles = tpu.read_timer()
+    except ProtocolError as exc:
+        print(f"timer   : unavailable — {exc}")
+        print("          (bitstream predates the 'T' command? reflash board=cmod_a7)")
+        return None
+    print(f"timer   : {cycles} core clocks ({cycles / clk_mhz:.1f} us @ {clk_mhz:g} MHz)")
+    return cycles
+
+
 def load_and_run(tpu: TPUUart, plan: Plan, args) -> dict:
     """Load, run, and read back. Returns the hardware bytes as ``{addr: byte}``."""
     in_runs = contiguous_runs(plan.in_img)
@@ -248,6 +278,7 @@ def load_and_run(tpu: TPUUart, plan: Plan, args) -> dict:
         time.sleep(args.wait)
     waited = wait_until_idle(tpu, args.run_timeout, args.poll_interval)
     print(f"halted  : core idle after {args.wait + waited:.2f}s")
+    report_run_time(tpu, args.clk_mhz)
 
     # 5) results -> host
     hw: dict = {}
@@ -259,6 +290,33 @@ def load_and_run(tpu: TPUUart, plan: Plan, args) -> dict:
 
 
 # ---- Stage 3: report --------------------------------------------------------
+
+def torch_verify(plan: Plan, out_img: dict, source: str) -> int | None:
+    """Check ``out_img`` against the PyTorch reference. Returns #mismatches.
+
+    Returns ``None`` when the check could not run at all (no ``torch``, or no
+    reference registered for this program) — an absent opinion, distinct from a
+    passing one, so the caller does not claim a check that never happened. The
+    golden-image comparison still stands on its own in that case.
+    """
+    try:
+        import torch_ref
+    except ImportError as exc:
+        print(f"\ntorch   : skipped — {exc} (pip install torch to enable)")
+        return None
+
+    try:
+        rep = torch_ref.verify(plan.consts, plan.in_img, out_img)
+    except torch_ref.NoReference as exc:
+        print(f"\ntorch   : skipped — {exc}")
+        return None
+    except torch_ref.MissingByte as exc:
+        print(f"\ntorch   : FAILED — {exc}")
+        return 1
+
+    print(f"\ntorch   : {rep.kernel} vs PyTorch, over the {source}")
+    return torch_ref.print_report(rep)
+
 
 def compare(hw: dict, exp_img: dict, limit: int = 8) -> int:
     bad = 0
@@ -290,8 +348,13 @@ def main(argv=None) -> int:
                     help="gap between idle probes (default: %(default)s)")
     ap.add_argument("--run-timeout", type=float, default=10.0,
                     help="give up if the core has not halted by then (default: %(default)s)")
+    ap.add_argument("--clk-mhz", type=float, default=12.0,
+                    help="device clock, for converting the 'T' cycle count to time "
+                         "(default: %(default)s, the Cmod A7)")
     ap.add_argument("--verify-inputs", action="store_true",
                     help="read the tensors back after writing them (bring-up check)")
+    ap.add_argument("--no-torch", action="store_true",
+                    help="skip the independent PyTorch check of the results")
     ap.add_argument("--dry-run", action="store_true",
                     help="assemble + simulate only; never open the serial port")
     args = ap.parse_args(argv)
@@ -310,7 +373,12 @@ def main(argv=None) -> int:
         if plan.ref is not None:
             print_matrix(decode_c_matrix(plan.consts, lambda a: plan.exp_img[a]),
                          "C = A @ W (golden)")
-        return 0
+        if args.no_torch:
+            return 0
+        # No device bytes exist here, so this checks the ISS against PyTorch
+        # instead — worth having on its own, and it confirms the reference is
+        # wired up correctly before spending a board run on it.
+        return 1 if torch_verify(plan, plan.exp_img, "ISS golden image") else 0
 
     port = args.port or autodetect_port()
     try:
@@ -325,12 +393,23 @@ def main(argv=None) -> int:
                      "C = A @ W (from the FPGA)")
 
     print()
-    bad = compare(hw, plan.exp_img)
-    if bad:
-        print(f"FAILED: {bad}/{len(plan.exp_img)} output bytes differ from the golden image")
-        return 1
-    print(f"PASSED: all {len(plan.exp_img)} output bytes match the golden image")
-    return 0
+    bad_golden = compare(hw, plan.exp_img)
+    if bad_golden:
+        print(f"FAILED: {bad_golden}/{len(plan.exp_img)} output bytes differ "
+              f"from the golden image")
+    else:
+        print(f"PASSED: all {len(plan.exp_img)} output bytes match the golden image")
+
+    # Run the PyTorch check even when the golden compare already failed — the
+    # per-tensor breakdown says *which* output is wrong, which raw byte
+    # addresses do not, and it costs nothing once the bytes are off the board.
+    bad_torch = None if args.no_torch else torch_verify(plan, hw, "device output")
+    if bad_torch:
+        print(f"\nFAILED: {bad_torch} element(s) differ from the PyTorch reference")
+    elif bad_torch == 0:
+        print("PASSED: the device output matches the PyTorch reference")
+
+    return 1 if (bad_golden or bad_torch) else 0
 
 
 if __name__ == "__main__":

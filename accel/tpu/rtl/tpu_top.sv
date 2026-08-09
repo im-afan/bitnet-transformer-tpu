@@ -211,6 +211,8 @@ module tpu_top #(
     logic                  uart_run_start;
     logic [IMEM_AW-1:0]    uart_run_pc;
 
+    logic [31:0]           run_cycles;   // cycle_timer → UART 'T' command
+
     // ---- Host program/run path: external host ports OR'd with the UART host --
     //   Both paths write instruction memory and pulse host_run; they are used
     //   only while the core is idle, so a simple priority-mux is safe.
@@ -533,6 +535,20 @@ module tpu_top #(
     );
 
     // =========================================================================
+    // Run-length counter — times the scalar unit's `busy` interval in core
+    // clocks, i.e. one whole program run from 'G' to HALT. Read over UART with
+    // the 'T' command; nothing else in the core observes it.
+    // =========================================================================
+    cycle_timer #(
+        .W (32)
+    ) u_cycle_timer (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .busy   (busy),
+        .cycles (run_cycles)
+    );
+
+    // =========================================================================
     // UART host link — serial bring-up/debug path (docs/uart_host.md).
     //   uart_receiver/transmitter do the 8N1 wire framing; uart_interface is the
     //   command FSM. It shares the sram_controller with the DMA engine (mux above,
@@ -569,8 +585,9 @@ module tpu_top #(
         .clk   (clk),
         .rst_n (rst_n),
 
-        // arbitration: core has priority
-        .core_busy (busy),
+        // arbitration: core has priority ('T' excepted — see uart_interface.sv)
+        .core_busy   (busy),
+        .cycle_count (run_cycles),
 
         // receiver / transmitter
         .data_in           (uart_rx_data),

@@ -1,0 +1,193 @@
+; @primitive matmul_ternary
+; @clobbers r1-r30, cfg tlen/len/scalar
+;
+; C[M,N] int8 = requant(A[M,K] int8 @ W[K,N] ternary)   — the MXU workhorse.
+;
+; examples/tiled_matmul.tpu generalized: three nested tile loops (M, N, K) over
+; an 8x8 array, with only the current tiles resident, so A, W and C may each be
+; far larger than the scratchpad. The K flavours are the whole trick —
+;
+;     kt = 0        matmul          initialise the int32 partial
+;     kt = 1..K-2   matmul.acc      C += this tile
+;     kt = K-1      matmul.acc.rq   C += last tile, then requant int32 -> int8
+;
+; so the full contraction accumulates in int32 and exactly one requant happens,
+; at the end. (KTILES >= 2 is therefore required: there must be a distinct init
+; tile and a distinct requant tile. primitives.py asserts it.)
+;
+; **Layout: A and C are plain row-major [M,K] / [M,N].** The MXU wants an
+; activation tile as T rows of ROWS *contiguous* bytes, which a row-major matrix
+; is not, so the A tile is gathered one row at a time (T DMA fills of ROWS bytes
+; at DRAM stride K) and the C tile is scattered back the same way. That costs two
+; short loops and buys the thing that matters for composition: every activation
+; in the generated program is plain row-major, so the VPU primitives — which have
+; no notion of tiles — can consume any matmul's output directly.
+;
+; W is the exception: it is a *weight*, packed offline by quant.pack_ternary into
+; the tile-major [nt][kt] order this loop walks, 2 bits per trit, column-major
+; within a tile. It is read with one contiguous DMA per tile.
+;
+; Scratchpad footprint is fixed at T*8 + 16 + T*8*4 bytes regardless of M, K, N.
+;
+; @param A     DRAM byte address of A[M,K], int8, row-major
+; @param W     DRAM byte address of W[K,N], ternary, tile-major [nt][kt] packed
+; @param C     DRAM byte address of C[M,N], int8, row-major (output)
+; @param RQW   address of the requant {m0,n} word (int32; DRAM == scratchpad)
+; @param M     rows of A / C          (multiple of TT)
+; @param K     contraction length     (multiple of 8, KTILES >= 2)
+; @param N     columns of W / C       (multiple of 8)
+; @param ABUF  scratchpad buffer for one A tile      (TT*8 bytes)
+; @param WBUF  scratchpad buffer for one W tile      (16 bytes)
+; @param CBUF  scratchpad int32 accumulator          (TT*8*4 bytes)
+; @default TT  8
+
+; ---- array / problem geometry ------------------------------------------------
+.equ $ROWS   8                          ; MXU contraction dim (K per tile)
+.equ $COLS   8                          ; MXU output features (N per tile)
+.equ $T      {{TT}}                     ; tokens per matmul pass (cfg tlen)
+.equ $MTILES {{M}} // {{TT}}
+.equ $KTILES {{K}} // $ROWS
+.equ $NTILES {{N}} // $COLS
+.equ $WTILE  $COLS * (($ROWS * 2) // 8) ; packed ternary bytes per tile (= 16)
+
+.reg $abuf   r1
+.reg $wbuf   r2
+.reg $cbuf   r3
+.reg $rqw    r4
+.reg $abase  r5
+.reg $wbase  r6
+.reg $cbase  r7
+.reg $mt     r8
+.reg $nt     r9
+.reg $kt     r10
+.reg $mtiles r11
+.reg $ntiles r12
+.reg $ktiles r13
+.reg $klast  r14
+.reg $one    r15
+.reg $eight  r16
+.reg $tt     r17            ; row counter for the gather / scatter loops
+.reg $trows  r18            ; T
+.reg $kdim   r19            ; K  (row stride of A)
+.reg $ndim   r20            ; N  (row stride of C)
+.reg $wtile  r21
+.reg $arow   r22            ; A + mt*T*K      — top-left of this M block
+.reg $crow   r23            ; C + mt*T*N
+.reg $wcol   r24            ; W + nt*KTILES*WTILE
+.reg $ctil   r25            ; crow + nt*COLS  — top-left of this C tile
+.reg $at     r26            ; arow + kt*ROWS  — top-left of this A tile
+.reg $wt     r27
+.reg $s      r28            ; scratch/DRAM source cursor
+.reg $d      r29            ; scratch/DRAM destination cursor
+
+    setcfg  tlen,   $T
+    setcfg  scalar, {{RQW}}     ; MXU reads {m0,n} from this scratchpad address
+
+    li  $abuf,   {{ABUF}}
+    li  $wbuf,   {{WBUF}}
+    li  $cbuf,   {{CBUF}}
+    li  $rqw,    {{RQW}}
+    li  $abase,  {{A}}
+    li  $wbase,  {{W}}
+    li  $cbase,  {{C}}
+    li  $mtiles, $MTILES
+    li  $ntiles, $NTILES
+    li  $ktiles, $KTILES
+    li  $klast,  $KTILES - 1
+    li  $one,    1
+    li  $eight,  $ROWS
+    li  $trows,  $T
+    li  $kdim,   {{K}}
+    li  $ndim,   {{N}}
+    li  $wtile,  $WTILE
+
+    ; ---- stage the requant word once (identical DRAM/scratchpad address) ----
+    setcfg  len, 4
+    rdmem   $rqw, $rqw
+
+    li  $mt, 0
+$mloop:
+    cmps    $mt, $mtiles
+    bge     $mdone
+    muls    $arow, $mt, $trows
+    muls    $arow, $arow, $kdim
+    adds    $arow, $arow, $abase        ; arow = A + mt*T*K
+    muls    $crow, $mt, $trows
+    muls    $crow, $crow, $ndim
+    adds    $crow, $crow, $cbase        ; crow = C + mt*T*N
+    li      $nt, 0
+
+$nloop:
+    cmps    $nt, $ntiles
+    bge     $ndone
+    muls    $wcol, $nt, $ktiles
+    muls    $wcol, $wcol, $wtile
+    adds    $wcol, $wcol, $wbase        ; wcol = W + nt*KTILES*WTILE
+    muls    $ctil, $nt, $eight
+    adds    $ctil, $ctil, $crow         ; ctil = crow + nt*COLS
+    li      $kt, 0
+
+$kloop:
+    ; ---- gather one A tile: T rows of ROWS bytes, DRAM row stride K ----
+    muls    $at, $kt, $eight
+    adds    $at, $at, $arow
+    setcfg  len, $ROWS
+    li      $tt, 0
+$aloop:
+    cmps    $tt, $trows
+    bge     $adone
+    muls    $s, $tt, $kdim
+    adds    $s, $s, $at                 ; DRAM    A + (mt*T+tt)*K + kt*ROWS
+    muls    $d, $tt, $eight
+    adds    $d, $d, $abuf               ; scratch ABUF + tt*ROWS
+    rdmem   $d, $s
+    adds    $tt, $tt, $one
+    jmp     $aloop
+$adone:
+
+    ; ---- one W tile: contiguous, already in the layout the MXU wants ----
+    muls    $wt, $kt, $wtile
+    adds    $wt, $wt, $wcol
+    setcfg  len, $WTILE
+    rdmem   $wbuf, $wt
+
+    ; ---- the matmul flavour depends on where this tile sits in K ----
+    cmps    $kt, r0
+    bne     $knotfirst
+    matmul  $cbuf, $abuf, $wbuf             ; kt = 0: initialise the accumulator
+    jmp     $knext
+$knotfirst:
+    cmps    $kt, $klast
+    bne     $kmiddle
+    matmul.acc.rq  $cbuf, $abuf, $wbuf      ; kt = K-1: accumulate, then requant
+    jmp     $knext
+$kmiddle:
+    matmul.acc     $cbuf, $abuf, $wbuf      ; middle: accumulate in int32
+$knext:
+    adds    $kt, $kt, $one
+    cmps    $kt, $ktiles
+    blt     $kloop
+
+    ; ---- scatter the T x COLS int8 tile back into row-major C ----
+    ; The .rq store wrote int8 at cbuf + t*COLS, overlaying the accumulator's
+    ; low bytes, so the scratch row stride here is COLS, not COLS*4.
+    setcfg  len, $COLS
+    li      $tt, 0
+$cloop:
+    cmps    $tt, $trows
+    bge     $cdone
+    muls    $s, $tt, $eight
+    adds    $s, $s, $cbuf               ; scratch CBUF + tt*COLS
+    muls    $d, $tt, $ndim
+    adds    $d, $d, $ctil               ; DRAM    C + (mt*T+tt)*N + nt*COLS
+    wrmem   $s, $d
+    adds    $tt, $tt, $one
+    jmp     $cloop
+$cdone:
+
+    adds    $nt, $nt, $one
+    jmp     $nloop
+$ndone:
+    adds    $mt, $mt, $one
+    jmp     $mloop
+$mdone:

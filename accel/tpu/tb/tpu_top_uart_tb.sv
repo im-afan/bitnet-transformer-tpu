@@ -10,7 +10,16 @@
 //   2. 'W'  write the input tensors into external DRAM
 //   3. 'G'  start the program at PC 0
 //   4.      the program DMAs DRAM -> scratchpad, computes, DMAs results -> DRAM
-//   5. 'R'  read the result bytes back out of DRAM and compare to the golden image
+//   5. 'T'  read back how many core clocks the run took, and check that against
+//           the `busy` interval this testbench timed itself
+//   6. 'R'  read the result bytes back out of DRAM and compare to the golden image
+//
+// That whole sequence runs *twice*, for two different programs, with no reset in
+// between — the same thing two back-to-back run_program.py invocations do. It is
+// not redundant coverage: the scalar unit used to accept host IMEM/config writes
+// only in S_IDLE, which is reachable only out of reset, so the second program's
+// 'I' load was ACK'd and silently dropped and the board re-ran the first program
+// until the reset button was pressed. Keep PROG2 different from PROG.
 //
 // Nothing touches the scratchpad or IMEM by backdoor; the only path in/out is the
 // serial link + the real sram_controller driving the behavioral async-SRAM chip
@@ -26,14 +35,13 @@
 //
 //     cd ../../tpulang && python gen_vectors.py -p examples/relu_layer.tpu -o ../tpu/tb/vectors_uart
 //
+//     cd ../../tpulang && python gen_vectors.py -p examples/vector_add.tpu -o ../tpu/tb/vectors_uart2
+//
 // Geometry below MUST match gen_vectors.py (ROWS/COLS/T). A small UART_CPB keeps
 // the bit-banged serial traffic fast in simulation; the FSM is baud-agnostic.
 //
-// Run (or use `make uart`):
-//   make TEST=tpu_top_uart RTL="../rtl/tpu_top.sv ../rtl/scalar_unit.sv \
-//        ../rtl/mxu.sv ../rtl/vpu.sv ../rtl/scratchpad.sv ../rtl/dma.sv \
-//        ../rtl/sram.sv ../rtl/uart_interface.sv ../rtl/uart_receiver.sv \
-//        ../rtl/uart_transmitter.sv"
+// Run (or use `make uart`, which regenerates the vectors first):
+//   make TEST=tpu_top_uart        (RTL_tpu_top_uart in tb/Makefile = UART_RTL)
 // -----------------------------------------------------------------------------
 
 // Own vector directory (vectors_uart/) so `make uart` never clobbers the
@@ -46,6 +54,28 @@
 `endif
 `ifndef SPAD_EXP_FILE
   `define SPAD_EXP_FILE "vectors_uart/tpu_spad_exp.hex"
+`endif
+
+// Second program, loaded over the same link *without* an intervening reset —
+// this is the "run one program, then a different one" case that fails on the
+// board until the button is pressed. Point them at a different vector dir.
+`ifndef PROG2_FILE
+  `define PROG2_FILE "vectors_uart2/tpu_prog.hex"
+`endif
+`ifndef SPAD_IN2_FILE
+  `define SPAD_IN2_FILE "vectors_uart2/tpu_spad_in.hex"
+`endif
+`ifndef SPAD_EXP2_FILE
+  `define SPAD_EXP2_FILE "vectors_uart2/tpu_spad_exp.hex"
+`endif
+
+// VPU activation LUTs — not vectors but fixed ROM contents, shared by both
+// programs and identical to what the bitstream burns in (accel/tpulang/luts.py).
+`ifndef GELU_LUT_FILE
+  `define GELU_LUT_FILE "../rtl/luts/gelu_lut.hex"
+`endif
+`ifndef EXP_LUT_FILE
+  `define EXP_LUT_FILE "../rtl/luts/exp_lut.hex"
 `endif
 
 module tpu_top_uart_tb;
@@ -68,8 +98,11 @@ module tpu_top_uart_tb;
     localparam int DEPTH     = (1 << ADDR_W);  // address span we scan for tensors
     localparam int IMEM_DEP  = (1 << IMEM_AW);
 
-    localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47;
+    localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47,
+                     TCMD = 8'h54;
     localparam [7:0] ACK  = 8'h06, NAK  = 8'h15;
+
+    localparam int   CLK_NS = 10;   // clock period in ns; matches `always #5` below
 
     // ---- Clock / reset ------------------------------------------------------
     logic clk = 1'b0;
@@ -102,7 +135,8 @@ module tpu_top_uart_tb;
         .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W),
         .REG_AW(REG_AW), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
         .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W),
-        .UART_CPB(CPB), .UART_RX_TIMEOUT(0)
+        .UART_CPB(CPB), .UART_RX_TIMEOUT(0),
+        .GELU_INIT(`GELU_LUT_FILE), .EXP_INIT(`EXP_LUT_FILE)
     ) dut (
         .clk(clk), .rst_n(rst_n),
         .host_run(host_run), .boot_pc(boot_pc),
@@ -121,6 +155,22 @@ module tpu_top_uart_tb;
     wire mem_drives = (sram_ce == 1'b0) && (sram_oen == 1'b0) && (sram_we == 1'b1);
     assign #3 sram_data = mem_drives ? sram_mem[sram_addr] : {MEM_DATA_W{1'bz}};
     always @(posedge sram_we) if (sram_ce == 1'b0) sram_mem[sram_addr] <= sram_data;
+
+    // ---- Independent measure of the run length ------------------------------
+    //
+    // What `cycle_timer` inside the DUT should be reporting, derived a different
+    // way: the simulation time between the edges of the `busy` pin, divided by
+    // the clock period. `busy` only ever changes at a clock edge, so that
+    // division is exact, and it shares no logic with the counter under test —
+    // a counter that miscounted, failed to restart, or never froze would have
+    // to be wrong in the same way as the simulator's clock to agree with this.
+    time t_busy_rise, t_busy_fall;
+    always @(posedge busy) t_busy_rise = $time;
+    always @(negedge busy) t_busy_fall = $time;
+
+    function automatic int unsigned expected_run_clocks();
+        return int'((t_busy_fall - t_busy_rise) / CLK_NS);
+    endfunction
 
     // ---- Vector-file backing stores -----------------------------------------
     logic [31:0] prog_words [0:IMEM_DEP-1];
@@ -235,6 +285,21 @@ module tpu_top_uart_tb;
         if (st !== ACK) begin errors++; $display("  FAIL: go, got %02h", st); end
     endtask
 
+    // 'T' read the run-length counter: one command byte, 4 bytes back MSB first,
+    // no status.
+    task automatic uart_read_timer(output [31:0] cycles);
+        logic [7:0] b;
+        fork
+            tx_bit_byte(TCMD);
+            begin
+                for (int i = 0; i < 4; i++) begin
+                    rx_bit_byte(b);
+                    cycles = {cycles[23:0], b};
+                end
+            end
+        join
+    endtask
+
     // Walk the sparse tensor/expected images and emit one command per contiguous
     // run of defined bytes (keeps the frame count small).
     task automatic uart_write_all_inputs();
@@ -262,9 +327,37 @@ module tpu_top_uart_tb;
     endtask
 
     int nprog;
-    task automatic test_program();
+
+    // Blank the vector arrays so a second $readmemh cannot leave bytes of the
+    // previous program's image behind — the run-scanners key off `defined8`.
+    task automatic clear_vectors();
+        for (int i = 0; i < IMEM_DEP; i++) prog_words[i] = 32'bx;
+        for (int i = 0; i < DEPTH; i++)   begin in_bytes[i] = 8'bx; exp_bytes[i] = 8'bx; end
+    endtask
+
+    // Wait for the run to finish. `done` is *level*-held in S_HALT, so after the
+    // first program it is already high when the second 'G' goes out; waiting on
+    // `done` alone would fall straight through and "observe" a halt that never
+    // happened. Wait for the core to actually pick the run up (`busy`) first,
+    // and bound that wait so a core that never starts is reported as such.
+    task automatic wait_for_halt(input int start_limit);
+        int n;
+        n = 0;
+        while (!busy && n < start_limit) begin @(negedge clk); n++; end
+        checks++;
+        if (!busy) begin
+            errors++;
+            $display("  FAIL: core never started after 'G' (still done=%0b)", done);
+        end else begin
+            do @(negedge clk); while (!done);
+        end
+    endtask
+
+    task automatic test_program(input string label);
         nprog = 0;
         while (nprog < IMEM_DEP && defined32(prog_words[nprog])) nprog++;
+
+        $display("---- %0s ----", label);
 
         // 1) program -> IMEM, 2) tensors -> DRAM, all over UART
         uart_load_program(nprog);
@@ -275,18 +368,33 @@ module tpu_top_uart_tb;
         // 3) start, 4) wait for the program to halt (observed via `done`)
         uart_go(24'd0);
         $display("issued run; waiting for halt...");
-        do @(negedge clk); while (!done);
-        $display("program halted at pc=%0d", pc_dbg);
+        wait_for_halt(200_000);
+        $display("program halted at pc=%0d (expected %0d)", pc_dbg, nprog - 1);
 
         checks++;
         if (busy) begin errors++; $display("  FAIL: core still busy after halt"); end
 
-        // 5) read results back over UART and compare
-        uart_check_all_outputs();
+        // 5) 'T' — the device's own measure of how long that run took. Checked
+        //    per program, not once at the end: the counter must restart on every
+        //    run, and program B is the only thing that can prove it does.
+        begin
+            logic [31:0] cycles;
+            int unsigned want;
+            uart_read_timer(cycles);
+            want = expected_run_clocks();
+            checks++;
+            if (cycles !== want) begin
+                errors++;
+                $display("  FAIL: 'T' reported %0d clocks, busy was high for %0d",
+                         cycles, want);
+            end else begin
+                $display("run took %0d core clocks (device timer agrees)", cycles);
+            end
+        end
 
-        $display("==== done: %0d checks, %0d errors ====", checks, errors);
-        if (errors == 0) $display("TPU_TOP_UART: ALL TESTS PASSED");
-        else             $display("TPU_TOP_UART: FAILED (%0d errors)", errors);
+        // 6) read results back over UART and compare
+        uart_check_all_outputs();
+        $display("---- %0s: %0d checks, %0d errors so far ----", label, checks, errors);
     endtask
 
     // =========================================================================
@@ -296,22 +404,34 @@ module tpu_top_uart_tb;
         // int nprog;
 
         for (int i = 0; i < SRAM_SZ; i++) sram_mem[i] = 8'h00;
-        $readmemh(`PROG_FILE, prog_words);
-        $readmemh(`SPAD_IN_FILE, in_bytes);
-        $readmemh(`SPAD_EXP_FILE, exp_bytes);
 
         repeat (4) @(posedge clk);
         rst_n = 1'b1;
         repeat (4) @(posedge clk);
 
-
         $display("==== TPU UART end-to-end testbench (%0dx%0d array) ====", ROWS, COLS);
 
-        // run program twice without reset
-        test_program();
+        // Two *different* programs back to back over the same link, with no
+        // reset in between — exactly what run_program.py does on the board when
+        // it is invoked twice with different --program arguments.
+        clear_vectors();
+        $readmemh(`PROG_FILE, prog_words);
+        $readmemh(`SPAD_IN_FILE, in_bytes);
+        $readmemh(`SPAD_EXP_FILE, exp_bytes);
+        test_program("program A");
+
         repeat (100) @(posedge clk);
-        test_program();
-        
+
+        clear_vectors();
+        $readmemh(`PROG2_FILE, prog_words);
+        $readmemh(`SPAD_IN2_FILE, in_bytes);
+        $readmemh(`SPAD_EXP2_FILE, exp_bytes);
+        test_program("program B (no reset in between)");
+
+        $display("==== done: %0d checks, %0d errors ====", checks, errors);
+        if (errors == 0) $display("TPU_TOP_UART: ALL TESTS PASSED");
+        else             $display("TPU_TOP_UART: FAILED (%0d errors)", errors);
+
         $finish;
     end
 

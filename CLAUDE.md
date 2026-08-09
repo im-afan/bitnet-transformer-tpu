@@ -24,7 +24,18 @@ python accel/cuda/tests/test_cuda_mha.py    # CUDA kernel vs. torch reference �
 needs a CUDA toolchain + GPU. It asserts max abs diff < 1e-2 against the einsum reference.
 
 The venv is checked in at `.venv/` (Python 3.12). There is no requirements.txt; deps are just
-`torch` (+ jupyter for `model/notebook.ipynb`).
+`torch` (+ jupyter for `model/notebook.ipynb`), plus `pyserial` for the FPGA host driver.
+
+TPU stack (these are plain scripts, not `-m` modules — each adds its own directory to
+`sys.path`, so run them by path from the repo root):
+
+```bash
+python accel/tpulang/gen_vectors.py -p accel/tpulang/examples/relu_layer.tpu
+python accel/tpulang/torch_ref.py                         # example kernels: ISS vs PyTorch
+python accel/tpulang/pytpu/examples/transformer_layer.py  # build + verify one layer
+python accel/tpu/host/run_program.py --dry-run            # toolchain only, no board
+cd accel/tpu/tb && make list                              # RTL testbenches (Icarus)
+```
 
 ## Architecture
 
@@ -68,9 +79,16 @@ the last 3 (these are gitignored; committed checkpoints like `colab_vanilla_mha.
 - **`cuda/`** (`kernels.cu` + `bindings.cpp`) — hand-written CUDA MHA/GQA kernel, the GPU
   reference. Loaded into PyTorch as an extension. Correctness is defined by matching
   `mha_torch`.
-- **`tpu/`** — a SystemVerilog TPU targeting an FPGA, **early / mostly scaffolding** (see
-  `accel/tpu/README.md` and `accel/tpu/docs/`). No synthesizable RTL of the array yet; blocks
-  are to be validated against golden vectors exported from `model/`.
+- **`tpu/`** — a SystemVerilog TPU running on a **Digilent Cmod A7-35T** (see
+  `accel/tpu/README.md` and `accel/tpu/docs/`). The array, VPU, banked scratchpad, DMA +
+  external SRAM, scalar unit and UART link are all synthesizable and fit; `host/run_program.py`
+  loads a program over UART, runs it, and checks the readback against both the ISS and
+  PyTorch. Stubbed: the inter-TPU LINK (`wrneigh` is a completing no-op).
+- **`tpulang/`** — the TPU's software stack: the `.tpu` assembly language + `assembler.py`,
+  `iss.py` (bit-exact with the RTL), `luts.py` (the VPU's gelu/exp ROMs), `torch_ref.py`
+  (independent PyTorch checks), and `gen_vectors.py` (golden vectors for `tpu/tb/`).
+  `tpulang/pytpu/` composes parameterized `.tpu` templates into whole layers — it builds one
+  quantized transformer layer in 861 of 1024 instruction words.
 
 When touching attention numerics, keep the three implementations in sync: `mha_torch`
 (reference), the CUDA kernel, and any future TPU block — they all implement the same 5-D layout

@@ -10,6 +10,7 @@
 //   'W' 0x57  write SRAM : hdr = CMD + A2 A1 A0 + L1 L0 + data[len]-> ACK/NAK
 //   'I' 0x49  write IMEM : hdr = CMD + A2 A1 A0 + L1 L0 + data[len]-> ACK/NAK
 //   'G' 0x47  go / run   : hdr = CMD + A2 A1 A0                    -> ACK/NAK
+//   'T' 0x54  read timer : hdr = CMD                               -> 4 data bytes
 //
 //   * Addresses are 3 bytes, big-endian. For 'R'/'W' this is a 19-bit SRAM byte
 //     address; for 'I' it is an instruction-word index; for 'G' it is the boot PC.
@@ -17,12 +18,24 @@
 //     (one 32-bit instruction word per 4 bytes, MSB first); words are written at
 //     ascending instruction addresses.
 //   * 'G' pulses `run_start` with `run_pc = addr` — no length, no data.
+//   * 'T' is the whole frame: no address, no length, nothing to validate. It
+//     replies with `cycle_count` as 4 bytes, MSB first, and no status byte —
+//     header-less like a read, because the length is fixed and both ends know it.
 //
 // Arbitration (core priority): the scalar unit owns the machine. Any command that
 // arrives while `core_busy` is high is rejected with NAK and touches nothing —
 // the SRAM mux in tpu_top hands the controller to the DMA engine while a program
 // runs, so the host and the core never contend. The host regains access once the
 // program halts (`core_busy` low).
+//
+// **'T' is exempt from that rule**, and is the only command that is. It reads a
+// counter and nothing else: no SRAM access, no IMEM write, no run trigger, so
+// there is nothing for it to contend over and no state for it to corrupt
+// mid-run. Answering it while the core runs is also the useful case — it is how
+// a host watches a long program make progress, since a rising count is the one
+// piece of live evidence this link can give that the core is still working
+// rather than wedged. (The count freezing is not by itself proof the run
+// finished: it also stops if the core never started.)
 //
 // The UART receiver/transmitter live outside this module (instantiated in
 // tpu_top); this block consumes decoded bytes (data_in/receiver_valid), emits
@@ -43,6 +56,13 @@ module uart_interface #(
 
     // arbitration: high while the scalar unit is running (see file header)
     input  logic core_busy,
+
+    // run-length counter (cycle_timer.sv), reported verbatim by the 'T' command.
+    // Free-running relative to this FSM: sampled once, at the clock the command
+    // byte is decoded, so the four bytes that go out are one coherent reading
+    // and not a value that moved between them. Tie to '0 in an image with no
+    // scalar unit behind it.
+    input  logic [31:0] cycle_count,
 
     // receiver interface (from uart_receiver)
     input  logic [7:0] data_in,
@@ -94,30 +114,39 @@ module uart_interface #(
     localparam [7:0] CMD_WRITE = 8'h57; // 'W'  write SRAM
     localparam [7:0] CMD_IMEM  = 8'h49; // 'I'  write instruction memory
     localparam [7:0] CMD_GO    = 8'h47; // 'G'  start program at addr
+    localparam [7:0] CMD_TIMER = 8'h54; // 'T'  read the run-length counter
     localparam [7:0] STAT_ACK  = 8'h06;
     localparam [7:0] STAT_NAK  = 8'h15;
 
-    // op selector, latched in IDLE from the command byte
+    // bytes in a 'T' reply (the counter, MSB first)
+    localparam integer TIMER_BYTES = 4;
+
+    // op selector, latched in IDLE from the command byte. 'T' needs no entry: it
+    // has no header to collect and no validation to branch on, so IDLE sends it
+    // straight to the reply states without ever consulting `op`.
     localparam [1:0] OP_RD = 2'd0, OP_WR = 2'd1, OP_IMEM = 2'd2, OP_GO = 2'd3;
 
-    localparam [3:0]
-        IDLE             = 4'd0,
-        RX_ADDR          = 4'd1,   // collect ADDR_BYTES address bytes (MSB first)
-        RX_LEN           = 4'd2,   // collect LENGTH_BYTES length bytes (MSB first)
-        VALIDATE         = 4'd3,   // arbitration + range check; branch per op
-        RD_ISSUE         = 4'd4,   // issue one SRAM read
-        RD_WAIT          = 4'd5,   // wait for read data
-        RD_TX            = 4'd6,   // hand the byte to the transmitter
-        RD_TX_WAIT       = 4'd7,   // wait for the byte to finish on the wire
-        WR_RX            = 4'd8,   // wait for a payload byte from the host
-        WR_ISSUE         = 4'd9,   // issue one SRAM write
-        WR_WAIT          = 4'd10,  // wait for write to commit
-        IMEM_RX          = 4'd11,  // collect 4 payload bytes into one instr word
-        IMEM_WR          = 4'd12,  // write one instruction word
-        SEND_STATUS      = 4'd13,  // send ACK/NAK
-        SEND_STATUS_WAIT = 4'd14;  // wait for the status byte to finish
+    // 5 bits, not 4: the two timer states take the encoding past 15.
+    localparam [4:0]
+        IDLE             = 5'd0,
+        RX_ADDR          = 5'd1,   // collect ADDR_BYTES address bytes (MSB first)
+        RX_LEN           = 5'd2,   // collect LENGTH_BYTES length bytes (MSB first)
+        VALIDATE         = 5'd3,   // arbitration + range check; branch per op
+        RD_ISSUE         = 5'd4,   // issue one SRAM read
+        RD_WAIT          = 5'd5,   // wait for read data
+        RD_TX            = 5'd6,   // hand the byte to the transmitter
+        RD_TX_WAIT       = 5'd7,   // wait for the byte to finish on the wire
+        WR_RX            = 5'd8,   // wait for a payload byte from the host
+        WR_ISSUE         = 5'd9,   // issue one SRAM write
+        WR_WAIT          = 5'd10,  // wait for write to commit
+        IMEM_RX          = 5'd11,  // collect 4 payload bytes into one instr word
+        IMEM_WR          = 5'd12,  // write one instruction word
+        SEND_STATUS      = 5'd13,  // send ACK/NAK
+        SEND_STATUS_WAIT = 5'd14,  // wait for the status byte to finish
+        TMR_TX           = 5'd15,  // hand one counter byte to the transmitter
+        TMR_TX_WAIT      = 5'd16;  // wait for that byte to finish on the wire
 
-    logic [3:0] state;
+    logic [4:0] state;
 
     // receiver_valid and transmitter_busy are level-held across many cycles, so we
     // work off their edges: a rising valid = one new byte, a falling busy = one
@@ -167,6 +196,7 @@ module uart_interface #(
     logic [7:0]           rd_byte, wr_byte, status_byte;
     logic [31:0]          word;    // instruction word under assembly
     logic [31:0]          to_cnt;  // inter-byte timeout counter
+    logic [31:0]          tmr;     // 'T': counter snapshot, shifted out MSB first
 
     // number of instruction words in an 'I' payload (len is bytes, 4 per word)
     wire [LEN_BITS-1:0] nwords = len >> 2;
@@ -224,6 +254,7 @@ module uart_interface #(
             status_byte           <= 8'b0;
             word                  <= 32'b0;
             to_cnt                <= 32'b0;
+            tmr                   <= 32'b0;
             rx_hold               <= 8'b0;
             rx_pending            <= 1'b0;
             rx_overrun            <= 1'b0;
@@ -249,6 +280,11 @@ module uart_interface #(
                             CMD_WRITE: begin op <= OP_WR;   state <= RX_ADDR; end
                             CMD_IMEM:  begin op <= OP_IMEM; state <= RX_ADDR; end
                             CMD_GO:    begin op <= OP_GO;   state <= RX_ADDR; end
+                            // 'T' is a complete frame on its own: sample the
+                            // counter now (see the port comment on why it is
+                            // sampled once) and go straight to the reply. No
+                            // header, no VALIDATE, no core_busy check.
+                            CMD_TIMER: begin tmr <= cycle_count; state <= TMR_TX; end
                             default:   begin status_byte <= STAT_NAK; state <= SEND_STATUS; end
                         endcase
                     end
@@ -373,6 +409,26 @@ module uart_interface #(
                         status_byte <= STAT_ACK;
                         state       <= SEND_STATUS;
                     end else state <= IMEM_RX;
+                end
+
+                // ---------- read the run-length counter ----------
+                // Four bytes MSB first out of the snapshot taken in IDLE, then
+                // straight back to IDLE — like a read reply, no trailing status.
+                // `idx` counts them; IDLE cleared it on the way in.
+                TMR_TX: begin
+                    if (!transmitter_busy) begin
+                        transmitter_start <= 1'b1;
+                        data_out          <= tmr[31:24];
+                        tmr               <= {tmr[23:0], 8'b0};
+                        state             <= TMR_TX_WAIT;
+                    end
+                end
+                TMR_TX_WAIT: begin
+                    if (tx_done) begin
+                        idx <= idx + 1'b1;
+                        if (idx + 1'b1 == TIMER_BYTES) state <= IDLE;
+                        else                           state <= TMR_TX;
+                    end
                 end
 
                 // ---------- status reply ----------
