@@ -1,18 +1,15 @@
-# tpulang & pytpu
+# tpulang
 
 **tpulang** is the TPU's assembly language: a human-writable text form that lowers
 **1:1** onto the scalar unit's [instruction set](../tpu/docs/isa.md). A `.tpu` source
 file assembles into the 32-bit machine words the TPU's instruction BRAM executes.
-**pytpu** sits one level up: it *generates* tpulang by instantiating hand-written
-parameterized templates from Python. It exists and builds a whole transformer layer — see
-[§5](#5-pytpu) and [`pytpu/README.md`](pytpu/README.md).
 
 ```
-   pytpu/lib/*.tpu  ──pytpu──►  kernel.tpu  ──assembler.py──►  32-bit words
-   (templates)                      │                              │
-                                    │                              ├──►  instruction BRAM  ──►  scalar_unit.sv
-                                    │                              └──iss.py──►  golden scratchpad image
-                                    └──torch_ref.py──►  independent PyTorch check
+   kernel.tpu  ──assembler.py──►  32-bit words
+       │                              │
+       │                              ├──►  instruction BRAM  ──►  scalar_unit.sv
+       │                              └──iss.py──►  golden scratchpad image
+       └──torch_ref.py──►  independent PyTorch check
 ```
 
 The toolchain (all in this directory):
@@ -25,7 +22,6 @@ The toolchain (all in this directory):
 | [`gen_vectors.py`](gen_vectors.py) | ties both together: assemble + simulate → golden test vectors for `tpu_top_tb.sv` |
 | [`torch_ref.py`](torch_ref.py) | PyTorch references for the examples — an independent check on the ISS *and* the FPGA |
 | [`examples/`](examples)       | annotated `.tpu` programs (vector add, relu layer, tiled matmul, VPU matmul, softmax) |
-| [`pytpu/`](pytpu)             | template composer one level up — builds whole layers out of `.tpu` primitives |
 
 For the machine-level encoding and per-opcode semantics, read the
 [ISA reference](../tpu/docs/isa.md) alongside this — this doc is the *language* (syntax,
@@ -303,58 +299,3 @@ python torch_ref.py -p examples/relu_layer.tpu
 The same references run against **real hardware** — `accel/tpu/host/run_program.py`
 calls `torch_ref.verify()` on the bytes it reads back off the FPGA, so one command
 checks the device against both the ISS and PyTorch.
-
----
-
-## 5. pytpu
-
-[`pytpu/`](pytpu) is the Python layer above tpulang: kernels written in terms of tensors
-and primitives instead of hand-managed registers and addresses. It exists — see
-[`pytpu/README.md`](pytpu/README.md) — but it is a **composer, not a compiler**, which is a
-smaller and more concrete thing than the DSL sketched below.
-
-A primitive is a hand-written, parameterized `.tpu` template (`pytpu/lib/*.tpu`); Python
-instantiates them with concrete shapes and addresses and concatenates the result into one
-ordinary `.tpu` file that this toolchain then handles unchanged. So the tiling stays
-hand-written tpulang, and `tiled_matmul.tpu`'s loop nest gets *reused* rather than
-re-derived by codegen. The worked example builds one quantized transformer layer —
-attention, softmax, GELU feed-forward and two LayerNorms — in 861 of the 1024 available
-instruction words, and checks every intermediate against an exact integer reference:
-
-```bash
-python pytpu/examples/transformer_layer.py
-```
-
-What is **not** implemented from the design below is the compiler part: no automatic
-tiling, no fusion, no liveness-driven elision of the DMA between primitives. The ISA has no
-call/return, so every instantiation is inlined and instruction memory (2¹⁰ words) is the
-binding budget. The original design intent, for reference:
-
-### Tensor
-
-Represents an int8 or ternary tensor in TPU memory. Fields:
-- `dtype` (`int8`, `int2`): element type.
-- `shape` (`Tuple[int]`): tensor shape.
-- `scale` (`float`): quantization scale. **Not** stored in TPU RAM — a compile-time value
-  only, used to pick requantization factors around matmuls.
-
-### Scalar
-
-A 32-bit value in memory: either an int32, or a `{M0, n}` pair (12-bit `M0`, 4-bit `n`)
-encoding a requantization factor.
-
-### Primitives
-
-Tensor operations that map to a single TPU instruction (matmul, vector add/dot, ReLU, …).
-Everything else lowers to a sequence of primitives — e.g. softmax → `redmax`, `sadd`,
-`exp`, `redsum`, `sdiv` (exactly the [softmax example](examples/softmax_row.tpu)).
-
-### Matmuls
-
-The compiler tiles `(ternary × int8)` matmuls to the array size and expands
-`(int8 × int8)` matmuls into VPU dot-product sequences.
-
-### Memory management
-
-The compiler inserts the `rdmem`/`wrmem` movement around primitives. Automatic fusion to
-avoid redundant scratchpad traffic is a later consideration.

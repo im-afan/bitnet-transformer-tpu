@@ -51,7 +51,7 @@ def mha_torch(Q, K, V):
 
     attention_scores = torch.einsum("btkgh,bskh->btskg", Q, K) / math.sqrt(head_dim)
 
-    attention_scores = F.softmax(attention_scores + mask, dim=2)  # btskg
+    attention_scores = F.relu(attention_scores + mask, dim=2)  # btskg
     A = torch.einsum("btskg,bskh->btkgh", attention_scores, V).reshape(
         [batch_size, n_tokens, q_heads * head_dim]
     )
@@ -231,7 +231,7 @@ class Expert(nn.Module):
         self.fc2 = make_linear(f, d, use_ternary)
 
     def forward(self, x):
-        return self.fc2(F.gelu(self.fc1(x)))
+        return self.fc2(F.relu(self.fc1(x)))
 
 
 class MoE(nn.Module):
@@ -296,7 +296,7 @@ class Transformer(nn.Module):
         else:
             self.ff = nn.Sequential(
                 make_linear(d, f, use_ternary),
-                nn.GELU(),
+                nn.ReLU(),
                 make_linear(f, d, use_ternary),
             )
 
@@ -416,8 +416,8 @@ def adder_ternary_vanilla():
     model = Model(
         len(numbers_data.VOCAB),
         d=128,
-        f=512,
-        layers=4,
+        f=128,
+        layers=2,
         q_heads=4,
         kv_heads=4,
         use_moe=False,

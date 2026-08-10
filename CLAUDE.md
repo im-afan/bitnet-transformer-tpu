@@ -32,7 +32,6 @@ TPU stack (these are plain scripts, not `-m` modules — each adds its own direc
 ```bash
 python accel/tpulang/gen_vectors.py -p accel/tpulang/examples/relu_layer.tpu
 python accel/tpulang/torch_ref.py                         # example kernels: ISS vs PyTorch
-python accel/tpulang/pytpu/examples/transformer_layer.py  # build + verify one layer
 python accel/tpu/host/run_program.py --dry-run            # toolchain only, no board
 cd accel/tpu/tb && make list                              # RTL testbenches (Icarus)
 ```
@@ -87,8 +86,6 @@ the last 3 (these are gitignored; committed checkpoints like `colab_vanilla_mha.
 - **`tpulang/`** — the TPU's software stack: the `.tpu` assembly language + `assembler.py`,
   `iss.py` (bit-exact with the RTL), `luts.py` (the VPU's gelu/exp ROMs), `torch_ref.py`
   (independent PyTorch checks), and `gen_vectors.py` (golden vectors for `tpu/tb/`).
-  `tpulang/pytpu/` composes parameterized `.tpu` templates into whole layers — it builds one
-  quantized transformer layer in 861 of 1024 instruction words.
 
 When touching attention numerics, keep the three implementations in sync: `mha_torch`
 (reference), the CUDA kernel, and any future TPU block — they all implement the same 5-D layout

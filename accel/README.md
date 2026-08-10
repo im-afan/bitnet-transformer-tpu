@@ -12,12 +12,8 @@ is validated against the PyTorch golden model.
   instruction-set simulator that is bit-exact with the RTL, the activation-LUT generator,
   PyTorch references for the example kernels, and the golden-vector generator that feeds
   `tpu/tb/`. See [`tpulang/README.md`](tpulang/README.md).
-  - **`tpulang/pytpu/`** — a Python *composer* one level up: it instantiates hand-written
-    parameterized `.tpu` templates and concatenates them into an ordinary `.tpu` file. It
-    builds a whole quantized transformer layer this way. See
-    [`tpulang/pytpu/README.md`](tpulang/pytpu/README.md).
 
 There is no `compiler/`: the job that name implied — turning a model into a TPU instruction
-stream — is split between `tpulang/` (language + tools) and `tpulang/pytpu/` (composition),
-and neither traces PyTorch with `torch.fx`. `torch_ref.py` runs in the other direction, as
-an independent check on kernels the ISS and the FPGA have already executed.
+stream — is done by hand in `tpulang/`, and nothing traces PyTorch with `torch.fx`.
+`torch_ref.py` runs in the other direction, as an independent check on kernels the ISS and
+the FPGA have already executed.

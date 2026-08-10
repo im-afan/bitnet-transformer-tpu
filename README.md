@@ -23,7 +23,6 @@ accel/            accelerator backends, each validated against the golden model
     docs/             microarchitecture notes
   tpulang/          the TPU's software stack: assembly language, assembler,
                     bit-exact ISS, activation LUTs, PyTorch references
-    pytpu/            composes `.tpu` templates into whole transformer layers
 ```
 
 ## Running
@@ -40,7 +39,6 @@ The TPU stack runs from the repo root too:
 
 ```bash
 python accel/tpulang/torch_ref.py                        # example kernels: ISS vs PyTorch
-python accel/tpulang/pytpu/examples/transformer_layer.py # build + verify a whole layer
 python accel/tpu/host/run_program.py --dry-run           # toolchain only, no board
 cd accel/tpu/tb && make list                             # RTL testbenches (Icarus)
 ```

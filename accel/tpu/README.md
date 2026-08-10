@@ -52,9 +52,9 @@ time out against the echo bitstream.
 6. `host/` — **next.** Wire the FPGA in as a selectable model backend, mirroring the
    `use_custom_attention` path. Today the host runs standalone `.tpu` kernels, not
    `model/transformer.py` itself.
-7. Fit a second transformer layer. `pytpu` builds one layer in 861 of 1024 instruction
-   words; the lever is hoisting the four inlined `matmul_ternary` instances into one
-   parameter-driven copy (`../tpulang/pytpu/README.md` §6).
+7. Fit a second transformer layer. One quantized layer already measures 861 of 1024
+   instruction words, so the lever is hoisting the four inlined ternary matmuls into a
+   single parameter-driven copy.
 
 Known gaps on hardware: the inter-TPU LINK (`wrneigh`) is stubbed in `tpu_top.sv` and
 completes as a no-op, and `UART_RX_TIMEOUT` is 0 in every board definition, so a corrupted
