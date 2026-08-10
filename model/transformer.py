@@ -13,29 +13,6 @@ device = torch.device("cpu")
 if torch.cuda.is_available():
     device = torch.device("cuda")
 
-# CUDA reference accelerator now lives under accel/cuda/. Resolve its sources
-# relative to the repo root so the extension loads regardless of cwd.
-# _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# _CUDA_DIR = os.path.join(_REPO_ROOT, "accel", "cuda")
-# mha_cuda = load(
-#    name="mha_cuda",
-#    sources=[
-#        os.path.join(_CUDA_DIR, "kernels.cu"),
-#        os.path.join(_CUDA_DIR, "bindings.cpp"),
-#    ],
-#    verbose=True,
-# )
-
-
-def slow_mha_cuda(Q, K, V):
-    batch_size = Q.shape[0]
-    n_tokens = Q.shape[1]
-    q_heads = Q.shape[2] * Q.shape[3]
-    head_dim = Q.shape[4]
-
-    out, _ = mha_cuda.mha_custom(Q, K, V)
-    out = out.reshape([batch_size, n_tokens, q_heads * head_dim])
-    return out
 
 
 def mha_torch(Q, K, V):
@@ -51,7 +28,7 @@ def mha_torch(Q, K, V):
 
     attention_scores = torch.einsum("btkgh,bskh->btskg", Q, K) / math.sqrt(head_dim)
 
-    attention_scores = F.relu(attention_scores + mask, dim=2)  # btskg
+    attention_scores = F.relu(attention_scores + mask)  # btskg revert to softmax if training bad
     A = torch.einsum("btskg,bskh->btkgh", attention_scores, V).reshape(
         [batch_size, n_tokens, q_heads * head_dim]
     )
@@ -215,56 +192,10 @@ class MultiHeadAttention(nn.Module):
         V = torch.reshape(V, [batch_size, n_tokens, self.kv_heads, self.head_dim])
 
         A = None
-        if use_custom_attention:
-            A = slow_mha_cuda(Q, K, V)
-        else:
-            A = mha_torch(Q, K, V)
+        A = mha_torch(Q, K, V)
 
         O = self.Wo(A)
         return O + X
-
-
-class Expert(nn.Module):
-    def __init__(self, d, f, use_ternary=False):
-        super().__init__()
-        self.fc1 = make_linear(d, f, use_ternary)
-        self.fc2 = make_linear(f, d, use_ternary)
-
-    def forward(self, x):
-        return self.fc2(F.relu(self.fc1(x)))
-
-
-class MoE(nn.Module):
-    def __init__(self, d, f, n_experts=8, top_k=2, use_ternary=False):
-        super().__init__()
-        self.n_experts = n_experts
-        self.top_k = top_k
-        # Gate stays full-precision; quantizing the router hurts routing quality.
-        self.gate = nn.Linear(d, n_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [Expert(d, f, use_ternary) for _ in range(n_experts)]
-        )
-
-    def forward(self, X):
-        # X: (B, T, d)
-        B, T, d = X.shape
-        X_flat = X.view(B * T, d)  # (B*T, d)
-
-        logits = self.gate(X_flat)  # (B*T, E)
-        weights, indices = torch.topk(logits, self.top_k, dim=-1)  # (B*T, k)
-        weights = F.softmax(weights, dim=-1)  # (B*T, k)
-
-        out = torch.zeros_like(X_flat)
-        for k in range(self.top_k):
-            expert_idx = indices[:, k]  # (B*T,)
-            w = weights[:, k].unsqueeze(1)  # (B*T, 1)
-            for e in range(self.n_experts):
-                mask = expert_idx == e
-                if mask.any():
-                    out[mask] += w[mask] * self.experts[e](X_flat[mask])
-
-        return out.view(B, T, d)
-
 
 class Transformer(nn.Module):
     def __init__(
@@ -274,14 +205,10 @@ class Transformer(nn.Module):
         q_heads,
         kv_heads,
         head_dim,
-        n_experts=8,
-        top_k=2,
-        use_moe=False,
         use_ternary=False,
     ):
         super().__init__()
 
-        self.use_moe = use_moe
         self.use_ternary = use_ternary
 
         self.attention = MultiHeadAttention(
@@ -289,16 +216,12 @@ class Transformer(nn.Module):
         )
         self.norm1 = nn.LayerNorm(d)
 
-        if use_moe:
-            self.ff = MoE(
-                d, f, n_experts=n_experts, top_k=top_k, use_ternary=use_ternary
-            )
-        else:
-            self.ff = nn.Sequential(
-                make_linear(d, f, use_ternary),
-                nn.ReLU(),
-                make_linear(f, d, use_ternary),
-            )
+        
+        self.ff = nn.Sequential(
+            make_linear(d, f, use_ternary),
+            nn.ReLU(),
+            make_linear(f, d, use_ternary),
+        )
 
         self.norm2 = nn.LayerNorm(d)
         self.dropout = nn.Dropout(p=0.1)
@@ -320,9 +243,6 @@ class Model(nn.Module):
         q_heads=8,
         kv_heads=8,
         head_dim=None,
-        n_experts=8,
-        top_k=2,
-        use_moe=False,
         use_ternary=False,
     ):
         super().__init__()
@@ -348,9 +268,6 @@ class Model(nn.Module):
                     self.q_heads,
                     self.kv_heads,
                     self.head_dim,
-                    n_experts=n_experts,
-                    top_k=top_k,
-                    use_moe=use_moe,
                     use_ternary=use_ternary,
                 )
                 for i in range(layers)
@@ -394,7 +311,6 @@ def adder_vanilla():
         layers=4,
         q_heads=4,
         kv_heads=4,
-        use_moe=False,
     )
     return model
 
@@ -407,7 +323,6 @@ def adder_gqa():
         layers=6,
         q_heads=8,
         kv_heads=2,
-        use_moe=False,
     )
     return model
 
@@ -417,10 +332,9 @@ def adder_ternary_vanilla():
         len(numbers_data.VOCAB),
         d=128,
         f=128,
-        layers=2,
+        layers=4,
         q_heads=4,
         kv_heads=4,
-        use_moe=False,
         use_ternary=True,
     )
     return model

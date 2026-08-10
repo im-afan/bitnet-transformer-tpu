@@ -14,6 +14,7 @@ Detailed per-component design notes (this file is the overview):
 | [scalar_unit.md](scalar_unit.md) | Control processor microarchitecture                   |
 | [scalar_unit_pipeline.md](scalar_unit_pipeline.md) | Plan to pipeline it — **proposal, not built**; the RTL is still the multi-cycle FSM |
 | [isa.md](isa.md)                 | Guide to writing TPU programs in tpulang (+ encoding/opcode appendix) |
+| [macro_ops.md](macro_ops.md)     | Plan to move tiling/softmax/LayerNorm into hardware (CISC macro-ops) — **proposal, not built**; the ISA is still one-pass-per-instruction |
 | [uart_host.md](uart_host.md)     | The host link: frame format, the five commands, arbitration |
 | [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image and how to use it |
 | [synth.md](synth.md)             | Vivado build flow, Cmod A7-35T deployment, sizing reality check |

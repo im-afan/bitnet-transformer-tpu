@@ -39,7 +39,7 @@ def make_calibration_batches(n_batches, batch_size, max_tokens, max_digits):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default="model/saved/colab_ternary_mha.pt")
+    parser.add_argument("--model-path", default="model/saved/colab_ternary_mha_small.pt")
     parser.add_argument(
         "--out",
         default=None,
