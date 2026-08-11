@@ -37,7 +37,12 @@ module scalar_unit #(
     parameter int REG_AW   = 5,   // register file: 2**REG_AW regs (fields are 8b)
     parameter int IMEM_AW  = 10,  // instruction memory depth = 2**IMEM_AW
     parameter int ADDR_W   = 16,  // scratchpad / DRAM byte-address width
-    parameter int CFG_AW   = 4    // config register file: 2**CFG_AW regs
+    // Config register file: 2**CFG_AW regs. Widened 4 -> 5 for the DMA's
+    // transpose geometry (docs/dma.md §5): 0..14 were assigned and index 15 was
+    // the last free slot, which three registers do not fit into. The `dst`
+    // instruction field is 8 bits, so the encoding was already wide enough and
+    // nothing outside this file's cfg array grows.
+    parameter int CFG_AW   = 5
 ) (
     input  logic                 clk,
     input  logic                 rst_n,
@@ -110,6 +115,10 @@ module scalar_unit #(
     output logic [ADDR_W-1:0]    dma_scratch_addr,
     output logic [ADDR_W-1:0]    dma_dram_addr,
     output logic [15:0]          dma_len,        // bytes (config reg)
+    output logic                 dma_transpose,  // transposed addressing (instr flag)
+    output logic [15:0]          dma_tcols,      // source row length, elements (config reg)
+    output logic [15:0]          dma_tsrow,      // source row stride, bytes (config reg)
+    output logic [15:0]          dma_tdrow,      // dest row stride, bytes (config reg)
     input  logic                 dma_busy,
     input  logic                 dma_done,
 
@@ -221,9 +230,15 @@ module scalar_unit #(
                           //   (1 x t+1) and prefill (T x T) are the same op
         CFG_VROW0  = 'd12,// vecmatmul src0 row stride, bytes
         CFG_VROW1  = 'd13,// vecmatmul src1 row stride, bytes
-        CFG_VCROW  = 'd14;// vecmatmul dst row stride, bytes (int32).
+        CFG_VCROW  = 'd14,// vecmatmul dst row stride, bytes (int32).
                           //   Separate from CFG_CROW: that one is the
                           //   MXU's, and a layer has both live at once.
+        // DMA transpose geometry (docs/dma.md §5). Read only by RDMEM/WRMEM
+        // carrying the `.t` flag; a plain rdmem/wrmem ignores them outright,
+        // for the same reason OP_MATMUL ignores the MXU strides.
+        CFG_TCOLS  = 'd15,// source row length in elements (the inner counter)
+        CFG_TSROW  = 'd16,// source row stride, bytes (0 => dense = TCOLS)
+        CFG_TDROW  = 'd17;// destination row stride, bytes (0 => 1)
 
     // Dispatch-target selector (also the WAIT flags encoding).
     localparam logic [1:0] U_MXU = 2'd0, U_VPU = 2'd1, U_DMA = 2'd2, U_LINK = 2'd3;
@@ -331,6 +346,9 @@ module scalar_unit #(
     assign vpu_row1       = cfg[CFG_VROW1][ADDR_W-1:0];
     assign vpu_crow       = cfg[CFG_VCROW][ADDR_W-1:0];
     assign dma_len        = cfg[CFG_LEN][15:0];
+    assign dma_tcols      = cfg[CFG_TCOLS][15:0];
+    assign dma_tsrow      = cfg[CFG_TSROW][15:0];
+    assign dma_tdrow      = cfg[CFG_TDROW][15:0];
     assign nb_len         = cfg[CFG_LEN][15:0];
 
     // -------------------------------------------------------------------------
@@ -387,6 +405,12 @@ module scalar_unit #(
     assign dma_write        = (opc == OP_WRMEM);
     assign dma_scratch_addr = (opc == OP_WRMEM) ? r_src0[ADDR_W-1:0] : r_dst [ADDR_W-1:0];
     assign dma_dram_addr    = (opc == OP_WRMEM) ? r_src1[ADDR_W-1:0] : r_src0[ADDR_W-1:0];
+    // `.t`: read the source row-major, write the destination transposed. Both DMA
+    // ops leave flags[0] free (RDMEM is RS-form, WRMEM SS-form), so this needs no
+    // opcode of its own — and being an instruction flag rather than a "the stride
+    // registers are nonzero" test is what stops one program's leftover geometry
+    // from rearranging the next program's plain rdmem (docs/macro_ops.md §4.0).
+    assign dma_transpose    = flags[0];
 
     assign nb_dir      = flags;
     assign nb_src_addr = r_src0[ADDR_W-1:0];

@@ -56,7 +56,7 @@ module tpu_top #(
     // ---- Scalar unit sizing -------------------------------------------------
     parameter int REG_AW   = 5,     // scalar register file: 2**REG_AW regs
     parameter int IMEM_AW  = 10,    // instruction memory depth = 2**IMEM_AW
-    parameter int CFG_AW   = 4,     // config register file: 2**CFG_AW regs
+    parameter int CFG_AW   = 5,     // config register file: 2**CFG_AW regs
 
     // ---- External DRAM (async SRAM chip) ------------------------------------
     parameter int MEM_ADDR_W = 19,   // external SRAM byte address (CMOD A7: 512K×8)
@@ -177,6 +177,8 @@ module tpu_top #(
     logic                dma_start, dma_write;
     logic [ADDR_W-1:0]   dma_scratch_addr, dma_dram_addr;
     logic [15:0]         dma_len;
+    logic                dma_transpose;                       // `.t` instruction flag
+    logic [15:0]         dma_tcols, dma_tsrow, dma_tdrow;     // transpose geometry (cfg)
     logic                dma_busy, dma_done;
 
     // ---- DMA ↔ scratchpad DMA port ------------------------------------------
@@ -328,6 +330,10 @@ module tpu_top #(
         .dma_scratch_addr (dma_scratch_addr),
         .dma_dram_addr    (dma_dram_addr),
         .dma_len          (dma_len),
+        .dma_transpose    (dma_transpose),
+        .dma_tcols        (dma_tcols),
+        .dma_tsrow        (dma_tsrow),
+        .dma_tdrow        (dma_tdrow),
         .dma_busy         (dma_busy),
         .dma_done         (dma_done),
 
@@ -537,6 +543,10 @@ module tpu_top #(
         .dma_scratch_addr (dma_scratch_addr),
         .dma_dram_addr    (MEM_ADDR_W'(dma_dram_addr)),  // zero-extend ADDR_W → MEM_ADDR_W
         .dma_len          (dma_len),
+        .dma_transpose    (dma_transpose),
+        .dma_tcols        (dma_tcols),
+        .dma_tsrow        (dma_tsrow),
+        .dma_tdrow        (dma_tdrow),
         .dma_busy         (dma_busy),
         .dma_done         (dma_done)
     );

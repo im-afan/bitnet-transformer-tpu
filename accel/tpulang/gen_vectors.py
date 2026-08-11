@@ -29,6 +29,8 @@ constants (:func:`program_kind`, dispatched by :func:`build_image`):
   * tiled matmul (defines ``MTILES``): a general A@W streamed tile-by-tile; the
     inputs are built in the program's tile-major DRAM layout and the ISS result
     is checked against an independent Python reference matmul.
+  * transpose_dma (defines ``VT``): a fused [T][3D] QKV block, checked against
+    the transpose permutation written out directly.
 
 A program that produces no reference result here can still be checked against
 PyTorch — see ``torch_ref.py``, which decodes these same images into tensors.
@@ -463,6 +465,41 @@ def build_softmax_rows_image(tpu: TPU, c: dict) -> dict:
 
 
 # =============================================================================
+# transpose_dma (examples/transpose_dma.tpu): the DMA's transposing mode.
+# =============================================================================
+def build_transpose_image(tpu: TPU, c: dict) -> tuple[dict, dict, None]:
+    """A fused [T][3D] QKV block, plus the two transposed slices it should yield.
+
+    The reference is the permutation written out directly — element (t, d) of a
+    slice belongs at ``base + d*T + t`` — rather than a second address generator,
+    so it cannot share a bug with the one under test. Values are made to depend
+    on both indices (and to differ between the Q and V slices) so a transfer that
+    transposed the wrong slice, or skipped the row stride, cannot pass.
+    """
+    T, D, D3 = c["T"], c["D"], c["D3"]
+    QKV, VT, QT = c["QKV"], c["VT"], c["QT"]
+
+    img: dict[int, int] = {}
+
+    def put(addr: int, byte: int):
+        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        img[addr] = byte & 0xFF
+
+    # The whole row is seeded, including the K columns nothing should read.
+    block = [[((t * 13 + j * 5) % 63) - 31 for j in range(D3)] for t in range(T)]
+    for t in range(T):
+        for j in range(D3):
+            put(QKV + t * D3 + j, block[t][j])
+
+    ref: dict[int, int] = {}
+    for t in range(T):
+        for d in range(D):
+            ref[VT + d * T + t] = block[t][2 * D + d]   # V slice, transposed
+            ref[QT + d * T + t] = block[t][d]           # Q slice, transposed
+    return img, ref, None
+
+
+# =============================================================================
 # Dispatch: pick the input image from the program's own constants.
 # =============================================================================
 def program_kind(consts: dict) -> str:
@@ -471,6 +508,8 @@ def program_kind(consts: dict) -> str:
     Keyed on constants rather than filename so a renamed or derived program
     still resolves. ``torch_ref.KERNELS`` identifies programs the same way.
     """
+    if "VT" in consts:              # transpose_dma: the DMA's `.t` mode
+        return "transpose_dma"
     if "MTILES" in consts:
         return "tiled_matmul"
     if "C32" in consts:             # tiled_matmul_hw: whole contraction in HW
@@ -496,6 +535,8 @@ def build_image(tpu: TPU, consts: dict) -> tuple[dict, dict | None, dict | None]
     computes them (tiled matmul only; ``None`` otherwise).
     """
     kind = program_kind(consts)
+    if kind == "transpose_dma":
+        return build_transpose_image(tpu, consts)
     if kind == "tiled_matmul":
         return build_matmul_image(tpu, consts)
     if kind == "tiled_matmul_hw":
@@ -571,7 +612,8 @@ def main(argv=None) -> int:
         if bad:
             print(f"reference check FAILED: {bad} mismatch(es) for {shape}")
             return 1
-        print(f"reference check OK: {shape} matches Python A@W "
+        what = f"{shape} " if shape else ""
+        print(f"reference check OK: {what}matches the Python reference "
               f"({len(ref)} output bytes)")
 
     prog_path = os.path.join(args.out_dir, "tpu_prog.hex")

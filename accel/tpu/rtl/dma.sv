@@ -22,6 +22,39 @@
 // single-cycle `sram_start` pulses with no output-lag. Only `state`, `counter`,
 // and the one-byte holding register `data` are sequential. `sram_busy` is unused:
 // completion is signalled by `sram_done`.
+//
+// ---- Transpose mode (`dma_transpose`, docs/dma.md §5) -----------------------
+//
+// The byte *sequence* is unchanged; only the two address generators differ. The
+// engine walks the transfer as a 2-D loop and applies opposite orders to the two
+// sides:
+//
+//     source      is read  ROW-MAJOR    : src + r*tsrow + c
+//     destination is written TRANSPOSED : dst + c*tdrow + r
+//
+// for c in 0..tcols-1 (the inner counter) and r advancing on each wrap, stopping
+// after `dma_len` bytes. "Source" is direction-relative and needs no separate
+// encoding: on a fill it is DRAM and on a spill it is the scratchpad, which is
+// exactly how the instruction reads. One convention covers both, because
+// transposing on the way out of a [R][C] tensor and transposing on the way in to
+// a [C][R] one are the same permutation.
+//
+// `tsrow` exists so the source can be a column slice of a wider tensor (V is the
+// last d columns of a fused [T][3d] QKV block, and nothing else needs to move to
+// get at it). `tdrow` is a free stride rather than a hard-wired R so the result
+// can land inside a wider destination.
+//
+// Zero means "not set" for all three, and each falls back to the value that makes
+// the mode degenerate rather than collapse to address 0 (the mxu.sv stride
+// convention, for the reason in docs/macro_ops.md §4.0):
+//
+//     tcols == 0  ->  dma_len   (one row: a strided scatter/gather, not a fault)
+//     tsrow == 0  ->  tcols     (dense source rows)
+//     tdrow == 0  ->  1         (all three unset == a plain linear copy)
+//
+// Addresses accumulate in SCRATCHPAD_ADDR_W bits on both sides, so a transposed
+// transfer addresses one 64 KB DRAM window — the same window the scalar unit's
+// 16-bit DRAM address can name in the first place.
 // -----------------------------------------------------------------------------
 
 module dma #(
@@ -57,6 +90,11 @@ module dma #(
     input  logic [SCRATCHPAD_ADDR_W-1:0]  dma_scratch_addr,
     input  logic [MEM_ADDR_W-1:0]         dma_dram_addr,
     input  logic [15:0]                   dma_len,            // bytes
+    // Transpose mode (instruction flag + cfg geometry; see header and §5 of the doc)
+    input  logic                          dma_transpose,      // 1: transposed addressing
+    input  logic [15:0]                   dma_tcols,          // source row length, elements
+    input  logic [15:0]                   dma_tsrow,          // source row stride, bytes
+    input  logic [15:0]                   dma_tdrow,          // destination row stride, bytes
     output logic                          dma_busy,
     output logic                          dma_done
 );
@@ -79,15 +117,39 @@ module dma #(
     reg [SCRATCHPAD_ADDR_W-1:0] counter;   // index of the byte being moved
     reg [MEM_DATA_W-1:0]        data;      // one-byte holding register
 
+    // Transpose-mode 2-D position. `col`/`row` are the source coordinates;
+    // `src_row_off` (= row*tsrow) and `dst_col_off` (= col*tdrow) are carried as
+    // running sums so neither address generator needs a multiplier.
+    reg [15:0]                  col, row;
+    reg [SCRATCHPAD_ADDR_W-1:0] src_row_off, dst_col_off;
+
+    // Effective geometry: zero means "not set" (see the header).
+    wire [15:0] tcols_eff = (dma_tcols == 16'd0) ? dma_len   : dma_tcols;
+    wire [15:0] tsrow_eff = (dma_tsrow == 16'd0) ? tcols_eff : dma_tsrow;
+    wire [15:0] tdrow_eff = (dma_tdrow == 16'd0) ? 16'd1     : dma_tdrow;
+    wire        row_last  = (col + 16'd1 >= tcols_eff);   // this byte ends a source row
+
     // -------------------------------------------------------------------------
     // Address generation. Inputs are held stable by the scalar unit for the whole
-    // transfer, so these can track the counter combinationally. Scratchpad math is
-    // mod 2**SCRATCHPAD_ADDR_W (matches scratchpad.sv's wrap); the SRAM offset is
-    // zero-extended to the wider DRAM address.
+    // transfer, so these can track the counters combinationally. Scratchpad math
+    // is mod 2**SCRATCHPAD_ADDR_W (matches scratchpad.sv's wrap); the SRAM offset
+    // is zero-extended to the wider DRAM address.
+    //
+    // Linear mode drives both sides from `counter`. Transpose mode gives the
+    // row-major offset to whichever side is the source (`dma_write` == spill ==
+    // scratchpad is the source) and the transposed offset to the other.
     // -------------------------------------------------------------------------
-    assign scratchpad_raddr = dma_scratch_addr + counter;
-    assign scratchpad_waddr = dma_scratch_addr + counter;
-    assign sram_addr        = dma_dram_addr + MEM_ADDR_W'(counter);
+    wire [SCRATCHPAD_ADDR_W-1:0] lin_off = src_row_off + SCRATCHPAD_ADDR_W'(col);
+    wire [SCRATCHPAD_ADDR_W-1:0] tr_off  = dst_col_off + SCRATCHPAD_ADDR_W'(row);
+
+    wire [SCRATCHPAD_ADDR_W-1:0] scratch_off =
+        !dma_transpose ? counter : (dma_write ? lin_off : tr_off);
+    wire [SCRATCHPAD_ADDR_W-1:0] dram_off =
+        !dma_transpose ? counter : (dma_write ? tr_off  : lin_off);
+
+    assign scratchpad_raddr = dma_scratch_addr + scratch_off;
+    assign scratchpad_waddr = dma_scratch_addr + scratch_off;
+    assign sram_addr        = dma_dram_addr + MEM_ADDR_W'(dram_off);
 
     // -------------------------------------------------------------------------
     // Next-state logic (default: hold).
@@ -144,16 +206,40 @@ module dma #(
     // -------------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state   <= IDLE;
-            counter <= '0;
-            data    <= '0;
+            state       <= IDLE;
+            counter     <= '0;
+            data        <= '0;
+            col         <= '0;
+            row         <= '0;
+            src_row_off <= '0;
+            dst_col_off <= '0;
         end else begin
             state <= state_n;
             case (state)
-                IDLE:                 counter <= '0;
+                IDLE: begin
+                    counter     <= '0;
+                    col         <= '0;
+                    row         <= '0;
+                    src_row_off <= '0;
+                    dst_col_off <= '0;
+                end
                 READ_SRAM_WAIT:       if (sram_done) data <= sram_dout;
                 READ_SCRATCHPAD_WAIT: data <= scratchpad_rdata[MEM_DATA_W-1:0];  // lane 0
-                STEP:                 counter <= counter + 1'b1;
+                STEP: begin
+                    counter <= counter + 1'b1;
+                    // 2-D walk. Only `counter` decides when the transfer ends, so
+                    // a `dma_len` that is not a whole number of rows simply stops
+                    // part-way through the last one.
+                    if (row_last) begin
+                        col         <= '0;
+                        row         <= row + 16'd1;
+                        src_row_off <= src_row_off + SCRATCHPAD_ADDR_W'(tsrow_eff);
+                        dst_col_off <= '0;
+                    end else begin
+                        col         <= col + 16'd1;
+                        dst_col_off <= dst_col_off + SCRATCHPAD_ADDR_W'(tdrow_eff);
+                    end
+                end
                 default: ;
             endcase
         end

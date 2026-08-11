@@ -99,7 +99,7 @@ Everything below is downstream of this. Sources are `iss.py`, `assembler.py`, `t
 | Scalar ALU | `adds` `subs` `muls` only | No shift, no divide. Drives the LayerNorm construction in §6.8. |
 | requant | `clip_i8((acc·m0 + 2ⁿ⁻¹) >> n)`, m0 < 4096, n ≤ 15 | Scale ratios from 1/32768 to ~4095. Ample. |
 | `gelu`/`exp` LUTs | fixed `in_scale = 1/16`; out 1/16 and 1/127 | **The tightest numerical constraint in the model.** §5. |
-| ISS step limit | 100 000 default | Raise it per program; `transpose_i8` alone is ~30 k steps. |
+| ISS step limit | 100 000 default | Raise it per program if a primitive loops per element. |
 
 Two semantics that cause most tpulang bugs, restated because every primitive below is
 shaped by them:
@@ -177,7 +177,7 @@ templates, and each gets its own program instead of being inlined into a shared 
 | --- | --- | --- | --- |
 | 6.1 | `matmul_ternary` | `C[M,N] int8 = requant(A[M,K] int8 @ W[K,N] ternary)` | 90 |
 | 6.2 | `matmul_i8` | `O[H,M,N] int32 = A[H,M,K] @ B[H,N,K]ᵀ`, fully strided | 55 |
-| 6.3 | `transpose_i8` | `B[N,M] = A[M,N]ᵀ`, int8 | 27 |
+| 6.3 | `transpose_i8` | `B[N,M] = A[M,N]ᵀ`, int8 — now one `wrmem.t` | 10 |
 | 6.4 | `requant_block` | `dst[N] int8 = requant(src[N] int32)` | 25 |
 | 6.5 | `add_rows` | `C[R,N] int8 = requant(A[R,N] + B[R,N])`, B row-stride may be 0 | 30 |
 | 6.6 | `gelu_block` | `dst[N] int8 = requant(gelu(requant(src)))` | 25 |
@@ -202,10 +202,19 @@ because neither operand is ternary. Explicit strides are what let one template s
 have to be un-interleaved), `A = P Vᵀ`, **and** the final `fc` head with int8 weights.
 
 **6.3 `transpose_i8`** — `vecdot` needs both operands contiguous along the contraction axis,
-and `P @ V` contracts over keys, so V must be key-contiguous. There is no transpose op and no
-strided vector load. The trick: **DMA with `len = 1` is a byte move to an arbitrary
-address.** Loop over elements: `rdmem` one byte from `A + m·N + n`, `wrmem` it to
-`B + n·M + m`, through one scratch cell. Slow in cycles, tiny in instructions, correct.
+and `P @ V` contracts over keys, so V must be key-contiguous.
+
+*Superseded by hardware.* This was written when there was no transpose op and no strided
+vector load, and used the fact that **DMA with `len = 1` is a byte move to an arbitrary
+address**: loop over elements, `rdmem` one byte from `A + m·N + n`, `wrmem` it to
+`B + n·M + m`. Tiny in instructions, correct, and brutally slow — two dispatches per byte.
+
+The DMA now transposes natively ([`../tpu/docs/dma.md`](../tpu/docs/dma.md) §5), so the
+primitive is **one `wrmem.t`** (or `rdmem.t`, whichever side the tensor is already on) with
+`cfg tcols/tsrow/tdrow` set: ~10 words instead of 27, and one dispatch instead of ~8k for a
+`[32,128]` V. `tsrow` reads the V columns straight out of the fused `[T,384]` QKV block, so
+step 7 of §7 no longer needs V un-interleaved first either. The ~30 k ISS steps quoted in §3
+go with it.
 
 **6.5 `add_rows`** — one primitive covers three jobs, because a row-stride of 0 on the second
 operand is a broadcast: residual add (stride N), bias add (stride 0), attention mask
@@ -287,7 +296,7 @@ reference clips identically, so exactness still holds and the cost lands in leg 
 | 4 | requant into exp scale, `1/√32` folded | `requant_block` | `[4,32,32]` int8 |
 | 5 | `+ causal/pad mask` | `add_rows` (stride 0) | int8 |
 | 6 | `P = softmax(S8)` | `softmax_rows` | int8 @ 1/128 |
-| 7 | `Vᵀ` | `transpose_i8` | `[4,32,32]` int8 |
+| 7 | `Vᵀ` | `transpose_i8` (one `wrmem.t`) | `[4,32,32]` int8 |
 | 8 | `AO32 = P·Vᵀᵀ` per head | `matmul_i8` | `[32,128]` int32 |
 | 9 | requant | `requant_block` | `[32,128]` int8 |
 | 10–11 | `O = AO·Wo`, `+ bias_o` | `matmul_ternary`, `add_rows` | `[32,128]` int8 |
@@ -430,5 +439,5 @@ to *built* with the numbers that actually came out.
 | Resident weights / a DRAM parameter block | The answer to §8's 20 s of UART per forward on the board: load each primitive once, drive it from a parameter block in scratchpad. Needs `loads` from a `rdmem`'d block into registers — supported today, just unnecessary until the board path matters. |
 | Autoregressive decode | Not needed: the answer tokens sit at fixed positions after `EQUALS_POS = 15`, so one forward pass produces the whole answer. |
 | Embedding and `argmax` on device | §1. Would need a gather and an argmax the ISA does not have. |
-| A transposing DMA mode | Would delete `transpose_i8` (§6.3) and a chunk of the cycle count. RTL change. |
+| ~~A transposing DMA mode~~ | **Built** — `rdmem.t`/`wrmem.t`, `dma.md` §5. `transpose_i8` (§6.3) is now one dispatch. |
 | A torch compiler | §2. `graph.py` being a plain Python function *is* the honest version of this at this scale. |

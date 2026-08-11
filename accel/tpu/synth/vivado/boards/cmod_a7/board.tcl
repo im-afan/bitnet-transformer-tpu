@@ -54,7 +54,7 @@ set VPU_BYTES  32
 set ADDR_W     16
 set XLEN       32
 set IMEM_AW    10
-set CFG_AW     4
+set CFG_AW     5
 set REG_AW     5
 set M0_W       12
 set N_W        4

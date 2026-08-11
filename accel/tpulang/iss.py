@@ -27,8 +27,9 @@ fixed scratchpad buffer from an advancing DRAM address, compute, spill the resul
 back to a distinct DRAM address — so the operands need not all fit in scratchpad.
 Inputs live in DRAM, ``rdmem`` fills scratchpad, and ``wrmem`` is what makes a byte
 host-visible again, so the golden outputs are exactly the DRAM bytes ``wrmem`` wrote
-(tracked in ``dram_written``). Inter-TPU LINK (wrneigh) is still a no-op — no link
-engine is attached.
+(tracked in ``dram_written``). ``rdmem.t``/``wrmem.t`` move the same bytes with a
+transposed destination order (docs/dma.md §5). Inter-TPU LINK (wrneigh) is still a
+no-op — no link engine is attached.
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ CFG_KTILES, CFG_NTILES, CFG_AROW, CFG_CROW, CFG_WCOL = 4, 5, 6, 7, 8
 # VPU macro-op geometry
 CFG_VSCALAR, CFG_VROWS, CFG_VCOLS, CFG_VROW0, CFG_VROW1 = 9, 10, 11, 12, 13
 CFG_VCROW = 14   # vecmatmul dst row stride (the MXU owns CFG_CROW)
+# DMA transpose geometry (docs/dma.md §5); read only by rdmem.t / wrmem.t.
+CFG_TCOLS, CFG_TSROW, CFG_TDROW = 15, 16, 17
 
 # --- branch condition codes (scalar_unit.sv C_*) ------------------------------
 C_EQ, C_NE, C_LT, C_GE = 0b00, 0b01, 0b10, 0b11
@@ -105,7 +108,7 @@ class TPU:
     mem: bytearray = field(init=False)      # on-chip scratchpad
     dram: bytearray = field(init=False)     # external DRAM (DMA source/destination)
     regs: list = field(init=False)          # 32 x int32 (r0 hardwired 0)
-    cfg: list = field(init=False)           # 16 x int32
+    cfg: list = field(init=False)           # 32 x int32 (CFG_AW = 5)
     written: set = field(init=False)        # scratchpad byte addrs a compute/store wrote
     dram_written: set = field(init=False)   # DRAM byte addrs a wrmem spilled (host output)
 
@@ -114,7 +117,7 @@ class TPU:
         self.mem = bytearray(self.depth)
         self.dram = bytearray(self.depth)
         self.regs = [0] * 32
-        self.cfg = [0] * 16
+        self.cfg = [0] * 32
         self.written = set()
         self.dram_written = set()
         self.wcol_bytes = (self.rows * 2) // 8   # packed ternary column bytes
@@ -151,18 +154,55 @@ class TPU:
                 self.written.add(a)
 
     # ---- DMA: byte copy DRAM<->scratchpad over cfg 'len' (dma.sv/sram.sv) -----
-    def _dma(self, *, dst: int, src: int, to_scratch: bool) -> None:
+    def _dma(self, *, dst: int, src: int, to_scratch: bool,
+             transpose: bool = False) -> None:
         """Copy ``cfg['len']`` bytes. Fill (to_scratch) reads DRAM into the
         scratchpad; spill writes the scratchpad back to DRAM and records the
-        touched DRAM bytes as host-visible output."""
+        touched DRAM bytes as host-visible output.
+
+        With ``transpose`` (the ``.t`` instruction flag) the byte *count* is
+        unchanged but the two address generators run in opposite orders: the
+        source is read row-major over ``cfg tcols`` columns at ``cfg tsrow``
+        stride, and the destination is written transposed at ``cfg tdrow``.
+        Mirrors dma.sv's counters exactly, including the zero-means-unset
+        fallbacks and the 16-bit wrap of both running offsets — those are the
+        parts the RTL and this model have to agree on byte-for-byte.
+        """
         n = self.cfg[CFG_LEN] & 0xFFFF
-        for k in range(n):
+
+        if not transpose:
+            for k in range(n):
+                if to_scratch:
+                    self.mem[self._a(dst + k)] = self.dram[self._a(src + k)]
+                else:
+                    a = self._a(dst + k)
+                    self.dram[a] = self.mem[self._a(src + k)]
+                    self.dram_written.add(a)
+            return
+
+        cols = (self.cfg[CFG_TCOLS] & 0xFFFF) or n
+        srow = (self.cfg[CFG_TSROW] & 0xFFFF) or cols
+        drow = (self.cfg[CFG_TDROW] & 0xFFFF) or 1
+
+        col = row = src_row_off = dst_col_off = 0
+        for _ in range(n):
+            s = self._a(src + src_row_off + col)
+            d = self._a(dst + dst_col_off + row)
             if to_scratch:
-                self.mem[self._a(dst + k)] = self.dram[self._a(src + k)]
+                self.mem[d] = self.dram[s]
             else:
-                a = self._a(dst + k)
-                self.dram[a] = self.mem[self._a(src + k)]
-                self.dram_written.add(a)
+                self.dram[d] = self.mem[s]
+                self.dram_written.add(d)
+            # Only the byte count ends the transfer, so a `len` that is not a
+            # whole number of rows stops part-way through the last one.
+            if col + 1 >= cols:
+                col = 0
+                row += 1
+                src_row_off = (src_row_off + srow) & 0xFFFF
+                dst_col_off = 0
+            else:
+                col += 1
+                dst_col_off = (dst_col_off + drow) & 0xFFFF
 
     # ---- register file (r0 == 0) ---------------------------------------------
     def rreg(self, field8: int) -> int:
@@ -244,10 +284,10 @@ class TPU:
 
             elif opc == OP_RDMEM:    # fill: DRAM(src0) -> scratchpad(dst)
                 self._dma(dst=r_dst & addr_mask, src=r_src0 & addr_mask,
-                          to_scratch=True)
+                          to_scratch=True, transpose=bool(flags & 0b01))
             elif opc == OP_WRMEM:    # spill: scratchpad(src0) -> DRAM(src1)
                 self._dma(dst=r_src1 & addr_mask, src=r_src0 & addr_mask,
-                          to_scratch=False)
+                          to_scratch=False, transpose=bool(flags & 0b01))
             elif opc == OP_WRNEIGH:
                 pass  # no LINK engine attached in tpu_top.sv — completing no-op
 
@@ -260,11 +300,11 @@ class TPU:
             elif opc == OP_LIS:
                 self.wreg(f_dst, imm16 - 0x10000 if imm16 & 0x8000 else imm16)
             elif opc == OP_SETCFG:
-                self.cfg[f_dst & 0xF] = imm16           # zero-extended
+                self.cfg[f_dst & 0x1F] = imm16          # zero-extended
             elif opc == OP_SETCFGR:
                 # Register -> config, full 32 bits with no extension. Consumers
                 # mask to their own field width, matching scalar_unit.sv.
-                self.cfg[f_dst & 0xF] = r_src0 & 0xFFFFFFFF
+                self.cfg[f_dst & 0x1F] = r_src0 & 0xFFFFFFFF
             elif opc == OP_LOADS:
                 self.wreg(f_dst, self.rd_i32(r_src0 & addr_mask))
             elif opc == OP_STORES:

@@ -3,8 +3,12 @@
 The block that moves bytes between **DRAM** (the CMOD A7's external SRAM, driven by
 [`sram_controller`](../rtl/sram.sv)) and the on-chip [scratchpad](scratchpad.md), without the
 scalar unit copying each byte itself. It is the hardware behind the `ReadMemory` /
-`WriteMemory` ISA ops ([scalar_unit.md](scalar_unit.md) §Comms/Memory). No RTL exists yet —
-`rtl/dma.sv` is an empty stub; this doc is the plan.
+`WriteMemory` ISA ops ([scalar_unit.md](scalar_unit.md) §Comms/Memory).
+
+**Status: built.** [`rtl/dma.sv`](../rtl/dma.sv) implements §3–§4 and is wired into
+`tpu_top.sv` between the scalar unit's dispatch, the scratchpad's `dma_*` port and a
+`sram_controller`; [`tb/dma_tb.sv`](../tb/dma_tb.sv) is the §9 bench. §5's **transpose
+mode** is built on top of it. The line-buffered optimization (§7) is not.
 
 ---
 
@@ -52,21 +56,17 @@ That mismatch is the entire reason this is a real block and not a wire.
 
 The DMA is a **master on two buses at once**. It is a *slave* to the scalar unit (it accepts a
 command) and a *master* to both the scratchpad and the SRAM controller (it drives their
-requests). All three interfaces already exist — the DMA is the missing middle:
+requests):
 
-- **Scalar side** — [`scalar_unit.sv`](../rtl/scalar_unit.sv) already exposes
-  `dma_start / dma_write / dma_scratch_addr / dma_dram_addr / dma_len / dma_busy / dma_done`.
-  In [`tpu_top.sv`](../rtl/tpu_top.sv) these dispatch outputs are currently dangling and
-  `dma_busy=0 / dma_done=1` are tied off so a `ReadMemory`/`WriteMemory` is a completing no-op.
+- **Scalar side** — [`scalar_unit.sv`](../rtl/scalar_unit.sv) exposes
+  `dma_start / dma_write / dma_scratch_addr / dma_dram_addr / dma_len / dma_busy / dma_done`,
+  plus the §5 transpose inputs, and `tpu_top.sv` wires them straight to the engine.
 - **Scratchpad side** — [`scratchpad.sv`](../rtl/scratchpad.sv) has a dedicated `dma_*` port
-  (`DMA_BYTES=64` wide, synchronous read valid next cycle, byte-strobed write). Today
-  `tpu_top` wires that port out to the host as `host_mem_*` for preload/readback.
+  (`DMA_BYTES=64` wide, synchronous read valid next cycle, byte-strobed write), which the
+  engine owns; the host reaches memory over the UART instead.
 - **DRAM side** — [`sram_controller`](../rtl/sram.sv): one `start`/`busy`/`done` transaction
-  per byte, `we` selects read vs. write, 19-bit address, 8-bit data.
-
-Landing the DMA means: connect its dispatch inputs to the scalar unit, its scratchpad master
-port to the scratchpad `dma_*` port (replacing the `host_mem_*` pass-through), and its SRAM
-master port to a `sram_controller` instance whose chip pins go to the top-level.
+  per byte, `we` selects read vs. write, 19-bit address, 8-bit data. `tpu_top` arbitrates it
+  between the DMA (while a program runs) and the UART host (while idle).
 
 ---
 
@@ -80,14 +80,21 @@ unit — the DMA consumes it as-is.
 | `dma_start`        | in  | 1      | begin a transfer (pulse)                                   |
 | `dma_write`        | in  | 1      | **1 = spill** scratch → DRAM · **0 = fill** DRAM → scratch |
 | `dma_scratch_addr` | in  | 16     | scratchpad byte address (base)                             |
-| `dma_dram_addr`    | in  | 16*    | DRAM byte address (base) — *see §7 note on width*          |
+| `dma_dram_addr`    | in  | 16*    | DRAM byte address (base) — *see §8 note on width*          |
 | `dma_len`          | in  | 16     | number of bytes to move                                    |
+| `dma_transpose`    | in  | 1      | **transposed addressing** (the `.t` instruction flag) — §5 |
+| `dma_tcols`        | in  | 16     | §5 source row length, elements (`cfg tcols`)               |
+| `dma_tsrow`        | in  | 16     | §5 source row stride, bytes (`cfg tsrow`)                  |
+| `dma_tdrow`        | in  | 16     | §5 destination row stride, bytes (`cfg tdrow`)             |
 | `dma_busy`         | out | 1      | transfer in progress                                       |
 | `dma_done`         | out | 1      | transfer complete (single-cycle pulse)                     |
 
 `dma_write` mirrors the ISA: `WriteMemory` (spill) sets it, `ReadMemory` (fill) clears it. The
 handshake is identical to MXU/VPU dispatch, so the scalar unit's `U_DMA` wait state
 (`sel_done = dma_done`) already knows how to block on it.
+
+`dma_transpose` comes from the instruction's `flags[0]`, not from the config file; the three
+geometry registers come from the config file. That split is deliberate — see §5.3.
 
 ---
 
@@ -113,7 +120,7 @@ For each byte `i`:
 
 The SRAM is the bottleneck (~3 cycles/byte vs. 1 for the scratchpad), so v1 deliberately does
 **byte-at-a-time** transfers and doesn't try to batch. It's the simplest thing that's correct;
-§6 covers the line-buffered optimization once v1 passes.
+§7 covers the line-buffered optimization.
 
 ---
 
@@ -225,7 +232,91 @@ Two more small points from the diagram:
 
 ---
 
-## 5. Address & timing facts to respect
+## 5. Transpose mode (`rdmem.t` / `wrmem.t`)
+
+The byte *count* and the FSM are unchanged. Only the two address generators differ: the
+engine walks the transfer as a 2-D loop and applies opposite orders to the two sides.
+
+```
+    for r = 0, 1, 2, ...            # rows, until dma_len bytes have moved
+      for c = 0 .. tcols-1          # the inner counter
+         read   source      at  src + r*tsrow + c        # row-major
+         write  destination at  dst + c*tdrow + r        # transposed
+```
+
+**"Source" is direction-relative, and that is the whole trick.** On a fill the source is DRAM
+and the destination is the scratchpad; on a spill it is the other way round. One convention
+covers both directions because transposing on the way *out* of an `[R][C]` tensor and
+transposing on the way *in* to a `[C][R]` one are the same permutation. So there is exactly
+one rule to remember: **the source is read row-major, the destination is written transposed.**
+
+### 5.1 Why the two strides are not just `C` and `R`
+
+`tsrow` lets the source be a **column slice of a wider tensor**. That is not generality for
+its own sake — it is the case attention actually has. Q, K and V come out of one fused
+`[T][3d]` projection, so V is `d` columns of a `3d`-byte row, and a transfer that assumed
+dense rows would need the slice copied out first. With `tsrow = 3d` and `tcols = d` the slice
+is read in place.
+
+`tdrow` is a free stride rather than a hard-wired row count for the mirror-image reason: the
+result can land inside a wider destination (one head's `V^T` written into a `[H·d][T]` block).
+For a plain dense transpose it is simply `R`, the source's row count.
+
+The row count `R` is never a parameter. `dma_len` already fixes it — the transfer ends when
+the byte count is met, wherever that falls. A `dma_len` that is not a whole number of rows
+therefore stops part-way through the last one rather than faulting, and writes nothing past
+it.
+
+### 5.2 Zero means "not set"
+
+Each parameter falls back to the value that makes the mode degenerate gracefully rather than
+collapse every address onto `0` — the same convention `mxu.sv` uses for its strides, adopted
+for the same reason (`macro_ops.md` §4.0):
+
+| Register | 0 means | Effect |
+| --- | --- | --- |
+| `tcols` | `dma_len` | one row: a **strided scatter/gather**, which is the same generator seen end-on |
+| `tsrow` | `tcols` | dense source rows |
+| `tdrow` | `1` | dense destination |
+
+With all three unset, `rdmem.t` is bit-for-bit a plain `rdmem`. A missing `setcfg` costs you a
+copy, not a scribble.
+
+### 5.3 Why the mode is an instruction flag and the geometry is not
+
+`matmul_t` exists as a separate opcode because `matmul`'s 2-bit flags field was full
+(`macro_ops.md` §4.0). The DMA ops had room — `rdmem` is `RS`-form and `wrmem` is `SS`-form,
+so `flags[0]` was free on both — so the mode costs no opcode.
+
+It has to be *in the instruction* either way. Config registers are not cleared between runs,
+so a mode inferred from "the stride registers are nonzero" would let one program's leftover
+geometry silently rearrange the next program's plain `rdmem`. That is precisely the bug the
+MXU hit when `strided_matmul.tpu` ran before `relu_layer.tpu`. A plain `rdmem`/`wrmem` ignores
+all three registers outright.
+
+### 5.4 What it costs, and what it replaces
+
+Two 16-bit counters (`col`, `row`), two running-sum offset registers, and a mux on each
+address — no multipliers, since both offsets accumulate. Cycles per byte are unchanged: the
+SRAM access still dominates, and the permutation is free inside it.
+
+What it replaces is `transpose_i8`, the byte-move loop that was the only way to transpose
+before: `rdmem`/`wrmem` with `len = 1` around a two-deep software loop, **two dispatches per
+byte** — about 8k of them for a `[24][128]` V, each paying full scalar-unit dispatch overhead
+on top of the same SRAM access. One `.t` transfer is one dispatch.
+
+The source and destination must be **distinct regions**: a transpose is not safe in place, and
+nothing checks that for you. On-chip, `wrmem.t` + `rdmem` (or `wrmem` + `rdmem.t`) turns a
+scratchpad tensor into its transpose via DRAM in two dispatches. A scratchpad-to-scratchpad
+path would halve that traffic, but it needs the DMA to own both scratchpad ports at once and
+is a separate change.
+
+See [`examples/transpose_dma.tpu`](../../tpulang/examples/transpose_dma.tpu) for both
+directions on a fused QKV block.
+
+---
+
+## 6. Address & timing facts to respect
 
 - **Single clock domain.** The SRAM is asynchronous but its controller is clocked on the same
   `clk` as the DMA and scratchpad, so there is **no clock-domain crossing** here — unlike the
@@ -236,11 +327,11 @@ Two more small points from the diagram:
   future overlapped mode; v1 has the memory to itself.
 - **Byte-serial handles any alignment / length.** Because every access is one byte at an
   absolute address, unaligned bases and a `len` that isn't a multiple of 64 just work — no
-  special first/last-word masking (that complexity only appears in the §6 optimization).
+  special first/last-word masking (that complexity only appears in the §7 optimization).
 
 ---
 
-## 6. Later: line-buffered (burst) mode
+## 7. Later: line-buffered (burst) mode
 
 v1 wastes the scratchpad's 64-byte width — it reads/writes one lane at a time. Once correct,
 the throughput win is to **buffer a full 64-byte scratchpad line** and stream it to/from the
@@ -258,7 +349,7 @@ write.
 
 ---
 
-## 7. Open questions / decisions
+## 8. Open questions / decisions
 
 - **DRAM address width.** `dma_dram_addr` is currently **16 bits** (scalar unit + `tpu_top`),
   but the SRAM is **19 bits / 512 KB**. As-is the DMA can only reach the low 64 KB. Options:
@@ -277,7 +368,7 @@ write.
 
 ---
 
-## 8. Validation plan
+## 9. Validation plan
 
 Mirror the existing block tests (`make TEST=dma sim`, iverilog `-g2012`), reusing the
 behavioral async-SRAM model from [`sram_tb.sv`](../tb/sram_tb.sv):
@@ -293,16 +384,28 @@ behavioral async-SRAM model from [`sram_tb.sv`](../tb/sram_tb.sv):
 4. **Round-trip.** Spill a scratch region to DRAM, wipe scratch, fill it back — must match.
 5. **Corners.** `len = 0` (immediate `done`, nothing moved), `len = 1`, unaligned bases, a
    `len` that isn't a multiple of 64, and a transfer that reaches a high SRAM address (exercises
-   the §7 address-width decision).
+   the §8 address-width decision).
 6. **Handshake asserts.** `busy` frames the whole transfer, `done` is a single-cycle pulse, and
    the DMA never re-pulses `sram.start` while `sram.busy` is high.
+7. **Transpose (§5).** Both directions against an explicit `[r][c] -> [c][r]` reference written
+   as the permutation, not as a second address generator — a shared bug in the two would
+   otherwise cancel. Square and non-square; a strided source slice (`tsrow > tcols`, the V case)
+   and a strided destination; a `len` that is not a whole number of rows, which must stop
+   mid-row and write nothing past it; the zero-geometry case, which must stay a plain copy; and
+   a spill/fill round trip, which must be the identity. Every *linear* case in the bench runs
+   with the geometry registers at 0, so they also prove an unflagged copy ignores them.
 
 ---
 
-## 9. Build order
+## 10. Build order
 
-1. **v1 byte-serial FSM** (§3–§4) against the §8 bench — correctness first.
-2. **Rewire `tpu_top`** (§7): DMA between scalar dispatch, scratchpad `dma_*`, and a
-   `sram_controller` instance; resolve `host_mem_*`.
-3. **Widen the DRAM address** (§7) so the full SRAM is reachable.
-4. **Line-buffered mode** (§6) for throughput, then optional prefetch/double-buffer.
+1. ~~**v1 byte-serial FSM** (§3–§4) against the §9 bench.~~ **done**
+2. ~~**Rewire `tpu_top`** (§8): DMA between scalar dispatch, scratchpad `dma_*`, and a
+   `sram_controller` instance.~~ **done** — the host reaches memory over the UART, so
+   `host_mem_*` is gone.
+3. ~~**Transpose mode** (§5), with the geometry in `cfg tcols/tsrow/tdrow`.~~ **done**
+4. **Widen the DRAM address** (§8) so the full SRAM is reachable. Not done — the scalar unit
+   still emits 16 bits, so a program addresses the low 64 KB.
+5. **Line-buffered mode** (§7) for throughput, then optional prefetch/double-buffer.
+6. Optional: a **scratchpad-to-scratchpad** path, which would take the DRAM round trip out of
+   an on-chip transpose (§5.4).

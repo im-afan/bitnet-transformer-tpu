@@ -75,7 +75,7 @@ module tpu_top_tb;
     localparam int ADDR_W    = 16;
     localparam int XLEN      = 32;
     localparam int IMEM_AW   = 10;
-    localparam int CFG_AW    = 4;
+    localparam int CFG_AW    = 5;   // 32 cfg regs: 15..17 are the DMA transpose geometry
     localparam int REG_AW    = 5;
     localparam int M0_W      = 12;
     localparam int N_W       = 4;

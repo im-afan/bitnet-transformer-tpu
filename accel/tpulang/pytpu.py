@@ -242,6 +242,18 @@ class Program:
         self._ins("matmul" + (".acc" if acc else "") + (".rq" if rq else ""),
                   self._val(out), self._val(act), self._val(wgt))
 
+    # ---- DMA -----------------------------------------------------------------
+    # Hand-written rather than table-generated (unlike the ops below) because of
+    # the `.t` flag: with `t=True` the destination is written transposed, over the
+    # geometry in cfg tcols/tsrow/tdrow — set those with p.cfg() first.
+    def rdmem(self, dst, src, t: bool = False) -> None:
+        """DRAM(src) -> scratchpad(dst), `cfg len` bytes; `t` transposes."""
+        self._ins("rdmem" + (".t" if t else ""), self._val(dst), self._val(src))
+
+    def wrmem(self, src, dst, t: bool = False) -> None:
+        """scratchpad(src) -> DRAM(dst), `cfg len` bytes; `t` transposes."""
+        self._ins("wrmem" + (".t" if t else ""), self._val(src), self._val(dst))
+
     def loads(self, addr, name: str = "v") -> Reg:
         """Read one int32 out of the scratchpad into a *new* register."""
         dst = self._alloc(name)
@@ -326,8 +338,8 @@ _OPS = {
     "vecdot": 3, "vecmul": 3, "vecadd": 3, "vecemul": 3,
     "sadd": 3, "sdiv": 3, "requant": 3,
     "relu": 2, "gelu": 2, "exp": 2, "square": 2, "redmax": 2, "redsum": 2,
-    "rdmem": 2, "wrmem": 2, "stores": 2,
-}
+    "stores": 2,
+}   # rdmem/wrmem are hand-written above: they carry the `.t` flag.
 
 
 def _make_op(mnem: str, arity: int):

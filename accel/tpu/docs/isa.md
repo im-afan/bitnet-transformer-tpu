@@ -168,14 +168,17 @@ re-`setcfg` when the value changes.
 
 ### 4.3 The identical-address DMA convention
 
-The current DUT has **no DMA/LINK engine attached** — `rdmem`/`wrmem`/`wrneigh` complete as
-no-ops — and the ISS models them the same way, with input tensors pre-placed in the
-scratchpad. To keep a program correct on *both* the no-op simulator and real byte-copying
-hardware, give every tensor the **same address in DRAM and in the scratchpad**. Then
-`rdmem a, a` / `wrmem a, a` are the identity in simulation and a matched-address copy on
-hardware — both agree. This is why every example passes the *same* register twice to
-`rdmem`/`wrmem`. Scratchpad-only scratch (softmax's intermediates, say) never needs DMA at
-all.
+`rdmem`/`wrmem` are a **real byte copy** between DRAM and the scratchpad, in the RTL
+(`dma.sv`, wired into `tpu_top.sv`) and in the ISS alike; only `wrneigh` is still a
+completing no-op. The examples nonetheless give every tensor the **same address in DRAM and
+in the scratchpad**, so `rdmem a, a` / `wrmem a, a` pass the same register twice. That is a
+convention, not a requirement: it keeps the two address maps from drifting apart, and it
+makes the golden-vector flow legible, since `gen_vectors.py` seeds DRAM and reads back the
+bytes `wrmem` wrote. Scratchpad-only scratch (softmax's intermediates, say) never needs DMA
+at all.
+
+The one place it cannot hold is a **transposing** transfer (§4.6): a transpose is not safe in
+place, so its source and destination are necessarily different regions.
 
 ### 4.4 Lay tensors out the way the units expect
 
@@ -207,6 +210,34 @@ register. To use that value as a scalar in later scalar math, pull it into a reg
 `sadd`/`vecmul`/`sdiv`/`requant` take their scalar/param from a *scratchpad* address (the
 third operand's register), so a scalar destined for broadcast must live in the scratchpad —
 hence the `stores`.
+
+### 4.6 Transpose with the DMA, not with a loop
+
+The VPU contracts over each operand's **contiguous** axis, so `P @ V` — which contracts over
+keys, V's *row* axis — needs `Vᵀ`. There is no transpose op and no strided vector load, and no
+loop order avoids it (asking for `Aᵀ` instead just wants `Vᵀ` from the other side).
+
+The DMA does it, in one dispatch, with the `.t` flag on either direction. The source is read
+row-major and the destination written transposed, over a geometry in three config registers
+(full detail in [dma.md §5](dma.md#5-transpose-mode-rdmemt--wrmemt)):
+
+```asm
+    setcfg  tcols, D            ; D elements per source row...
+    setcfg  tsrow, D3           ; ...taken from rows D3 bytes apart (a column slice)
+    setcfg  tdrow, T            ; destination rows are T elements long
+    setcfg  len,   T * D
+    wrmem.t v, vt               ; scratchpad V slice -> DRAM Vᵀ
+    rdmem.t qt, qkv             ; DRAM Q slice       -> scratchpad Qᵀ
+```
+
+`tsrow` is what lets the source be a **column slice of a wider tensor**, which is the case
+that matters: Q/K/V come out of one fused `[T][3d]` projection, so nothing has to be
+un-interleaved before the transpose. Zero means "not set" for all three (`tcols → len`,
+`tsrow → tcols`, `tdrow → 1`), so an unconfigured `.t` degrades to a plain copy, and `tcols`
+alone unset gives a strided scatter/gather. A plain `rdmem`/`wrmem` ignores the three
+registers outright — the mode is in the instruction, so a stale geometry cannot reach it.
+
+See [`transpose_dma.tpu`](../../tpulang/examples/transpose_dma.tpu).
 
 ---
 
@@ -240,10 +271,13 @@ wrongly-scaled operand just reads the wrong table entry. See [vpu.md](vpu.md).
 **DMA / comms** (byte length from `cfg len`):
 
 ```
-rdmem  rscratch, rdram      DRAM -> scratchpad (fill)
-wrmem  rscratch, rdram      scratchpad -> DRAM (spill)
+rdmem[.t]  rscratch, rdram  DRAM -> scratchpad (fill)
+wrmem[.t]  rscratch, rdram  scratchpad -> DRAM (spill)
 wrneigh rmy, rnb, dir       push local DRAM -> neighbor DRAM  (dir: n|e|s|w)
 ```
+
+`.t` transposes: the source is read row-major and the destination written transposed, over
+`cfg tcols`/`tsrow`/`tdrow` — §4.6.
 
 **Scalar & control:**
 
@@ -369,7 +403,10 @@ program's outputs and nothing else — the loop that keeps hardware honest again
 - **Reductions write to the scratchpad, not a register** — `loads` to get the scalar out.
 - **Broadcast scalars must be in the scratchpad** (`sadd`/`vecmul`/`sdiv`/`requant` read the
   param from a scratchpad address), so `stores` a computed scalar before broadcasting it.
-- **Identical DRAM/scratchpad addresses** per tensor, so the no-op DMA stays correct (§4.3).
+- **Identical DRAM/scratchpad addresses** per tensor, by convention (§4.3) — except for a
+  `.t` transfer, whose source and destination must be *different* regions.
+- **A `.t` transfer needs `tcols`/`tsrow`/`tdrow` set** (§4.6). They default to a plain copy
+  rather than to garbage, so the symptom of forgetting is an untransposed result.
 - **Branch conditions come from the preceding `cmps`** — don't let another flag-setting op
   slip between the `cmps` and its branch.
 - **End with `halt`.** Without it the scalar unit runs off into whatever follows in IMEM.
@@ -388,7 +425,7 @@ the authority when the units disagree.
 | ---------------------- | -------------------------- | ------------------------------------------------ |
 | **PC**                 | `IMEM_AW` (10) bits        | word index into instruction memory               |
 | **Registers** `r0..r31`| 32 × int32 (`REG_AW=5`)    | `r0` hardwired to 0 (writes ignored)             |
-| **Config** `cfg0..cfg15`| 16 × int32 (`CFG_AW=4`)   | implied operands (lengths, requant addr); §A.4   |
+| **Config** `cfg0..cfg31`| 32 × int32 (`CFG_AW=5`)   | implied operands (lengths, requant addr); §A.4   |
 | **Flags**              | `eq`, `lt`                 | set by `cmps`, consumed by `branch`              |
 | **Instruction mem**    | 2¹⁰ × 32-bit BRAM          | host-loaded while idle; separate from scratchpad |
 | **Scratchpad**         | 2¹⁶ bytes                  | working memory; all *math* addresses point here  |
@@ -455,8 +492,8 @@ int32 is little-endian 4-byte, int8 a single signed byte.
 | `0x03` | `vecadd`  | RRR    | VPU     | `dst[i] = src0[i] + src1[i]`                         |
 | `0x04` | `relu`    | RR     | VPU     | `dst[i] = max(src0[i], 0)`                           |
 | `0x05` | `gelu`    | RR     | VPU     | `dst[i] = gelu_lut[src0[i]]`                         |
-| `0x06` | `wrmem`   | SS     | DMA     | scratch(src0) → DRAM(src1)                           |
-| `0x07` | `rdmem`   | RS     | DMA     | DRAM(src0) → scratch(dst)                            |
+| `0x06` | `wrmem`   | SS     | DMA     | scratch(src0) → DRAM(src1); `.t` transposes (§4.6)   |
+| `0x07` | `rdmem`   | RS     | DMA     | DRAM(src0) → scratch(dst); `.t` transposes (§4.6)    |
 | `0x08` | `wrneigh` | NEIGH  | LINK    | local DRAM(src0) → neighbor DRAM(src1), dir = flags  |
 | `0x09` | `requant` | RRR    | VPU     | `dst[i] = clip((src0·m0 + rnd) >> n)` int32→int8     |
 | `0x0A` | `vecemul` | RRR    | VPU     | `dst[i] = src0[i]·src1[i]` (elementwise)             |
@@ -491,8 +528,8 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 | -------- | -------- | ------------------ | ----------- | ----------- | --------------------------------------------- |
 | `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul, vecdot/mul/add/emul, sadd, sdiv, requant, adds/subs/muls |
 | `RR`     | dst reg  | src0 reg           | —           | —           | relu, gelu, square, exp, redmax, redsum       |
-| `RS`     | dst reg  | src0 reg           | —           | —           | rdmem, loads                                  |
-| `SS`     | —        | src0 reg           | src1 reg    | —           | wrmem, stores, cmps                           |
+| `RS`     | dst reg  | src0 reg           | —           | `.t` (rdmem)| rdmem, loads                                  |
+| `SS`     | —        | src0 reg           | src1 reg    | `.t` (wrmem)| wrmem, stores, cmps                           |
 | `RIMM`   | dst reg  | ⟵ imm16 ⟶          |             | —           | li                                            |
 | `CFG`    | cfg idx  | ⟵ imm16 ⟶          |             | —           | setcfg                                        |
 | `CFGR`   | cfg idx  | src0 reg           | —           | —           | setcfgr                                       |
@@ -507,6 +544,7 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 | Field         | Values                                                   |
 | ------------- | -------------------------------------------------------- |
 | matmul flags  | `flags[0]=.acc` (accumulate), `flags[1]=.rq` (requant)  |
+| DMA flags     | `flags[0]=.t` (transpose, §4.6) on `rdmem`/`wrmem`      |
 | branch cond   | `eq=0b00`, `ne=0b01`, `lt=0b10`, `ge=0b11`              |
 | wait unit     | `mxu=0b00`, `vpu=0b01`, `dma=0b10`, `link=0b11`         |
 | neighbor dir  | `n=0`, `e=1`, `s=2`, `w=3`                               |
@@ -514,7 +552,7 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 
 **Config registers.** Host-presettable while idle (`cfg_we`), runtime-writable with
 `setcfg` (16-bit immediate, zero-extended) and `setcfgr` (a register, full 32 bits).
-Indices `14..15` remain unassigned and can be named `cfg14`/`cfg15`.
+Indices `18..31` remain unassigned and can be named `cfg18`…`cfg31`.
 
 | Idx | Name      | Drives                                                        |
 | --- | --------- | ------------------------------------------------------------- |
@@ -532,9 +570,16 @@ Indices `14..15` remain unassigned and can be named `cfg14`/`cfg15`.
 | 11  | `vcols`   | `vecmatmul` key rows                                          |
 | 12  | `vrow0`   | `vecmatmul` `src0` row stride, bytes                          |
 | 13  | `vrow1`   | `vecmatmul` `src1` row stride, bytes                          |
+| 14  | `vcrow`   | `vecmatmul` dst row stride, bytes (int32) — the MXU owns `crow` |
+| 15  | `tcols`   | `rdmem.t`/`wrmem.t` source row length, elements (0 ⇒ `len`)   |
+| 16  | `tsrow`   | `rdmem.t`/`wrmem.t` source row stride, bytes (0 ⇒ `tcols`)    |
+| 17  | `tdrow`   | `rdmem.t`/`wrmem.t` destination row stride, bytes (0 ⇒ 1)     |
 
 `vscalar` is deliberately separate from `scalar`: the MXU's requant word and a VPU
 macro-op's are live at the same time inside a layer.
+
+`CFG_AW` is **5**, not 4: the transpose geometry is three registers and only index 15 was
+free. Widening the file cost nothing in the encoding — `dst` is 8 bits — and left 14 spare.
 
 **`setcfg` vs `setcfgr`.** `setcfg` takes an immediate, so the value is fixed at assembly
 time. `setcfgr cfgname, rN` takes it from a register, which is what lets a geometry vary at

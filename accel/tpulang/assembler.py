@@ -114,7 +114,7 @@ from dataclasses import dataclass
 
 # --- register file / config file sizing (mirrors scalar_unit.sv defaults) -----
 NUM_REGS = 32  # 2**REG_AW, REG_AW = 5
-NUM_CFG = 16  # 2**CFG_AW, CFG_AW = 4
+NUM_CFG = 32  # 2**CFG_AW, CFG_AW = 5
 
 # --- config register names (scalar_unit.sv CFG_*) -----------------------------
 CFG_NAMES = {
@@ -139,7 +139,13 @@ CFG_NAMES = {
     "vrow1": 13,    # vecmatmul src1 row stride, bytes
     "vcrow": 14,    # vecmatmul dst row stride, bytes (int32). Distinct from
                     # `crow`, which is the MXU's — a layer has both live at once.
-}   # 15 unassigned
+    # DMA transpose geometry (docs/dma.md §5), read only by `rdmem.t`/`wrmem.t`.
+    # The source is walked row-major and the destination transposed, so these
+    # three describe the *source* shape and where its columns land.
+    "tcols": 15,    # source row length in elements  (0 => len: one row)
+    "tsrow": 16,    # source row stride, bytes       (0 => tcols: dense)
+    "tdrow": 17,    # destination row stride, bytes  (0 => 1)
+}   # 18..31 unassigned
 
 # --- branch condition codes (scalar_unit.sv C_*) ------------------------------
 COND_CODES = {"eq": 0b00, "ne": 0b01, "lt": 0b10, "ge": 0b11}
@@ -235,8 +241,13 @@ SPECS: dict[str, Spec] = {
     # denominator between its internal passes.
     "softmax": Spec(0x20, "RRR", {}),
     # memory / comms
-    "wrmem": Spec(0x06, "SS", {}),  # scratch(src0) -> DRAM(src1)
-    "rdmem": Spec(0x07, "RS", {}),  # DRAM(src0) -> scratch(dst)
+    # `.t` transposes: the source is read row-major (cfg tcols/tsrow) and the
+    # destination written transposed (cfg tdrow). Both ops had a spare flags
+    # field, so the mode costs no opcode — and carrying it in the instruction
+    # rather than inferring it from nonzero strides keeps a stale cfg from
+    # rearranging an unrelated plain copy (docs/macro_ops.md §4.0).
+    "wrmem": Spec(0x06, "SS", {"t": 0b01}),  # scratch(src0) -> DRAM(src1)
+    "rdmem": Spec(0x07, "RS", {"t": 0b01}),  # DRAM(src0) -> scratch(dst)
     "wrneigh": Spec(0x08, "NEIGH", {}),  # local(src0) -> neighbor(src1), dir=flags
     # scalar
     "adds": Spec(0x10, "RRR", {}),

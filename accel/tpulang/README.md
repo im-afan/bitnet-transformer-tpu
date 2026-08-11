@@ -108,11 +108,19 @@ VPU vector length comes from `cfg 'vlen'`; MXU token count from `cfg 'tlen'`.
 length from `cfg 'len'`):
 
 ```
-wrmem    rscratch, rdram                DMA scratchpad → DRAM (spill)
-rdmem    rscratch, rdram                DMA DRAM → scratchpad (fill)
+wrmem[.t] rscratch, rdram               DMA scratchpad → DRAM (spill)
+rdmem[.t] rscratch, rdram               DMA DRAM → scratchpad (fill)
 wrneigh  rmy, rnb, dir                  push local DRAM → neighbor DRAM
                                          dir: n|e|s|w or 0..3
 ```
+
+`.t` **transposes**: the source is read row-major over `cfg 'tcols'` elements per row at
+`cfg 'tsrow'` byte stride, and the destination is written transposed at `cfg 'tdrow'`.
+Source and destination must be different regions. Each of the three registers falls back
+to the value that makes the mode a plain copy when left at 0, so a forgotten `setcfg`
+gives an untransposed result rather than a scribble. See
+[`../tpu/docs/dma.md`](../tpu/docs/dma.md) §5 and
+[`examples/transpose_dma.tpu`](examples/transpose_dma.tpu).
 
 **Scalar / control:**
 
@@ -125,7 +133,11 @@ li       rdst, imm16                    rdst = sign_extend(imm16)
 loads    rdst, raddr                    rdst = scratch[raddr]        (int32)
 stores   raddr, rval                    scratch[raddr] = rval        (int32)
 setcfg   cfgname, imm16                 cfg[name] = zero_extend(imm16)
-                                         cfgname: tlen|vlen|len|scalar (or cfgN)
+                                         cfgname: tlen|vlen|len|scalar|ktiles|
+                                         ntiles|arow|crow|wcol|vscalar|vrows|
+                                         vcols|vrow0|vrow1|vcrow|tcols|tsrow|
+                                         tdrow (or cfgN, N < 32)
+setcfgr  cfgname, rN                    cfg[name] = rN   (runtime value)
 branch   cond, label                    if cond (from prior cmps): pc = label
 beq/bne/blt/bge label                   same, condition baked in (cond: eq|ne|lt|ge)
 jmp      label                          pc = label
@@ -177,7 +189,9 @@ a` — a tidy way to keep the address arithmetic obvious. This is only a conveni
 a requirement: because the DMA truly copies, a scratch buffer and its DRAM tile can sit at
 different addresses. [`tiled_matmul.tpu`](examples/tiled_matmul.tpu) uses that to **stream
 tiles** — each `rdmem` pulls one tile from an advancing DRAM address into a small *fixed*
-scratchpad buffer, so A, W and C can each be far larger than the scratchpad.
+scratchpad buffer, so A, W and C can each be far larger than the scratchpad. A `.t`
+transfer is the one case where the convention *cannot* hold: a transpose is not safe in
+place, so its two regions are necessarily distinct.
 
 ### 2.3 Data layout
 
@@ -212,6 +226,7 @@ Each stages its own operands over DRAM (§2.2) and ends in `halt`.
 | [`tiled_matmul.tpu`](examples/tiled_matmul.tpu) | streams a big `A@W` tile-by-tile: nested M/N/K loops (`li/muls/adds/cmps/branch/jmp`) `rdmem` each tile into fixed buffers, then `matmul` → `matmul.acc` → `matmul.acc.rq` — scratchpad use is fixed regardless of matrix size |
 | [`vpu_matmul.tpu`](examples/vpu_matmul.tpu) | a matmul with **no** ternary operand, so the MXU cannot help: attention's `S = Q@K^T` as a `T x T` nest of `vecdot`, contracting over the head dim — `K^T` is never materialised — then a per-row `requant` back to int8 for softmax |
 | [`softmax_row.tpu`](examples/softmax_row.tpu) | a multi-op micro-sequence + scalar↔vector interplay (`redmax → sadd → exp → redsum → sdiv`) — illustrative only, see the caveat below |
+| [`transpose_dma.tpu`](examples/transpose_dma.tpu) | `Vᵀ` and `Qᵀ` out of a fused `[T][3D]` QKV block in one dispatch each — `wrmem.t` (spill) and `rdmem.t` (fill), with `tsrow` reading a column slice in place |
 
 > **`softmax_row.tpu` does not compute a correct softmax.** It is not type-correct:
 > `exp`, `redsum` and `sdiv` read int8 operands at stride 1, but the `sadd` and `exp`

@@ -71,8 +71,11 @@ Both have room; check this before adding anything else.
   and the whole of `0x20–0x3E`. No pressure.
 - **`flags` is only 2 bits and `matmul` already uses both** (`acc`, `rq`). A "tiled" bit
   does not fit — hence a new opcode rather than a flag.
-- **`cfg` is `CFG_AW=4` = 16 registers**, of which `0..3` are assigned (`tlen`, `vlen`,
-  `len`, `scalar`). Twelve free; this proposal takes ten.
+- **`cfg` was `CFG_AW=4` = 16 registers**, of which `0..3` are assigned (`tlen`, `vlen`,
+  `len`, `scalar`). Twelve free; this proposal takes eleven (ten below, plus `vcrow`).
+  *Since built:* the DMA's transpose geometry (`dma.md` §5) needed three more, so `CFG_AW`
+  is now **5** — 32 registers, `0..17` assigned. Widening cost only the register file; the
+  `dst` field was already 8 bits.
 - **`setcfg` is immediate-only** (`CFG` form: `cfg[dst] = zero_extend(imm16)`). There is no
   register→config path, so no config value can vary at runtime. §9.2 needs one; see
   `setcfgr` below.
@@ -95,8 +98,10 @@ Both have room; check this before adding anything else.
 | 12 | `vrow0` | 16 | `vecmatmul` `src0` row stride in bytes |
 | 13 | `vrow1` | 16 | `vecmatmul` `src1` row stride in bytes |
 
-Leaves `cfg14`/`cfg15` free. `vscalar` is deliberately *not* `cfg3 scalar` — that one is the
-MXU's requant word, and the two are live simultaneously inside a layer.
+Plus `vcrow` at 14 (`vecmatmul`'s dst row stride, distinct from the MXU's `crow`). 15..17
+later went to the DMA transpose geometry (`dma.md` §5); 18..31 are free. `vscalar` is
+deliberately *not* `cfg3 scalar` — that one is the MXU's requant word, and the two are live
+simultaneously inside a layer.
 
 `vrows` and `vcols` are separate because `vecmatmul` is **not square** in general: decode
 attends one query row against `t+1` key rows (§9.2). `vpu_matmul.tpu`'s square `T × T`
@@ -283,6 +288,10 @@ contracting over `cfg vlen`, with `src0`/`src1` row strides from `cfg vrow0`/`cf
 tensor). K is read row-major, so **`K^T` is never materialized** — the transpose is
 implicit in the loop order, exactly as `vpu_matmul.tpu` already documents. Output is int32
 at `cfg crow` stride.
+
+That implicit transpose covers `Q@K^T` and **not** `P@V`, which contracts over keys — V's
+*row* axis — and so needs a real `V^T` whichever way round you write it. That is the DMA's
+job rather than this op's: `wrmem.t`/`rdmem.t` ([dma.md](dma.md) §5) do it in one dispatch.
 
 `vrows` and `vcols` are independent so decode (`vrows=1`, `vcols=t+1`) and prefill
 (`vrows=vcols=T`) are the same instruction. Both come from `setcfgr` when they vary.

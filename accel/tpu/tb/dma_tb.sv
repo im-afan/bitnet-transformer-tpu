@@ -8,6 +8,10 @@
 //   FILL  (ReadMemory)  : preload DRAM, DMA -> scratchpad, verify scratchpad
 //   SPILL (WriteMemory) : preload scratchpad, DMA -> DRAM, verify DRAM
 //   ROUND-TRIP          : spill a region, wipe scratch, fill it back, compare
+//   TRANSPOSE (`.t`)    : both directions, against an explicit [r][c] -> [c][r]
+//                         reference — including a strided source slice, a
+//                         partial last row, a strided scatter, and the
+//                         all-zero-geometry case that must stay a plain copy
 //
 // Reference model is a plain byte memcpy. Also checks corners (len 0/1, unaligned
 // bases, len not a multiple of the scratchpad width, a high DRAM address) and the
@@ -37,6 +41,8 @@ module dma_tb;
     logic [SCRATCHPAD_ADDR_W-1:0]  dma_scratch_addr;
     logic [MEM_ADDR_W-1:0]         dma_dram_addr;
     logic [15:0]                   dma_len;
+    logic                          dma_transpose;
+    logic [15:0]                   dma_tcols, dma_tsrow, dma_tdrow;
     logic                          dma_busy, dma_done;
 
     // ---- DMA <-> sram_controller --------------------------------------------
@@ -75,7 +81,10 @@ module dma_tb;
         .scratchpad_wdata(spad_wdata), .scratchpad_wstrb(spad_wstrb),
         .dma_start(dma_start), .dma_write(dma_write),
         .dma_scratch_addr(dma_scratch_addr), .dma_dram_addr(dma_dram_addr),
-        .dma_len(dma_len), .dma_busy(dma_busy), .dma_done(dma_done)
+        .dma_len(dma_len),
+        .dma_transpose(dma_transpose), .dma_tcols(dma_tcols),
+        .dma_tsrow(dma_tsrow), .dma_tdrow(dma_tdrow),
+        .dma_busy(dma_busy), .dma_done(dma_done)
     );
 
     // =========================================================================
@@ -152,14 +161,24 @@ module dma_tb;
     // -------------------------------------------------------------------------
     // Dispatch one transfer and wait for done, asserting the handshake.
     // -------------------------------------------------------------------------
-    task automatic run_dma(input logic wr,
-                           input [SCRATCHPAD_ADDR_W-1:0] saddr,
-                           input [MEM_ADDR_W-1:0] daddr,
-                           input [15:0] len);
+    // Full form: carries the `.t` flag and its geometry. `run_dma` below is the
+    // linear-mode wrapper, which leaves all three stride registers at 0 — so
+    // every plain transfer in this bench also proves that a leftover geometry
+    // cannot reach an unflagged copy.
+    task automatic run_dma_t(input logic wr,
+                             input [SCRATCHPAD_ADDR_W-1:0] saddr,
+                             input [MEM_ADDR_W-1:0] daddr,
+                             input [15:0] len,
+                             input logic tr,
+                             input [15:0] tcols,
+                             input [15:0] tsrow,
+                             input [15:0] tdrow);
         int guard;
         @(negedge clk);
         dma_write = wr; dma_scratch_addr = saddr; dma_dram_addr = daddr;
-        dma_len = len; dma_start = 1'b1;
+        dma_len = len;
+        dma_transpose = tr; dma_tcols = tcols; dma_tsrow = tsrow; dma_tdrow = tdrow;
+        dma_start = 1'b1;
         @(negedge clk);
         dma_start = 1'b0;                 // one-cycle pulse
         guard = 0;
@@ -167,13 +186,20 @@ module dma_tb;
             @(negedge clk);
             guard++;
             if (guard > 20000) begin
-                $display("  FAIL run_dma: no done (wr=%0d len=%0d)", wr, len);
-                errors++; disable run_dma;
+                $display("  FAIL run_dma: no done (wr=%0d len=%0d tr=%0d)", wr, len, tr);
+                errors++; disable run_dma_t;
             end
         end
         @(negedge clk);
         chk(!dma_done, "done is single-cycle pulse");
         chk(!dma_busy, "busy low after done");
+    endtask
+
+    task automatic run_dma(input logic wr,
+                           input [SCRATCHPAD_ADDR_W-1:0] saddr,
+                           input [MEM_ADDR_W-1:0] daddr,
+                           input [15:0] len);
+        run_dma_t(wr, saddr, daddr, len, 1'b0, 16'd0, 16'd0, 16'd0);
     endtask
 
     // -------------------------------------------------------------------------
@@ -216,6 +242,71 @@ module dma_tb;
     endtask
 
     // -------------------------------------------------------------------------
+    // Transpose mode. The reference is written out as the permutation itself
+    // rather than as a second address generator, so a shared bug in the two
+    // cannot cancel: source element (r,c) lives at `src + r*tsrow + c` and must
+    // land at `dst + c*tdrow + r`.
+    //
+    // `tsrow > rlen` is the column-slice case (the source is a window of a wider
+    // matrix); `tdrow > rows` is the same on the destination side.
+    // -------------------------------------------------------------------------
+    task automatic test_fill_t(input [SCRATCHPAD_ADDR_W-1:0] saddr,
+                               input [MEM_ADDR_W-1:0] daddr,
+                               input int rows, input int rlen,
+                               input [15:0] tsrow, input [15:0] tdrow,
+                               input string tag);
+        logic [7:0] b, want;
+        // Poison the whole source window, then write the live slice, so a
+        // generator that walks the padding is caught rather than tolerated.
+        for (int i = 0; i < rows * tsrow; i++) sram_mem[daddr + i] = 8'hEE;
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < rlen; c++)
+                sram_mem[daddr + r*tsrow + c] = 8'((r * 31 + c * 7 + 1));
+
+        run_dma_t(1'b0, saddr, daddr, 16'(rows * rlen), 1'b1,
+                  16'(rlen), tsrow, tdrow);
+
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < rlen; c++) begin
+                want = 8'((r * 31 + c * 7 + 1));
+                spad_read_byte((saddr + c*tdrow + r), b);
+                chk(b === want, $sformatf("%s[%0d][%0d]", tag, r, c));
+                if (b !== want)
+                    $display("    fill.t %s src(%0d,%0d)->dst+%0d: exp %02h got %02h",
+                             tag, r, c, c*tdrow + r, want, b);
+            end
+        $display("[FILL.t  %-8s] %0dx%0d  tsrow=%0d tdrow=%0d  (errors: %0d)",
+                 tag, rows, rlen, tsrow, tdrow, errors);
+    endtask
+
+    task automatic test_spill_t(input [SCRATCHPAD_ADDR_W-1:0] saddr,
+                                input [MEM_ADDR_W-1:0] daddr,
+                                input int rows, input int rlen,
+                                input [15:0] tsrow, input [15:0] tdrow,
+                                input string tag);
+        logic [7:0] want;
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < rlen; c++)
+                spad_write_byte((saddr + r*tsrow + c), 8'((r * 17 + c * 3 + 5)));
+        for (int i = 0; i < rlen * tdrow; i++) sram_mem[daddr + i] = 8'hEE;
+
+        run_dma_t(1'b1, saddr, daddr, 16'(rows * rlen), 1'b1,
+                  16'(rlen), tsrow, tdrow);
+
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < rlen; c++) begin
+                want = 8'((r * 17 + c * 3 + 5));
+                chk(sram_mem[daddr + c*tdrow + r] === want,
+                    $sformatf("%s[%0d][%0d]", tag, r, c));
+                if (sram_mem[daddr + c*tdrow + r] !== want)
+                    $display("    spill.t %s src(%0d,%0d)->dst+%0d: exp %02h got %02h",
+                             tag, r, c, c*tdrow + r, want, sram_mem[daddr + c*tdrow + r]);
+            end
+        $display("[SPILL.t %-8s] %0dx%0d  tsrow=%0d tdrow=%0d  (errors: %0d)",
+                 tag, rows, rlen, tsrow, tdrow, errors);
+    endtask
+
+    // -------------------------------------------------------------------------
     // Stimulus.
     // -------------------------------------------------------------------------
     logic [7:0] b;
@@ -225,6 +316,7 @@ module dma_tb;
 
         dma_start = 0; dma_write = 0; dma_scratch_addr = 0; dma_dram_addr = 0;
         dma_len = 0;
+        dma_transpose = 0; dma_tcols = 0; dma_tsrow = 0; dma_tdrow = 0;
         for (int i = 0; i < SRAM_SZ; i++) sram_mem[i] = '0;
 
         repeat (4) @(posedge clk);
@@ -267,6 +359,73 @@ module dma_tb;
             chk(b === 8'((i*13+9)), $sformatf("roundtrip[%0d]", i));
         end
         $display("[ROUNDTRIP] len=40  (errors: %0d)", errors);
+
+        // ---- Transpose mode -------------------------------------------------
+        // Square and non-square, both directions. Dense: tsrow == row length,
+        // tdrow == row count.
+        test_fill_t (16'h5000, 19'h20000, 8,  8,  16'd8,  16'd8,  "sq8");
+        test_spill_t(16'h5200, 19'h20200, 8,  8,  16'd8,  16'd8,  "sq8s");
+        test_fill_t (16'h5400, 19'h20400, 5,  9,  16'd9,  16'd5,  "5x9");
+        test_spill_t(16'h5600, 19'h20600, 9,  5,  16'd5,  16'd9,  "9x5");
+
+        // The attention case: a 32-column slice of a [24][96] block — the source
+        // rows are 96 bytes apart and only 32 bytes of each are read, which is
+        // how V comes out of a fused QKV projection. Result: a dense [32][24] V^T.
+        test_fill_t (16'h6000, 19'h21000, 24, 32, 16'd96, 16'd24, "slice");
+        test_spill_t(16'h6800, 19'h22000, 24, 32, 16'd96, 16'd24, "slices");
+
+        // Destination is itself a window of something wider (tdrow > rows).
+        test_fill_t (16'h7000, 19'h23000, 6,  4,  16'd4,  16'd16, "dwin");
+
+        // Unaligned bases on both sides.
+        test_fill_t (16'h7803, 19'h24005, 7,  3,  16'd3,  16'd7,  "unal");
+
+        // Degenerate geometries.
+        //   (a) all three unset: `.t` must be a plain linear copy.
+        for (int i = 0; i < 24; i++) sram_mem[19'h25000 + i] = 8'((i * 9 + 2));
+        run_dma_t(1'b0, 16'h7A00, 19'h25000, 16'd24, 1'b1, 16'd0, 16'd0, 16'd0);
+        for (int i = 0; i < 24; i++) begin
+            spad_read_byte(16'h7A00 + i[SCRATCHPAD_ADDR_W-1:0], b);
+            chk(b === 8'((i * 9 + 2)), $sformatf("t-unset[%0d]", i));
+        end
+        $display("[FILL.t  unset   ] len=24 == plain copy  (errors: %0d)", errors);
+
+        //   (b) one row (tcols unset) with a destination stride: a strided
+        //       scatter, which is the same address generator seen end-on.
+        for (int i = 0; i < 10; i++) sram_mem[19'h25100 + i] = 8'((i * 11 + 3));
+        run_dma_t(1'b0, 16'h7B00, 19'h25100, 16'd10, 1'b1, 16'd0, 16'd0, 16'd4);
+        for (int i = 0; i < 10; i++) begin
+            spad_read_byte(16'h7B00 + 4*i[SCRATCHPAD_ADDR_W-1:0], b);
+            chk(b === 8'((i * 11 + 3)), $sformatf("t-scatter[%0d]", i));
+        end
+        $display("[FILL.t  scatter ] stride 4  (errors: %0d)", errors);
+
+        //   (c) len that is not a whole number of rows: the transfer stops
+        //       part-way through the last row and writes nothing beyond it.
+        for (int i = 0; i < 64; i++) sram_mem[19'h25200 + i] = 8'((i + 1));
+        for (int i = 0; i < 64; i++) spad_write_byte(16'h7C00 + i[SCRATCHPAD_ADDR_W-1:0], 8'h00);
+        run_dma_t(1'b0, 16'h7C00, 19'h25200, 16'd14, 1'b1, 16'd4, 16'd4, 16'd4);
+        for (int i = 0; i < 14; i++) begin       // 3 full rows + 2 of the 4th
+            spad_read_byte(16'h7C00 + ((i % 4) * 4 + (i / 4)), b);
+            chk(b === 8'(i + 1), $sformatf("t-partial[%0d]", i));
+        end
+        spad_read_byte(16'h7C00 + (2*4 + 3), b); // (3,2): past the 14th byte
+        chk(b === 8'h00, "t-partial stops at len");
+        $display("[FILL.t  partial ] len=14 of 4x4  (errors: %0d)", errors);
+
+        // Round-trip through DRAM: transposing on the way out and back gives
+        // the identity — the composition the layer program actually relies on.
+        for (int i = 0; i < 48; i++)
+            spad_write_byte(16'h7E00 + i[SCRATCHPAD_ADDR_W-1:0], 8'((i*7 + 4)));
+        run_dma_t(1'b1, 16'h7E00, 19'h26000, 16'd48, 1'b1, 16'd6, 16'd6, 16'd8);
+        for (int i = 0; i < 48; i++)
+            spad_write_byte(16'h7E00 + i[SCRATCHPAD_ADDR_W-1:0], 8'h00);
+        run_dma_t(1'b0, 16'h7E00, 19'h26000, 16'd48, 1'b1, 16'd8, 16'd8, 16'd6);
+        for (int i = 0; i < 48; i++) begin
+            spad_read_byte(16'h7E00 + i[SCRATCHPAD_ADDR_W-1:0], b);
+            chk(b === 8'((i*7 + 4)), $sformatf("t-roundtrip[%0d]", i));
+        end
+        $display("[ROUNDTRIP.t] 8x6 -> 6x8 -> 8x6  (errors: %0d)", errors);
 
         // Summary.
         $display("==== done: %0d checks, %0d errors ====", checks, errors);

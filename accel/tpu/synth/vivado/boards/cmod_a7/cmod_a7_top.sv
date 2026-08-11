@@ -47,7 +47,7 @@ module cmod_a7_top #(
     parameter int ADDR_W     = 16,
     parameter int XLEN       = 32,
     parameter int IMEM_AW    = 10,
-    parameter int CFG_AW     = 4,
+    parameter int CFG_AW     = 5,
     parameter int REG_AW     = 5,
     parameter int M0_W       = 12,
     parameter int N_W        = 4,

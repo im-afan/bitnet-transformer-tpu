@@ -325,12 +325,37 @@ def vpu_matmul(c: dict, get_in, get_out) -> list:
     ]
 
 
+def transpose_dma(c: dict, get_in, get_out) -> list:
+    """``V^T`` and ``Q^T`` out of a fused QKV block — examples/transpose_dma.tpu.
+
+    The device does this with two DMA dispatches (`wrmem.t` and `rdmem.t`); here
+    it is ``.t()`` on a slice of the same block, so the check is against what a
+    transpose *means* rather than against another index calculation.
+
+    Both slices are checked, and they are read from opposite ends of the row: Q
+    at column 0 exercises the fill direction with a zero source offset, V at
+    column 2D exercises the spill direction with the row stride actually doing
+    work. A transfer that ignored `tsrow` would return the first D columns of the
+    flattened block for both and fail on V.
+    """
+    T, D, D3 = c["T"], c["D"], c["D3"]
+    block = i8_tensor(get_in, c["QKV"], (T, D3))
+
+    return [
+        Check(f"V^T = QKV[:, 2D:3D].T   [{D}x{T}] int8",
+              block[:, 2 * D:3 * D].t(), i8_tensor(get_out, c["VT"], (D, T))),
+        Check(f"Q^T = QKV[:, 0:D].T     [{D}x{T}] int8",
+              block[:, 0:D].t(), i8_tensor(get_out, c["QT"], (D, T))),
+    ]
+
+
 # ---- registry ---------------------------------------------------------------
 # Programs are identified by their own .equ constants, the same way
 # gen_vectors.program_kind picks an input-image builder — not by filename, so a
 # renamed or derived program still resolves.
 
 KERNELS = [
+    ("transpose_dma", lambda c: "VT" in c,       transpose_dma),
     ("relu_layer",   lambda c: "RLU" in c,       relu_layer),
     ("vector_add",   lambda c: "VEC_BYTES" in c, vector_add),
     ("tiled_matmul", lambda c: "MTILES" in c,    tiled_matmul),

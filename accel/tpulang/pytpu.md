@@ -165,7 +165,8 @@ p.requant(dst, src, param)
 p.relu(dst, s);  p.gelu(dst, s);  p.exp(dst, s);  p.square(dst, s)
 p.redmax(dst, s);  p.redsum(dst, s)
 
-p.rdmem(scratch, dram);  p.wrmem(scratch, dram)     # length from cfg 'len'
+p.rdmem(scratch, dram, t=False)                     # length from cfg 'len';
+p.wrmem(scratch, dram, t=False)                     #   t=True -> .t (transpose)
 p.stores(addr, value);   v = p.loads(addr)          # loads RETURNS a new Reg
 ```
 
