@@ -161,7 +161,7 @@ def calibrate_activations(model, run_forward):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d, q_heads, kv_heads, head_dim, use_ternary=False):
+    def __init__(self, d, q_heads, kv_heads, head_dim, use_ternary=False, use_bias=True):
         super().__init__()
 
         assert q_heads % kv_heads == 0
@@ -172,10 +172,10 @@ class MultiHeadAttention(nn.Module):
         self.heads_per_q = q_heads // kv_heads
         self.head_dim = head_dim
 
-        self.Wq = make_linear(d, q_heads * self.head_dim, use_ternary)
-        self.Wk = make_linear(d, kv_heads * self.head_dim, use_ternary)
-        self.Wv = make_linear(d, kv_heads * self.head_dim, use_ternary)
-        self.Wo = make_linear(q_heads * self.head_dim, d, use_ternary)
+        self.Wq = make_linear(d, q_heads * self.head_dim, use_ternary, bias=use_bias)
+        self.Wk = make_linear(d, kv_heads * self.head_dim, use_ternary, bias=use_bias)
+        self.Wv = make_linear(d, kv_heads * self.head_dim, use_ternary, bias=use_bias)
+        self.Wo = make_linear(q_heads * self.head_dim, d, use_ternary, bias=use_bias)
 
     def forward(self, X, attn_mask, use_custom_attention=False):
         batch_size = X.shape[0]
@@ -206,31 +206,33 @@ class Transformer(nn.Module):
         kv_heads,
         head_dim,
         use_ternary=False,
+        use_bias=True,
     ):
         super().__init__()
 
         self.use_ternary = use_ternary
 
         self.attention = MultiHeadAttention(
-            d, q_heads, kv_heads, head_dim, use_ternary=use_ternary
+            d, q_heads, kv_heads, head_dim, use_ternary=use_ternary, use_bias=use_bias
         )
-        self.norm1 = nn.LayerNorm(d)
+        # self.norm1 = nn.LayerNorm(d)
 
-        
+
         self.ff = nn.Sequential(
-            make_linear(d, f, use_ternary),
+            make_linear(d, f, use_ternary, bias=use_bias),
             nn.ReLU(),
-            make_linear(f, d, use_ternary),
+            make_linear(f, d, use_ternary, bias=use_bias),
         )
 
-        self.norm2 = nn.LayerNorm(d)
+        # self.norm2 = nn.LayerNorm(d)
         self.dropout = nn.Dropout(p=0.1)
 
     def forward(self, X, attn_mask, use_custom_attention=False):
-        X = self.norm1(
-            X + self.dropout(self.attention(X, attn_mask, use_custom_attention))
-        )
-        return self.norm2(X + self.dropout(self.ff(X)))
+        # X = self.norm1(
+            # X + self.dropout(self.attention(X, attn_mask, use_custom_attention))
+        # )
+        X = self.dropout(self.attention(X, attn_mask, use_custom_attention))
+        return X + self.dropout(self.ff(X))
 
 
 class Model(nn.Module):
@@ -244,6 +246,7 @@ class Model(nn.Module):
         kv_heads=8,
         head_dim=None,
         use_ternary=False,
+        use_bias=True,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -269,11 +272,12 @@ class Model(nn.Module):
                     self.kv_heads,
                     self.head_dim,
                     use_ternary=use_ternary,
+                    use_bias=use_bias,
                 )
                 for i in range(layers)
             ]
         )
-        self.fc = nn.Linear(self.d, self.vocab_size)
+        self.fc = nn.Linear(self.d, self.vocab_size, bias=use_bias)
         self.dropout = nn.Dropout(p=0.1)
 
     def positional_encoding(self, n_tokens):
@@ -328,6 +332,10 @@ def adder_gqa():
 
 
 def adder_ternary_vanilla():
+    # use_bias=False: the TPU's VPU has no row-broadcast operand, so a [N] bias
+    # over [T, N] costs a T-iteration vecadd/requant loop per linear (~5 per
+    # layer). Dropping the biases keeps a hand-written tpulang layer
+    # straight-line. See accel/tpulang/tpunn.md.
     model = Model(
         len(numbers_data.VOCAB),
         d=128,
@@ -336,5 +344,6 @@ def adder_ternary_vanilla():
         q_heads=4,
         kv_heads=4,
         use_ternary=True,
+        use_bias=False,
     )
     return model
