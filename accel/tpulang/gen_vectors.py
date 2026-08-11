@@ -275,6 +275,194 @@ def build_matmul_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
 
 
 # =============================================================================
+# Strided matmul (examples/strided_matmul.tpu): one tile *in place* inside a
+# larger matrix, exercising the arow/wcol/crow config strides rather than a
+# tile-shaped copy of the operands.
+# =============================================================================
+def build_strided_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
+    """Full M x K / K x N operands, plus a reference in which only the selected
+    tile of C changes and every other element keeps its seeded value."""
+    if c["ROWS"] != ROWS or c["COLS"] != COLS:
+        raise SystemExit(f"strided geometry ROWS/COLS must be {ROWS}/{COLS} "
+                         f"(DUT array size), got {c['ROWS']}/{c['COLS']}")
+    M, K, N = c["M"], c["K"], c["N"]
+    TI, TJ = c["TI"], c["TJ"]
+    A, W, Cb = c["A"], c["W"], c["C"]
+    AROW, WCOL, CROW = c["AROW"], c["WCOL"], c["CROW"]
+
+    # Deterministic operands, distinct patterns from build_matmul_image's so a
+    # copy-paste of the wrong builder is obvious.
+    a_full = [[((m * 5 + k * 3) % 9) - 4 for k in range(K)] for m in range(M)]
+    w_full = [[((k * 2 + n) % 3) - 1 for k in range(K)] for n in range(N)]
+    # C is seeded non-zero: the tile the matmul does *not* touch must come back
+    # byte-identical, which is what catches a stride that walks off the tile.
+    c_full = [[((m * 7 + n * 11) % 61) - 30 for n in range(N)] for m in range(M)]
+
+    img: dict[int, int] = {}
+
+    def put(addr: int, byte: int):
+        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        img[addr] = byte & 0xFF
+
+    for m in range(M):                      # A: M x K int8, row-major
+        for k in range(K):
+            put(A + m * AROW + k, a_full[m][k])
+
+    for n in range(N):                      # W: K x N trits, col-major 2b packed
+        colvals = [w_full[n][k] for k in range(K)]
+        for b, byte in enumerate(pack_wcol(colvals, WCOL)):
+            put(W + n * WCOL + b, byte)
+
+    for m in range(M):                      # C: M x N int32, row-major
+        for n in range(N):
+            v = c_full[m][n] & 0xFFFFFFFF
+            for b in range(4):
+                put(Cb + m * CROW + n * 4 + b, (v >> (8 * b)) & 0xFF)
+
+    # Reference: C unchanged except the one tile, which is a plain int32 matmul
+    # over the tile's own rows/columns (no requant — the program uses `matmul`).
+    ref: dict[int, int] = {}
+    for m in range(M):
+        for n in range(N):
+            in_tile = (TI * ROWS <= m < (TI + 1) * ROWS and
+                       TJ * COLS <= n < (TJ + 1) * COLS)
+            if in_tile:
+                val = sum(a_full[m][TJ * ROWS + i] * w_full[n][TI * ROWS + i]
+                          for i in range(ROWS))
+            else:
+                val = c_full[m][n]
+            # check_reference() compares signed bytes (s8), so store the four
+            # int32 bytes in that same convention rather than raw unsigned.
+            val &= 0xFFFFFFFF
+            for b in range(4):
+                ref[Cb + m * CROW + n * 4 + b] = s8((val >> (8 * b)) & 0xFF)
+
+    tpu.cfg[CFG_TLEN] = ROWS
+    return img, ref, {"M": M, "N": N, "K": K}
+
+
+# =============================================================================
+# Hardware-tiled matmul (examples/tiled_matmul_hw.tpu): the whole M x K @ K x N
+# contraction as one `matmul_t`, over a flat row-major layout.
+# =============================================================================
+def build_tiled_hw_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
+    """Flat A/W/RQW operands, plus a reference for both output forms.
+
+    The reference is a plain Python matmul over the *full* K, computed in one
+    go — deliberately not tile-by-tile. Matching it is what shows the hardware's
+    n-outer/k-inner decomposition reassembles the same contraction.
+    """
+    if c["ROWS"] != ROWS or c["COLS"] != COLS:
+        raise SystemExit(f"tiled_hw geometry ROWS/COLS must be {ROWS}/{COLS} "
+                         f"(DUT array size), got {c['ROWS']}/{c['COLS']}")
+    M, K, N = c["M"], c["K"], c["N"]
+    A, W, C32, C8 = c["A"], c["W"], c["C32"], c["C8"]
+    AROW, WCOL, CROW = c["AROW"], c["WCOL"], c["CROW"]
+
+    a_full = [[((m * 3 + k * 5) % 9) - 4 for k in range(K)] for m in range(M)]
+    w_full = [[((k + 3 * n) % 3) - 1 for k in range(K)] for n in range(N)]
+
+    img: dict[int, int] = {}
+
+    def put(addr: int, byte: int):
+        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        img[addr] = byte & 0xFF
+
+    for m in range(M):                      # A: M x K int8, row-major
+        for k in range(K):
+            put(A + m * AROW + k, a_full[m][k])
+
+    for n in range(N):                      # W: K x N trits, col-major 2b packed
+        for b, byte in enumerate(pack_wcol([w_full[n][k] for k in range(K)], WCOL)):
+            put(W + n * WCOL + b, byte)
+
+    word = requant_word()                   # identity requant (m0=1, n=0)
+    for b in range(4):
+        put(c["RQW"] + b, (word >> (8 * b)) & 0xFF)
+
+    ref: dict[int, int] = {}
+    for m in range(M):
+        for n in range(N):
+            acc = sum(a_full[m][k] * w_full[n][k] for k in range(K))
+            v = acc & 0xFFFFFFFF
+            for b in range(4):              # int32 result
+                ref[C32 + m * CROW + n * 4 + b] = s8((v >> (8 * b)) & 0xFF)
+            ref[C8 + m * N + n] = clip8(acc)   # requantized int8 result
+
+    tpu.cfg[CFG_TLEN] = M
+    tpu.cfg[CFG_SCALAR] = c["RQW"]
+    return img, ref, {"M": M, "N": N, "K": K}
+
+
+# =============================================================================
+# vecmatmul (examples/vecmatmul.tpu): an attention score block as one macro op.
+# =============================================================================
+def build_vecmatmul_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
+    """Q/K operands plus the reference S = Q @ K^T, computed directly in Python."""
+    TQ, TK, DH = c["TQ"], c["TK"], c["DH"]
+    Q, K, S = c["Q"], c["K"], c["S"]
+    QROW, KROW, SROW = c["QROW"], c["KROW"], c["SROW"]
+
+    q_full = [[((t * 7 + d * 3) % 15) - 7 for d in range(DH)] for t in range(TQ)]
+    k_full = [[((s * 5 + d * 2) % 13) - 6 for d in range(DH)] for s in range(TK)]
+
+    img: dict[int, int] = {}
+
+    def put(addr: int, byte: int):
+        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        img[addr] = byte & 0xFF
+
+    for t in range(TQ):
+        for d in range(DH):
+            put(Q + t * QROW + d, q_full[t][d])
+    for s in range(TK):
+        for d in range(DH):
+            put(K + s * KROW + d, k_full[s][d])
+
+    ref: dict[int, int] = {}
+    for t in range(TQ):
+        for s in range(TK):
+            acc = sum(q_full[t][d] * k_full[s][d] for d in range(DH)) & 0xFFFFFFFF
+            for b in range(4):
+                ref[S + t * SROW + s * 4 + b] = s8((acc >> (8 * b)) & 0xFF)
+
+    tpu.cfg[CFG_VLEN] = DH
+    return img, ref, {"M": TQ, "N": TK, "K": DH}
+
+
+# =============================================================================
+# softmax_rows (examples/softmax_rows.tpu): a block of rows as one macro op.
+# =============================================================================
+def build_softmax_rows_image(tpu: TPU, c: dict) -> dict:
+    """Seed the score rows and the requant word. No independent reference here:
+    the result is a chain of LUT + fixed-point steps whose *definition* is the
+    hardware's pass structure, so re-deriving it in Python would only restate
+    iss.py. torch_ref.py checks it against PyTorch instead, which is the
+    genuinely independent comparison."""
+    img: dict[int, int] = {}
+
+    def put(addr: int, byte: int):
+        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        img[addr] = byte & 0xFF
+
+    ROWS_, N = c["ROWS"], c["N"]
+    for t in range(ROWS_):
+        for i in range(N):
+            # A spread wide enough that the row max really matters, and
+            # different per row so a stuck max would show up.
+            put(c["X"] + t * c["SROW"] + i, ((t * 11 + i * 7) % 41) - 20)
+
+    # {m0=1, n=1}: halve then clip, landing x-max in the exp table's input scale
+    # without collapsing the distribution to a couple of entries.
+    word = requant_word(1, 1)
+    for b in range(4):
+        put(c["RQW"] + b, (word >> (8 * b)) & 0xFF)
+
+    tpu.cfg[CFG_VLEN] = N
+    return img
+
+
+# =============================================================================
 # Dispatch: pick the input image from the program's own constants.
 # =============================================================================
 def program_kind(consts: dict) -> str:
@@ -285,6 +473,14 @@ def program_kind(consts: dict) -> str:
     """
     if "MTILES" in consts:
         return "tiled_matmul"
+    if "C32" in consts:             # tiled_matmul_hw: whole contraction in HW
+        return "tiled_matmul_hw"
+    if "TQ" in consts:              # vecmatmul: attention block as a macro op
+        return "vecmatmul"
+    if "TROW" in consts:            # softmax_rows: row block as a macro op
+        return "softmax_rows"
+    if "AROW" in consts:            # strided_matmul: config-stride window
+        return "strided_matmul"
     if "VEC_BYTES" in consts:
         return "vector_add"
     if "D_HEAD" in consts:
@@ -302,6 +498,14 @@ def build_image(tpu: TPU, consts: dict) -> tuple[dict, dict | None, dict | None]
     kind = program_kind(consts)
     if kind == "tiled_matmul":
         return build_matmul_image(tpu, consts)
+    if kind == "tiled_matmul_hw":
+        return build_tiled_hw_image(tpu, consts)
+    if kind == "vecmatmul":
+        return build_vecmatmul_image(tpu, consts)
+    if kind == "softmax_rows":
+        return build_softmax_rows_image(tpu, consts), None, None
+    if kind == "strided_matmul":
+        return build_strided_image(tpu, consts)
     if kind == "vector_add":
         return build_vector_add_image(tpu, consts), None, None
     if kind == "vpu_matmul":

@@ -58,8 +58,15 @@ module mxu_tb;
         .clk(clk), .rst_n(rst_n),
         .start(start), .act_addr(act_addr), .weight_addr(weight_addr),
         .out_addr(out_addr), .scalar_addr(scalar_addr), .t_len(t_len),
+        // Strides zero => the single-tile defaults (a_row=ROWS, c_row=COLS*4,
+        // w_col=ROWS*2/8), i.e. exactly the constants these replaced. Driving
+        // them explicitly rather than leaving them unconnected: an unconnected
+        // input floats to z, and `a_row == '0` on z is x, which poisons every
+        // address the DUT generates.
+        .tiled(1'b0), .a_row(ADDR_W'(0)), .c_row(ADDR_W'(0)), .w_col(ADDR_W'(0)),
+        .k_tiles(8'd1), .n_tiles(8'd1),
         .accumulate(accumulate), .requant(requant),
-        .busy(busy), .done(done),
+        .busy(busy), .done(done), .load_active(),
         .A_re(A_re), .A_raddr(A_raddr), .A_rdata(A_rdata),
         .W_re(W_re), .W_raddr(W_raddr), .W_rdata(W_rdata),
         .C_re(C_re), .C_raddr(C_raddr), .C_rdata(C_rdata),

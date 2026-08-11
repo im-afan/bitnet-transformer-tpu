@@ -35,12 +35,12 @@ module vpu_tb;
     localparam int LANES        = SCRATCHPAD_W / 4;   // 16 int32 lanes
 
     // ---- Op encoding (matches vpu.sv) ---------------------------------------
-    localparam logic [3:0]
-        VOP_DOT         = 4'd0,  VOP_ADD        = 4'd1,  VOP_SCALAR_MUL = 4'd2,
-        VOP_RELU        = 4'd3,  VOP_GELU       = 4'd4,  VOP_SQUARE     = 4'd5,
-        VOP_EXP         = 4'd6,  VOP_REDUCEMAX  = 4'd7,  VOP_REDUCESUM  = 4'd8,
-        VOP_ELEMENT_MUL = 4'd9,  VOP_REQUANT    = 4'd10, VOP_SCALAR_ADD = 4'd11,
-        VOP_SCALAR_DIV  = 4'd12;
+    localparam logic [4:0]
+        VOP_DOT         = 5'd0,  VOP_ADD        = 5'd1,  VOP_SCALAR_MUL = 5'd2,
+        VOP_RELU        = 5'd3,  VOP_GELU       = 5'd4,  VOP_SQUARE     = 5'd5,
+        VOP_EXP         = 5'd6,  VOP_REDUCEMAX  = 5'd7,  VOP_REDUCESUM  = 5'd8,
+        VOP_ELEMENT_MUL = 5'd9,  VOP_REQUANT    = 5'd10, VOP_SCALAR_ADD = 5'd11,
+        VOP_SCALAR_DIV  = 5'd12, VOP_VECMATMUL  = 5'd13, VOP_SOFTMAX    = 5'd14;
 
     // ---- Scratchpad address map (generous spacing; int8 chunks over-read) ---
     localparam logic [ADDR_W-1:0] A_ADDR  = 16'h1000;  // src0
@@ -59,7 +59,11 @@ module vpu_tb;
     // DUT interface.
     // -------------------------------------------------------------------------
     logic                      vpu_start;
-    logic [3:0]                vpu_op;
+    logic [4:0]                vpu_op;
+    // Macro-op geometry (docs/macro_ops.md §5). Driven per test; the
+    // primitive-op tests leave them at the defaults set in `initial`.
+    logic [15:0]               vpu_rows, vpu_cols;
+    logic [ADDR_W-1:0]         vpu_row0, vpu_row1, vpu_crow;
     logic [ADDR_W-1:0]         vpu_src0, vpu_src1, vpu_scalar, vpu_dst;
     logic [9:0]                vpu_vlen;
     logic                      vpu_busy, vpu_done;
@@ -81,7 +85,13 @@ module vpu_tb;
         .vpu_start(vpu_start), .vpu_op(vpu_op),
         .vpu_src0(vpu_src0), .vpu_src1(vpu_src1),
         .vpu_scalar(vpu_scalar), .vpu_dst(vpu_dst),
-        .vpu_vlen(vpu_vlen), .vpu_busy(vpu_busy), .vpu_done(vpu_done),
+        .vpu_vlen(vpu_vlen),
+        // Macro-op geometry: unused by the primitive ops this TB exercises.
+        // Rows/cols of 0 read as 1 inside the DUT, so even if a macro op were
+        // dispatched here it would degrade to a single pair rather than hang.
+        .vpu_rows(vpu_rows), .vpu_cols(vpu_cols),
+        .vpu_row0(vpu_row0), .vpu_row1(vpu_row1), .vpu_crow(vpu_crow),
+        .vpu_busy(vpu_busy), .vpu_done(vpu_done),
         .V_re(V_re), .V_raddr(V_raddr), .V_rdata(V_rdata),
         .V_we(V_we), .V_waddr(V_waddr), .V_wdata(V_wdata), .V_wstrb(V_wstrb)
     );
@@ -159,7 +169,7 @@ module vpu_tb;
     // Dispatch one op and wait for completion (issue-and-wait handshake).
     // Inputs are driven on the negedge; the DUT samples on the posedge.
     // -------------------------------------------------------------------------
-    task automatic run_op(input logic [3:0] op,
+    task automatic run_op(input logic [4:0] op,
                           input logic [ADDR_W-1:0] s0, s1, sc, d,
                           input int vlen);
         @(negedge clk);
@@ -302,12 +312,92 @@ module vpu_tb;
         $display("[%s] vlen=%0d m0=%0d n=%0d  (errors so far: %0d)", tag, vlen, m0, n, errors);
     endtask
 
+    // Reference for VOP_SCALAR_DIV / softmax's normalize pass: reciprocate the
+    // divisor once, then multiply and round — mirroring vpu.sv's datapath rather
+    // than doing a true division, because the reciprocal's truncation is part of
+    // the result. Widths are 64-bit: a8 * R needs RECIP_Q+8 bits.
+    localparam int RECIP_Q_TB = 31;
+    localparam int DIV_Q_TB   = 15;
+    function automatic int ref_sdiv(input int a8, input int d);
+        longint unsigned R;
+        longint          prod, q;
+        int              shift;
+        if (d == 0) R = (64'd1 << (RECIP_Q_TB + 1)) - 64'd1;   // saturates
+        else        R = (64'd1 << RECIP_Q_TB) / (d < 0 ? -d : d);
+        prod  = longint'(a8) * longint'(R);
+        shift = RECIP_Q_TB - DIV_Q_TB;
+        q     = (shift == 0) ? prod : ((prod + (64'd1 << (shift - 1))) >>> shift);
+        return int'(d < 0 ? -q : q);
+    endfunction
+
+    // -------------------------------------------------------------------------
+    // Macro op: softmax over `rows` rows of `vlen` int8 elements.
+    //
+    // The reference recomputes the hardware's four passes in the same order and
+    // at the same widths — max, then exp_lut[requant(x-max)] stored as int8,
+    // then the int32 sum of those bytes, then the Q(DIV_Q) divide. It is
+    // deliberately NOT a floating-point softmax: the int8 intermediate and the
+    // LUT *are* the numerics, so a float reference would be checking a
+    // different function.
+    // -------------------------------------------------------------------------
+    localparam int SM_SRC = 16'h0000;
+    localparam int SM_TMP = 16'h0400;
+    localparam int SM_DST = 16'h0800;
+    localparam int SM_RQW = 16'h0F00;
+
+    task automatic test_softmax(input int rows, input int vlen,
+                                input int m0, input int n,
+                                input string tag);
+        int srow, trow, drow;
+        int mx, den, idx, ev;
+        srow = vlen;          // int8 source rows, packed
+        trow = vlen + 4;      // int8 exp values + the int32 denominator slot
+        drow = vlen * 4;      // int32 result rows
+
+        // Seed the source rows and the requant word.
+        for (int t = 0; t < rows; t++)
+            for (int i = 0; i < vlen; i++)
+                mem[SM_SRC + t*srow + i] = 8'(((t*11 + i*7) % 41) - 20);
+        put32(SM_RQW, (n << 12) | m0);
+
+        vpu_rows = 16'(rows);
+        vpu_row0 = ADDR_W'(srow);
+        vpu_row1 = ADDR_W'(trow);
+        vpu_crow = ADDR_W'(drow);
+        run_op(VOP_SOFTMAX, ADDR_W'(SM_SRC), ADDR_W'(SM_TMP),
+               ADDR_W'(SM_RQW), ADDR_W'(SM_DST), vlen);
+
+        for (int t = 0; t < rows; t++) begin
+            mx = -128;
+            for (int i = 0; i < vlen; i++)
+                if ($signed(mem[SM_SRC + t*srow + i]) > mx)
+                    mx = $signed(mem[SM_SRC + t*srow + i]);
+            den = 0;
+            for (int i = 0; i < vlen; i++) begin
+                idx = ref_requant($signed(mem[SM_SRC + t*srow + i]) - mx, m0, n);
+                ev  = $signed(dut.exp_rom[idx & 8'hFF]);
+                exp8(SM_TMP + t*trow + i, ev, {tag, "-exp"});
+                den += ev;
+            end
+            exp32(SM_TMP + t*trow + vlen, den, {tag, "-den"});
+            for (int i = 0; i < vlen; i++) begin
+                ev = $signed(mem[SM_TMP + t*trow + i]);
+                exp32(SM_DST + t*drow + i*4, ref_sdiv(ev, den), {tag, "-p"});
+            end
+        end
+        $display("[%s] rows=%0d vlen=%0d m0=%0d n=%0d  (errors so far: %0d)",
+                 tag, rows, vlen, m0, n, errors);
+        vpu_rows = 16'd0;   // leave the primitive-op defaults behind
+    endtask
+
     // -------------------------------------------------------------------------
     // Stimulus.
     // -------------------------------------------------------------------------
     initial begin
         vpu_start = 1'b0; vpu_op = '0;
         vpu_src0 = '0; vpu_src1 = '0; vpu_scalar = '0; vpu_dst = '0; vpu_vlen = '0;
+        vpu_rows = 16'd0; vpu_cols = 16'd0;
+        vpu_row0 = '0; vpu_row1 = '0; vpu_crow = '0;
         for (int i = 0; i < MEM_SZ; i++) mem[i] = '0;
 
         // Reset.
@@ -358,6 +448,13 @@ module vpu_tb;
         test_requant(40, 1500, 10, "REQUANT");
         test_requant(33,  512,  8, "REQUANT-half");
         test_requant(20, 4095,  0, "REQUANT-noshift");
+
+        // Macro op: row-wise softmax (docs/macro_ops.md §5.1). Multiple rows,
+        // and a row length that is not a whole number of chunks, so both the
+        // row advance and the partial-tail path are exercised.
+        test_softmax(3, 20, 1, 1, "SOFTMAX");
+        test_softmax(1, 16, 1, 0, "SOFTMAX-1row-exact");
+        test_softmax(2,  5, 2, 2, "SOFTMAX-short");
 
         // Summary.
         $display("==== done: %0d checks, %0d errors ====", checks, errors);

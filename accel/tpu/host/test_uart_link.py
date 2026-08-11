@@ -63,6 +63,7 @@ from tpu_uart import (                                        # noqa: E402
     MEM_ADDR_W,
     MEM_LIMIT,
     STAT_NAK,
+    TIMER_BYTES,
     NakError,
     ProtocolError,
     ReplyTimeout,
@@ -506,36 +507,42 @@ def link_rejects_out_of_range(tpu, cfg):
 
 @board_test("link_timer_command")
 def link_timer_command(tpu, cfg):
-    """'T' answers with 4 bytes, holds still while the core is idle, and does not
-    disturb the link.
+    """'T' answers with a whole number of counter words, holds still while the
+    core is idle, and does not disturb the link.
 
     Deliberately makes no claim about the *value*: this suite runs against the
     bring-up images too (`cmod_a7_mem`, `cmod_a7_bram`), which have no scalar
-    unit and tie the counter to 0, and even on `cmod_a7` the count is whatever
-    the last run left — 0 on a freshly configured board. What is image-
-    independent is the framing: exactly four bytes come back, with no status
-    byte and no NAK, and the FSM is in IDLE afterwards.
+    unit and tie the counters to 0, and even on `cmod_a7` the count is whatever
+    the last run left — 0 on a freshly configured board.
+
+    Nor does it pin the reply *length*, which is now image-dependent:
+    `uart_interface`'s TIMER_WORDS is 1 in the bring-up images (the run-length
+    counter alone) and NPERF in `tpu_top`. What is image-independent is that the
+    reply is a positive multiple of 4 bytes, carries no status byte and no NAK,
+    and leaves the FSM in IDLE — and that word 0 is the run length either way,
+    which is why the two images stay mutually intelligible at all.
 
     The second read is the one worth having. 'T' is the only command not gated
     on `core_busy`, so it is also the only one whose reply can move under the
-    host; with the core idle the counter is frozen by definition, so two reads
-    that disagree mean the counter is free-running rather than gated on `busy`.
+    host; with the core idle the counters are frozen by definition, so two reads
+    that disagree mean they are free-running rather than gated on `busy`.
     """
-    first = raw_exchange(tpu, bytes([CMD_TIMER]), 4, 0.5)
-    if len(first) != 4:
+    first = raw_exchange(tpu, bytes([CMD_TIMER]), TIMER_BYTES, 0.5)
+    if len(first) == 0 or len(first) % 4 != 0:
         raise Failure(
             f"'T' answered {first.hex(' ') or '<nothing>'} "
-            f"({len(first)} byte(s)), expected 4"
+            f"({len(first)} byte(s)), expected a positive multiple of 4 "
+            f"(at most TIMER_BYTES={TIMER_BYTES})"
         )
-    second = raw_exchange(tpu, bytes([CMD_TIMER]), 4, 0.5)
+    second = raw_exchange(tpu, bytes([CMD_TIMER]), TIMER_BYTES, 0.5)
     if second != first:
         raise Failure(
             f"'T' moved with the core idle: {first.hex(' ')} then "
-            f"{second.hex(' ')} — the counter is not gated on `busy`"
+            f"{second.hex(' ')} — the counters are not gated on `busy`"
         )
     link_alive(tpu, cfg.base)
-    print(f"     'T' = {int.from_bytes(first, 'big')} clocks, stable, "
-          f"link still usable")
+    print(f"     'T' = {len(first) // 4} word(s), run={int.from_bytes(first[:4], 'big')} "
+          f"clocks, stable, link still usable")
 
 
 @board_test("sram_long_transfer", slow=True)

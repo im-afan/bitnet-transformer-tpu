@@ -117,7 +117,29 @@ NUM_REGS = 32  # 2**REG_AW, REG_AW = 5
 NUM_CFG = 16  # 2**CFG_AW, CFG_AW = 4
 
 # --- config register names (scalar_unit.sv CFG_*) -----------------------------
-CFG_NAMES = {"tlen": 0, "vlen": 1, "len": 2, "scalar": 3}
+CFG_NAMES = {
+    # original four
+    "tlen": 0,      # MXU token count T
+    "vlen": 1,      # VPU vector length (elements)
+    "len": 2,       # DMA / wrneigh byte count
+    "scalar": 3,    # MXU requant {m0,n} word address
+    # MXU hardware tiling geometry (docs/macro_ops.md §3/§4)
+    "ktiles": 4,    # contraction tiles = K / ROWS
+    "ntiles": 5,    # output tiles      = N / COLS
+    "arow": 6,      # activation row stride, bytes (= K)
+    "crow": 7,      # result row stride, bytes (= N*4, or N when requantizing)
+    "wcol": 8,      # weight column stride, bytes (= K*2/8)
+    # VPU macro-op geometry (docs/macro_ops.md §5)
+    "vscalar": 9,   # macro-op {m0,n} word address (distinct from `scalar`:
+                    # the MXU's requant word is live at the same time)
+    "vrows": 10,    # row count (softmax/layernorm rows; vecmatmul query rows)
+    "vcols": 11,    # vecmatmul key rows — independent of vrows, so decode
+                    # (1 x t+1) and prefill (T x T) are the same instruction
+    "vrow0": 12,    # vecmatmul src0 row stride, bytes
+    "vrow1": 13,    # vecmatmul src1 row stride, bytes
+    "vcrow": 14,    # vecmatmul dst row stride, bytes (int32). Distinct from
+                    # `crow`, which is the MXU's — a layer has both live at once.
+}   # 15 unassigned
 
 # --- branch condition codes (scalar_unit.sv C_*) ------------------------------
 COND_CODES = {"eq": 0b00, "ne": 0b01, "lt": 0b10, "ge": 0b11}
@@ -184,6 +206,12 @@ class Spec:
 SPECS: dict[str, Spec] = {
     # compute / dispatch
     "matmul": Spec(0x00, "RRR", {"acc": 0b01, "rq": 0b10}),
+    # Same operands and flags as `matmul`, but the operands are tiles of a larger
+    # matrix and the strides come from cfg arow/crow/wcol. A distinct opcode
+    # rather than a third flag: `matmul`'s flags field is 2 bits and both are
+    # taken, and gating on "the stride registers happen to be nonzero" would let
+    # one program's leftover config corrupt the next program's plain matmul.
+    "matmul_t": Spec(0x1D, "RRR", {"acc": 0b01, "rq": 0b10}),
     "vecdot": Spec(0x01, "RRR", {}),
     "vecmul": Spec(0x02, "RRR", {}),
     "vecadd": Spec(0x03, "RRR", {}),
@@ -197,6 +225,15 @@ SPECS: dict[str, Spec] = {
     "redsum": Spec(0x0E, "RR", {}),
     "sadd": Spec(0x0F, "RRR", {}),
     "sdiv": Spec(0x1B, "RRR", {}),
+    # VPU macro op: S[t][s] = sum_d src0[t][d]*src1[s][d] over cfg vrows x vcols,
+    # contracting cfg vlen. Attention's Q@K^T and P@V — both operands are int8
+    # activations, which the ternary-weight MXU cannot multiply at all.
+    "vecmatmul": Spec(0x1E, "RRR", {}),
+    # Row-wise softmax: `softmax dst, src, tmp`. Rows from cfg vrows, row length
+    # from cfg vlen, requant {m0,n} from cfg vscalar. The tmp row must be
+    # vlen+4 bytes -- the trailing int32 is where the hardware parks the
+    # denominator between its internal passes.
+    "softmax": Spec(0x20, "RRR", {}),
     # memory / comms
     "wrmem": Spec(0x06, "SS", {}),  # scratch(src0) -> DRAM(src1)
     "rdmem": Spec(0x07, "RS", {}),  # DRAM(src0) -> scratch(dst)
@@ -208,6 +245,10 @@ SPECS: dict[str, Spec] = {
     "cmps": Spec(0x13, "SS", {}),
     "li": Spec(0x14, "RIMM", {}),
     "setcfg": Spec(0x15, "CFG", {}),
+    # Register -> config. The immediate form freezes every macro-op geometry at
+    # assembly time; this is what lets one vary at runtime (docs/macro_ops.md
+    # §9.2 — decode's key count grows by one per step).
+    "setcfgr": Spec(0x1C, "CFGR", {}),
     "loads": Spec(0x16, "RS", {}),  # dst = scratch[src0]
     "stores": Spec(0x17, "SS", {}),  # scratch[src0] = src1
     # control
@@ -416,6 +457,9 @@ class Assembler:
                 self._cfg(ops[0], ln),
                 self._imm16(ops[1], ln, signed_ok=False),
             )
+        if form == "CFGR":  # setcfgr cfgname, rN  (full XLEN, no extension)
+            self._need(ins, 2)
+            return _pack(spec.opcode, self._cfg(ops[0], ln), reg(ops[1]))
         if form == "BRANCH":  # branch cond, label
             self._need(ins, 2)
             cond = ops[0].lower()

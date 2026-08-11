@@ -45,9 +45,18 @@ OP_EXP, OP_REDMAX, OP_REDSUM, OP_SADD = 0x0C, 0x0D, 0x0E, 0x0F
 OP_ADDS, OP_SUBS, OP_MULS, OP_CMPS = 0x10, 0x11, 0x12, 0x13
 OP_LIS, OP_SETCFG, OP_LOADS, OP_STORES = 0x14, 0x15, 0x16, 0x17
 OP_BRANCH, OP_JMP, OP_WAIT, OP_SDIV, OP_HALT = 0x18, 0x19, 0x1A, 0x1B, 0x1F
+OP_SETCFGR = 0x1C
+OP_MATMUL_T = 0x1D
+OP_VECMM = 0x1E
+OP_SOFTMAX = 0x20
 
 # --- named config registers (scalar_unit.sv CFG_*) ----------------------------
 CFG_TLEN, CFG_VLEN, CFG_LEN, CFG_SCALAR = 0, 1, 2, 3
+# MXU hardware-tiling geometry (docs/macro_ops.md §3)
+CFG_KTILES, CFG_NTILES, CFG_AROW, CFG_CROW, CFG_WCOL = 4, 5, 6, 7, 8
+# VPU macro-op geometry
+CFG_VSCALAR, CFG_VROWS, CFG_VCOLS, CFG_VROW0, CFG_VROW1 = 9, 10, 11, 12, 13
+CFG_VCROW = 14   # vecmatmul dst row stride (the MXU owns CFG_CROW)
 
 # --- branch condition codes (scalar_unit.sv C_*) ------------------------------
 C_EQ, C_NE, C_LT, C_GE = 0b00, 0b01, 0b10, 0b11
@@ -213,10 +222,19 @@ class TPU:
             if opc == OP_HALT:
                 return
 
-            elif opc == OP_MATMUL:
+            elif opc in (OP_MATMUL, OP_MATMUL_T):
                 self._matmul(r_dst & addr_mask, r_src0 & addr_mask,
                              r_src1 & addr_mask, accumulate=bool(flags & 0b01),
-                             requant=bool(flags & 0b10))
+                             requant=bool(flags & 0b10),
+                             tiled=(opc == OP_MATMUL_T))
+
+            elif opc == OP_SOFTMAX:
+                self._softmax(r_dst & addr_mask, r_src0 & addr_mask,
+                              r_src1 & addr_mask)
+
+            elif opc == OP_VECMM:
+                self._vecmatmul(r_dst & addr_mask, r_src0 & addr_mask,
+                                r_src1 & addr_mask)
 
             elif opc in (OP_VECDOT, OP_VECMUL, OP_VECADD, OP_RELU, OP_GELU,
                          OP_REQUANT, OP_VECEMUL, OP_SQUARE, OP_EXP, OP_REDMAX,
@@ -243,6 +261,10 @@ class TPU:
                 self.wreg(f_dst, imm16 - 0x10000 if imm16 & 0x8000 else imm16)
             elif opc == OP_SETCFG:
                 self.cfg[f_dst & 0xF] = imm16           # zero-extended
+            elif opc == OP_SETCFGR:
+                # Register -> config, full 32 bits with no extension. Consumers
+                # mask to their own field width, matching scalar_unit.sv.
+                self.cfg[f_dst & 0xF] = r_src0 & 0xFFFFFFFF
             elif opc == OP_LOADS:
                 self.wreg(f_dst, self.rd_i32(r_src0 & addr_mask))
             elif opc == OP_STORES:
@@ -268,7 +290,7 @@ class TPU:
 
     # ---- MXU matmul (mxu.sv) -------------------------------------------------
     def _matmul(self, out_a: int, act_a: int, wgt_a: int, *,
-                accumulate: bool, requant: bool) -> None:
+                accumulate: bool, requant: bool, tiled: bool = False) -> None:
         t_len = self.cfg[CFG_TLEN] & 0x3F
         if t_len == 0:
             return
@@ -278,26 +300,151 @@ class TPU:
             rq_m0 = word & ((1 << self.m0_w) - 1)
             rq_n = (word >> self.m0_w) & ((1 << self.n_w) - 1)
 
-        # Pre-decode the ternary weight columns once (col-major, 2-bit packed).
-        wcol = []
-        for j in range(self.cols):
-            base = wgt_a + j * self.wcol_bytes
-            colint = sum(self.mem[self._a(base + b)] << (8 * b)
-                         for b in range(self.wcol_bytes))
-            wcol.append([self._trit(colint, i) for i in range(self.rows)])
+        # Operand strides. A plain `matmul` (tiled=False) ignores the config
+        # registers entirely and uses the single-tile constants, so it cannot
+        # inherit a stride an earlier program left behind — config survives
+        # across runs. `matmul_t` reads them, falling back to the same constants
+        # if one is unset. Matches how mxu.sv resolves them at dispatch.
+        # `c_row` is the int32 row stride; a requantized store writes int8 and
+        # therefore steps c_row/4, so `.acc.rq` uses both in one op.
+        a_row = (tiled and (self.cfg[CFG_AROW] & 0xFFFF)) or self.rows
+        c_row = (tiled and (self.cfg[CFG_CROW] & 0xFFFF)) or (self.cols * 4)
+        w_col = (tiled and (self.cfg[CFG_WCOL] & 0xFFFF)) or self.wcol_bytes
+        c_row_rq = c_row >> 2
 
-        res_stride = self.cols * 4    # int32 result row bytes
-        for t in range(t_len):
-            arow = [self.rd_i8(act_a + t * self.rows + i) for i in range(self.rows)]
-            for j in range(self.cols):
-                acc = sum(arow[i] * wcol[j][i] for i in range(self.rows))
-                if accumulate:      # readback stride is always the int32 stride
-                    acc += self.rd_i32(out_a + t * res_stride + j * 4)
-                if requant:
-                    self.wr_i8(out_a + t * self.cols + j,
-                               self.requant8(acc, rq_m0, rq_n))
-                else:
-                    self.wr_i32(out_a + t * res_stride + j * 4, acc)
+        # Tile counts. Zero reads as 1, matching mxu.sv, so an unset config
+        # register is a plain single-tile matmul rather than a no-op.
+        kt = (tiled and (self.cfg[CFG_KTILES] & 0xFF)) or 1
+        nt = (tiled and (self.cfg[CFG_NTILES] & 0xFF)) or 1
+
+        # n outer, k inner — the hardware's loop order. The order is not
+        # observable in the result (int32 accumulation is associative, including
+        # under two's-complement wraparound), but matching it keeps this readable
+        # against mxu.sv. Partials live in `res` across the k loop exactly as
+        # they live in the hardware's resbuf, so the scratchpad is untouched
+        # until the output tile is finished.
+        for n in range(nt):
+            out_n = out_a + n * self.cols * (1 if requant else 4)
+            res = [[0] * self.cols for _ in range(t_len)]
+
+            for k in range(kt):
+                act_k = act_a + k * self.rows
+                wgt_k = wgt_a + n * self.cols * w_col + k * self.wcol_bytes
+
+                # Ternary weight columns for this tile (col-major, 2-bit packed).
+                # Only wcol_bytes of each column are consumed — one tile's worth
+                # of rows — even when w_col strides past a taller column.
+                wcol = []
+                for j in range(self.cols):
+                    base = wgt_k + j * w_col
+                    colint = sum(self.mem[self._a(base + b)] << (8 * b)
+                                 for b in range(self.wcol_bytes))
+                    wcol.append([self._trit(colint, i) for i in range(self.rows)])
+
+                for t in range(t_len):
+                    arow = [self.rd_i8(act_k + t * a_row + i)
+                            for i in range(self.rows)]
+                    for j in range(self.cols):
+                        res[t][j] += sum(arow[i] * wcol[j][i]
+                                         for i in range(self.rows))
+
+            for t in range(t_len):
+                for j in range(self.cols):
+                    acc = res[t][j]
+                    if accumulate:  # readback stride is always the int32 stride
+                        acc += self.rd_i32(out_n + t * c_row + j * 4)
+                    if requant:
+                        self.wr_i8(out_n + t * c_row_rq + j,
+                                   self.requant8(acc, rq_m0, rq_n))
+                    else:
+                        self.wr_i32(out_n + t * c_row + j * 4, acc)
+
+    # ---- VPU macro op: softmax (vpu.sv VOP_SOFTMAX) --------------------------
+    def _softmax(self, dst: int, src: int, tmp: int) -> None:
+        """Row-wise softmax, Q(div_q) result. Four passes, as the hardware runs it.
+
+        Modelled pass-by-pass rather than as ``exp(x)/sum(exp(x))`` because the
+        intermediate *widths* are the numerics:
+
+          P0  max over the int8 source row            -> held in a register
+          P1  exp_lut[requant(x - max)]               -> int8, into tmp
+          P2  sum over the int8 tmp row               -> int32, at tmp+vlen
+          P3  round(tmp[i] * 2**div_q / sum)          -> int32, into dst
+
+        P1 is the fused pass: subtract, requantize into the exp table's input
+        scale, index the table, store **narrow**. Writing int32 there and reading
+        int8 in P2 is exactly the stride mismatch the hand-written
+        softmax_row.tpu has (its `sadd` writes 4-byte elements, its `exp` reads
+        1-byte ones), and fusing is what makes it unrepresentable.
+
+        The denominator really does round-trip through scratchpad at ``tmp+vlen``
+        — that is not a modelling shortcut, it is how the hardware hands P2's
+        result to P3 so P3 can reuse the ordinary SCALAR_DIV divisor path. Each
+        tmp row therefore needs vlen+4 bytes.
+        """
+        rows = (self.cfg[CFG_VROWS] & 0xFFFF) or 1
+        vlen = self.cfg[CFG_VLEN] & 0x3FF
+        row0 = self.cfg[CFG_VROW0] & 0xFFFF
+        row1 = self.cfg[CFG_VROW1] & 0xFFFF
+        crow = self.cfg[CFG_VCROW] & 0xFFFF
+        if vlen == 0:
+            return
+        rqw = self.rd_u32(self.cfg[CFG_VSCALAR] & (self.depth - 1))
+        m0 = rqw & ((1 << self.m0_w) - 1)
+        n = (rqw >> self.m0_w) & ((1 << self.n_w) - 1)
+
+        for t in range(rows):
+            s_row = src + t * row0
+            t_row = tmp + t * row1
+            d_row = dst + t * crow
+            den_a = t_row + vlen
+
+            # P0: row max (int8 reads), kept as a value, never stored.
+            mx = max(self.rd_i8(s_row + i) for i in range(vlen))
+
+            # P1: fused subtract -> requant -> exp LUT, stored int8.
+            for i in range(vlen):
+                # requant8 returns a signed int8; the ROM is indexed by the raw
+                # unsigned byte, exactly as vpu.sv indexes exp_rom.
+                idx = self.requant8(self.rd_i8(s_row + i) - mx, m0, n)
+                self.wr_i8(t_row + i, s8(self.exp_lut[idx & 0xFF]))
+
+            # P2: denominator over the int8 exp row, stored int32.
+            den = s32(sum(self.rd_i8(t_row + i) for i in range(vlen)))
+            self.wr_i32(den_a, den)
+
+            # P3: Q(div_q) normalize, reusing the ordinary scalar-divide path.
+            for i in range(vlen):
+                self.wr_i32(d_row + i * 4, self._sdiv(self.rd_i8(t_row + i), den))
+
+    # ---- VPU macro op: vecmatmul (vpu.sv VOP_VECMATMUL) ----------------------
+    def _vecmatmul(self, dst: int, src0: int, src1: int) -> None:
+        """S[t][s] = sum_d src0[t][d] * src1[s][d], int8 operands, int32 result.
+
+        The hardware runs this as one VOP_DOT per (t, s) pair, so the numerics
+        are exactly the dot product's: int8 reads, int32 accumulate, one int32
+        store. Modelled the same way rather than as a matrix product, because
+        that equivalence *is* the contract.
+
+        `src1` is read row-major and contracted over its own rows, so the
+        transpose in Q@K^T is implicit in the loop order — K is never
+        materialized transposed.
+        """
+        rows = (self.cfg[CFG_VROWS] & 0xFFFF) or 1
+        cols = (self.cfg[CFG_VCOLS] & 0xFFFF) or 1
+        vlen = self.cfg[CFG_VLEN] & 0x3FF
+        row0 = self.cfg[CFG_VROW0] & 0xFFFF
+        row1 = self.cfg[CFG_VROW1] & 0xFFFF
+        crow = self.cfg[CFG_VCROW] & 0xFFFF
+        if vlen == 0:
+            return
+        for t in range(rows):
+            for s in range(cols):
+                a = src0 + t * row0
+                b = src1 + s * row1
+                acc = sum(self.rd_i8(a + d) * self.rd_i8(b + d)
+                          for d in range(vlen))
+                self.wr_i32(dst + t * crow + s * 4, s32(acc))
 
     # ---- VPU (vpu.sv) --------------------------------------------------------
     def _vpu(self, opc: int, dst: int, src0: int, src1: int) -> None:

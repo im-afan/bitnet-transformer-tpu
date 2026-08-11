@@ -80,7 +80,20 @@ CMD_IMEM = 0x49   # 'I'
 CMD_GO = 0x47     # 'G'
 CMD_TIMER = 0x54  # 'T'
 
-TIMER_BYTES = 4   # width of the 'T' reply (device counter is 32-bit)
+# The 'T' reply is one 32-bit word per performance counter, MSB first both
+# within and across words. Mirrors tpu_top.sv's NPERF / PERF_* indices; the
+# order here IS the wire order, and counter 0 (the run length) comes first so a
+# reader that only wants the run length can still take the first four bytes.
+TIMER_COUNTERS = (
+    "run",    # total clocks the core was busy — the denominator for the rest
+    "mxu",    # MXU busy
+    "mload",  # MXU in its weight-load phase (subset of mxu)
+    "vpu",    # VPU busy
+    "dma",    # DMA busy
+    "swait",  # scalar unit blocked in S_WAIT (the cost of issue-and-wait)
+)
+TIMER_WORDS = len(TIMER_COUNTERS)
+TIMER_BYTES = TIMER_WORDS * 4
 
 STAT_ACK = 0x06
 STAT_NAK = 0x15
@@ -703,27 +716,73 @@ class TPUUart:
             self._send(_header(CMD_GO, pc))
             self._status()
 
-    def read_timer(self) -> int:
-        """``T`` — the scalar unit's run-length counter, in core clocks.
+    def read_counters(self) -> dict[str, int]:
+        """``T`` — the core's per-run performance counters, in core clocks.
 
-        Counts the interval the core was ``busy``: reset at the start of each
-        run ('G' → the first instruction fetch) and frozen when the program
-        halts, so after a run this is exactly how long that run took, and during
-        one it is how far it has got. Answered whether or not the core is
+        Every counter measures the same window: reset at the start of each run
+        ('G' → the first instruction fetch) and frozen when the program halts,
+        so after a run they describe exactly that run, and during one they
+        describe how far it has got. Answered whether or not the core is
         running — the one command that is.
 
-        The frame is the single command byte; the reply is 4 bytes MSB first and
-        no status, so unlike every other command there is nothing to validate,
+        Returns a dict keyed by :data:`TIMER_COUNTERS`. ``run`` is the total
+        busy interval and therefore the denominator for the others: divide to
+        get the fraction of the run each unit was active. They **overlap** and
+        do not partition the run — under issue-and-wait ``swait`` covers nearly
+        all of ``mxu``/``vpu``/``dma``, and ``mload`` is a subset of ``mxu``.
+
+        The frame is the single command byte; the reply is fixed-length with no
+        status byte, so unlike every other command there is nothing to validate,
         nothing to reject, and no NAK to disambiguate from data.
 
         Divide by the device's clock frequency for seconds (12 MHz on the Cmod
-        A7). ``0xFFFFFFFF`` is the counter saturating rather than wrapping —
-        358 s at 12 MHz, so treat it as "no plausible run is this long".
+        A7). ``0xFFFFFFFF`` is a counter saturating rather than wrapping — 358 s
+        at 12 MHz, so treat it as "no plausible run is this long".
         """
-        with self.trace.context("read_timer"):
+        with self.trace.context("read_counters"):
             self.ser.reset_input_buffer()
             self._send(bytes([CMD_TIMER]))
-            return int.from_bytes(self._recv(TIMER_BYTES), "big")
+            raw = self._recv(TIMER_BYTES)
+        return {
+            name: int.from_bytes(raw[i * 4:(i + 1) * 4], "big")
+            for i, name in enumerate(TIMER_COUNTERS)
+        }
+
+    def read_timer(self) -> int:
+        """``T``, run length only — ``read_counters()["run"]``.
+
+        Kept because the run length is what most callers want, and it is the
+        first word of the reply for exactly that reason.
+        """
+        return self.read_counters()["run"]
+
+
+def format_counters(ctr: dict[str, int], indent: str = "  ") -> str:
+    """Render :meth:`TPUUart.read_counters` as a per-run bottleneck breakdown.
+
+    Percentages are of ``run``, the total busy interval. They deliberately sum
+    to more than 100%: the counters overlap rather than partitioning the run.
+    Under issue-and-wait the scalar unit is parked in ``S_WAIT`` for nearly the
+    whole of any dispatch, so ``swait`` shadows ``mxu``/``vpu``/``dma``, and
+    ``mload`` is a sub-phase of ``mxu``. Read each line as "the fraction of the
+    run this unit was active", not as a slice of a pie.
+    """
+    labels = {
+        "mxu":   "MXU busy",
+        "mload": "  of which weight load",
+        "vpu":   "VPU busy",
+        "dma":   "DMA busy",
+        "swait": "scalar stalled (issue-and-wait)",
+    }
+    run = ctr.get("run", 0)
+    lines = [f"{indent}run{'':<32} {run:>10} clocks"]
+    for key, label in labels.items():
+        val = ctr.get(key, 0)
+        pct = f"{100.0 * val / run:5.1f}%" if run else "    - "
+        lines.append(f"{indent}{label:<35} {val:>10}  {pct}")
+    if any(v == 0xFFFFFFFF for v in ctr.values()):
+        lines.append(f"{indent}[SATURATED — at least one counter pinned]")
+    return "\n".join(lines)
 
 
 # ---- Program file parsing ---------------------------------------------------
@@ -795,7 +854,7 @@ def _build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("go", help="start the scalar unit ('G')")
     g.add_argument("pc", type=_auto_int, nargs="?", default=0)
 
-    tm = sub.add_parser("timer", help="read the run-length counter ('T')")
+    tm = sub.add_parser("timer", help="read the performance counters ('T')")
     tm.add_argument("--clk-mhz", type=float, default=12.0,
                     help="device clock, to print the count in seconds too "
                          "(default: %(default)s, the Cmod A7)")
@@ -851,10 +910,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"started at pc={args.pc} (ACK)")
 
             elif args.cmd == "timer":
-                cycles = tpu.read_timer()
-                us = cycles / args.clk_mhz
-                print(f"{cycles} clocks ({us:.1f} us @ {args.clk_mhz:g} MHz)"
-                      + ("  [SATURATED]" if cycles == 0xFFFFFFFF else ""))
+                ctr = tpu.read_counters()
+                run = ctr["run"]
+                us = run / args.clk_mhz
+                print(f"{run} clocks ({us:.1f} us @ {args.clk_mhz:g} MHz)"
+                      + ("  [SATURATED]" if run == 0xFFFFFFFF else ""))
+                print(format_counters(ctr))
 
     except (ProtocolError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

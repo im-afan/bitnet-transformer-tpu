@@ -48,6 +48,12 @@ module scalar_unit #(
     output logic                 busy,         // program executing
     output logic                 done,         // HALT reached
     output logic [IMEM_AW-1:0]   pc_dbg,        // PC, for debug/trace
+    // High while blocked in S_WAIT on a dispatched unit's `done`. This is the
+    // cost of the issue-and-wait model (§2) made measurable: perf_counters.sv
+    // integrates it over a run so control-stall time can be separated from the
+    // time the units are actually computing. Debug/telemetry only — nothing in
+    // the datapath observes it.
+    output logic                 wait_active,
 
     input  logic                 imem_we,       // host: write instruction word
     input  logic [IMEM_AW-1:0]   imem_waddr,
@@ -71,6 +77,12 @@ module scalar_unit #(
     output logic [ADDR_W-1:0]    mxu_out_addr,
     output logic [ADDR_W-1:0]    mxu_scalar_addr, // requant {M0,N} word (config reg)
     output logic [5:0]           mxu_t_len,      // token columns (config reg)
+    output logic                 mxu_tiled,      // OP_MATMUL_T: use the strides below
+    output logic [ADDR_W-1:0]    mxu_a_row,      // activation row stride (config reg)
+    output logic [ADDR_W-1:0]    mxu_c_row,      // int32 result row stride (config reg)
+    output logic [ADDR_W-1:0]    mxu_w_col,      // weight column stride (config reg)
+    output logic [7:0]           mxu_k_tiles,    // contraction tiles (config reg)
+    output logic [7:0]           mxu_n_tiles,    // output tiles (config reg)
     output logic                 mxu_accumulate, // tiling accumulate (instr flag[0])
     output logic                 mxu_requant,    // narrow store int32->int8 (instr flag[1])
     input  logic                 mxu_busy,
@@ -78,12 +90,17 @@ module scalar_unit #(
 
     // ---- VPU dispatch (vpu.md §6) -------------------------------------------
     output logic                 vpu_start,
-    output logic [3:0]           vpu_op,
+    output logic [4:0]           vpu_op,
     output logic [ADDR_W-1:0]    vpu_src0,
     output logic [ADDR_W-1:0]    vpu_src1,
     output logic [ADDR_W-1:0]    vpu_scalar,
     output logic [ADDR_W-1:0]    vpu_dst,
     output logic [9:0]           vpu_vlen,       // vector length (config reg)
+    output logic [15:0]          vpu_rows,       // macro-op rows (config reg)
+    output logic [15:0]          vpu_cols,       // vecmatmul key rows (config reg)
+    output logic [ADDR_W-1:0]    vpu_row0,       // vecmatmul src0 row stride
+    output logic [ADDR_W-1:0]    vpu_row1,       // vecmatmul src1 row stride
+    output logic [ADDR_W-1:0]    vpu_crow,       // vecmatmul dst row stride
     input  logic                 vpu_busy,
     input  logic                 vpu_done,
 
@@ -140,21 +157,73 @@ module scalar_unit #(
         OP_BRANCH  = 6'h18,  // if cond(flags) pc = imm16
         OP_JMP     = 6'h19,  // pc = imm16                   (support op)
         OP_WAIT    = 6'h1A,  // block on unit flags{0:MXU,1:VPU,2:DMA,3:LINK}
+        OP_SETCFGR = 6'h1C,  // cfg[dst] = r[src0]   (register -> config)
+        // First opcode past the original 0x00-0x1F block. The field is 6 bits,
+        // so 0x20-0x3E are free; HALT keeps 0x1F.
+        OP_SOFTMAX = 6'h20,  // VPU : macro op — row-wise softmax, Q15 result.
+                             //       dst=r[dst], src=r[src0], tmp=r[src1];
+                             //       rows from cfg vrows, row length from vlen,
+                             //       requant {m0,n} from cfg vscalar. The tmp
+                             //       row needs vlen+4 bytes: the trailing int32
+                             //       is where the denominator is parked.
+        OP_VECMM   = 6'h1E,  // VPU : macro op — S[t][s] = sum_d src0[t][d]*
+                             //       src1[s][d] over cfg vrows x vcols.
+                             //       Attention's Q@K^T / P@V: both operands
+                             //       are int8 activations, which the MXU
+                             //       (ternary weights) cannot do at all.
+        OP_MATMUL_T= 6'h1D,  // MXU : as MATMUL, but operands are tiles of a
+                             //       larger matrix — strides from cfg arow/
+                             //       crow/wcol. Same flags (acc/rq) as MATMUL.
+                             //       Separate opcode rather than a flag bit
+                             //       because MATMUL's 2-bit flags field is full,
+                             //       and because keying tiling off "the stride
+                             //       registers are nonzero" would let one
+                             //       program's leftover config change the next
+                             //       program's plain matmul (config survives
+                             //       across runs).
         OP_HALT    = 6'h1F;  // stop, raise `done`
 
-    // VPU op selector values driven on vpu_op (must match vpu.sv VOP_* codes).
-    localparam logic [3:0]
-        VOP_DOT = 4'd0, VOP_ADD = 4'd1, VOP_MUL = 4'd2, VOP_RELU = 4'd3, VOP_GELU = 4'd4,
-        VOP_SQUARE = 4'd5, VOP_EXP = 4'd6, VOP_REDUCEMAX = 4'd7, VOP_REDUCESUM = 4'd8,
-        VOP_ELEMENT_MUL = 4'd9, VOP_REQUANT = 4'd10, VOP_SCALAR_ADD = 4'd11,
-        VOP_SCALAR_DIV = 4'd12;
+    // OP_SETCFGR is what makes a config value *runtime* rather than compile-time.
+    // OP_SETCFG takes an immediate, so every geometry a macro op reads from the
+    // config file would otherwise be frozen at assembly time — fine for prefill,
+    // fatal for incremental decode, where the attended key count grows by one
+    // per step (docs/macro_ops.md §9.2). The config file already has a write
+    // port; this only muxes its data source.
 
-    // Named config registers (host- or SETCFG-written; scalar_unit.md §6).
+    // VPU op selector values driven on vpu_op (must match vpu.sv VOP_* codes).
+    // 5 bits, not 4: codes 0..12 were already assigned and the macro ops
+    // (docs/macro_ops.md §5) would have landed the field exactly full, leaving
+    // no room to add another. Widening costs three port declarations.
+    localparam logic [4:0]
+        VOP_DOT = 5'd0, VOP_ADD = 5'd1, VOP_MUL = 5'd2, VOP_RELU = 5'd3, VOP_GELU = 5'd4,
+        VOP_SQUARE = 5'd5, VOP_EXP = 5'd6, VOP_REDUCEMAX = 5'd7, VOP_REDUCESUM = 5'd8,
+        VOP_ELEMENT_MUL = 5'd9, VOP_REQUANT = 5'd10, VOP_SCALAR_ADD = 5'd11,
+        VOP_SCALAR_DIV = 5'd12, VOP_VECMATMUL = 5'd13,
+        VOP_SOFTMAX = 5'd14;   // VOP_SM_EXP (15) is internal to vpu.sv
+
+    // Named config registers (host-, SETCFG- or SETCFGR-written; scalar_unit.md
+    // §6). 0..3 are the original set; 4..13 carry the macro ops' geometry
+    // (docs/macro_ops.md §3). 14/15 remain unassigned.
     localparam logic [CFG_AW-1:0]
         CFG_TLEN   = 'd0, // MXU token count T -> mxu_t_len
         CFG_VLEN   = 'd1, // VPU vector length -> vpu_vlen
         CFG_LEN    = 'd2, // DMA / WriteNeighbor byte length
-        CFG_SCALAR = 'd3; // MXU requant {M0,N} word address -> mxu_scalar_addr
+        CFG_SCALAR = 'd3, // MXU requant {M0,N} word address -> mxu_scalar_addr
+        CFG_KTILES = 'd4, // MXU contraction tiles  = K / ROWS
+        CFG_NTILES = 'd5, // MXU output tiles       = N / COLS
+        CFG_AROW   = 'd6, // MXU activation row stride, bytes (= K)
+        CFG_CROW   = 'd7, // MXU result row stride, bytes (= N*4, or N requantized)
+        CFG_WCOL   = 'd8, // MXU weight column stride, bytes (= K*2/8)
+        CFG_VSCALAR= 'd9, // VPU macro-op {m0,n} word address (NOT CFG_SCALAR:
+                          //   the MXU's is live at the same time)
+        CFG_VROWS  = 'd10,// VPU macro-op row count (vecmatmul: query rows)
+        CFG_VCOLS  = 'd11,// vecmatmul key rows — independent of VROWS so decode
+                          //   (1 x t+1) and prefill (T x T) are the same op
+        CFG_VROW0  = 'd12,// vecmatmul src0 row stride, bytes
+        CFG_VROW1  = 'd13,// vecmatmul src1 row stride, bytes
+        CFG_VCROW  = 'd14;// vecmatmul dst row stride, bytes (int32).
+                          //   Separate from CFG_CROW: that one is the
+                          //   MXU's, and a layer has both live at once.
 
     // Dispatch-target selector (also the WAIT flags encoding).
     localparam logic [1:0] U_MXU = 2'd0, U_VPU = 2'd1, U_DMA = 2'd2, U_LINK = 2'd3;
@@ -220,18 +289,47 @@ module scalar_unit #(
     // (`core_busy`), so the host's view of "safe to load" now matches the
     // scalar unit's.
     // -------------------------------------------------------------------------
+    // Reset to zero. Previously unreset, which was invisible only because every
+    // program set each config register it read: an unset one was X in
+    // simulation and whatever the fabric powered up with on hardware. That
+    // stopped being harmless once zero acquired a meaning — the MXU reads
+    // `a_row`/`c_row`/`w_col` on every dispatch and takes zero as "use the
+    // single-tile default" (mxu.sv), so an undefined register poisons the
+    // address generators of programs that never mention them.
     logic [XLEN-1:0] cfg [0:(1<<CFG_AW)-1];
-    logic            cfg_prog_we;   // SETCFG write strobe
-    always_ff @(posedge clk) begin
-        if (cfg_we && !busy)
+    logic            cfg_prog_we;   // SETCFG  write strobe (immediate source)
+    logic            cfg_reg_we;    // SETCFGR write strobe (register source)
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            for (int ci = 0; ci < (1<<CFG_AW); ci++) cfg[ci] <= '0;
+        else if (cfg_we && !busy)
             cfg[cfg_waddr] <= cfg_wdata;
         else if (cfg_prog_we)
             cfg[a_dst[CFG_AW-1:0]] <= {{(XLEN-16){1'b0}}, imm16};
+        else if (cfg_reg_we)
+            // SETCFGR: full XLEN from the register file, no extension. The
+            // consumers below slice what they need, so a value too wide for a
+            // field truncates exactly as the immediate form would.
+            cfg[a_dst[CFG_AW-1:0]] <= r_src0;
     end
 
     assign mxu_t_len      = cfg[CFG_TLEN][5:0];
     assign mxu_scalar_addr = cfg[CFG_SCALAR][ADDR_W-1:0];
+    // Only consulted when `mxu_tiled` is set (OP_MATMUL_T). A plain OP_MATMUL
+    // ignores them outright, so it cannot inherit a stride an earlier program
+    // left behind — config registers are not cleared between runs.
+    assign mxu_tiled      = (opc == OP_MATMUL_T);
+    assign mxu_a_row      = cfg[CFG_AROW][ADDR_W-1:0];
+    assign mxu_c_row      = cfg[CFG_CROW][ADDR_W-1:0];
+    assign mxu_w_col      = cfg[CFG_WCOL][ADDR_W-1:0];
+    assign mxu_k_tiles    = cfg[CFG_KTILES][7:0];
+    assign mxu_n_tiles    = cfg[CFG_NTILES][7:0];
     assign vpu_vlen       = cfg[CFG_VLEN][9:0];
+    assign vpu_rows       = cfg[CFG_VROWS][15:0];
+    assign vpu_cols       = cfg[CFG_VCOLS][15:0];
+    assign vpu_row0       = cfg[CFG_VROW0][ADDR_W-1:0];
+    assign vpu_row1       = cfg[CFG_VROW1][ADDR_W-1:0];
+    assign vpu_crow       = cfg[CFG_VCROW][ADDR_W-1:0];
     assign dma_len        = cfg[CFG_LEN][15:0];
     assign nb_len         = cfg[CFG_LEN][15:0];
 
@@ -257,11 +355,17 @@ module scalar_unit #(
 
     assign vpu_src0   = r_src0[ADDR_W-1:0];
     assign vpu_src1   = r_src1[ADDR_W-1:0];
-    assign vpu_scalar = r_src1[ADDR_W-1:0];   // VECMUL/SADD scalar, SDIV divisor,
-                                              // REQUANT {n,m0} addr
+    // VECMUL/SADD scalar, SDIV divisor, REQUANT {n,m0} addr — normally the third
+    // register operand. SOFTMAX is the exception: its three registers are
+    // dst/src/tmp, so there is no operand slot left for the requant word and it
+    // comes from cfg vscalar instead (docs/macro_ops.md §5.1).
+    assign vpu_scalar = (opc == OP_SOFTMAX) ? cfg[CFG_VSCALAR][ADDR_W-1:0]
+                                            : r_src1[ADDR_W-1:0];
     assign vpu_dst    = r_dst [ADDR_W-1:0];
     always_comb begin
         unique case (opc)
+            OP_VECMM:   vpu_op = VOP_VECMATMUL;
+            OP_SOFTMAX: vpu_op = VOP_SOFTMAX;
             OP_VECDOT:  vpu_op = VOP_DOT;
             OP_VECADD:  vpu_op = VOP_ADD;
             OP_VECMUL:  vpu_op = VOP_MUL;
@@ -295,12 +399,12 @@ module scalar_unit #(
                (o == OP_RELU)    || (o == OP_GELU)    || (o == OP_SQUARE)   ||
                (o == OP_EXP)     || (o == OP_REDMAX)  || (o == OP_REDSUM)   ||
                (o == OP_VECEMUL) || (o == OP_REQUANT) || (o == OP_SADD)     ||
-               (o == OP_SDIV);
+               (o == OP_SDIV)    || (o == OP_VECMM) || (o == OP_SOFTMAX);
     endfunction
 
     // Is this opcode a compute/comms dispatch (assert start, then wait on done)?
     function automatic logic is_dispatch(input logic [5:0] o);
-        return is_vpu_op(o) || (o == OP_MATMUL) ||
+        return is_vpu_op(o) || (o == OP_MATMUL) || (o == OP_MATMUL_T) ||
                (o == OP_WRMEM) || (o == OP_RDMEM) || (o == OP_WRNEIGH);
     endfunction
 
@@ -308,7 +412,7 @@ module scalar_unit #(
     function automatic logic [1:0] dispatch_unit(input logic [5:0] o);
         unique case (1'b1)
             is_vpu_op(o):                               dispatch_unit = U_VPU;
-            (o == OP_MATMUL):                           dispatch_unit = U_MXU;
+            (o == OP_MATMUL), (o == OP_MATMUL_T):        dispatch_unit = U_MXU;
             (o == OP_WRMEM), (o == OP_RDMEM):           dispatch_unit = U_DMA;
             (o == OP_WRNEIGH):                          dispatch_unit = U_LINK;
             default:                                    dispatch_unit = U_MXU;
@@ -328,7 +432,7 @@ module scalar_unit #(
     end
 
     // start pulses: asserted only in S_EXEC, only for the matching dispatch op.
-    assign mxu_start = (state == S_EXEC) && (opc == OP_MATMUL);
+    assign mxu_start = (state == S_EXEC) && ((opc == OP_MATMUL) || (opc == OP_MATMUL_T));
     assign vpu_start = (state == S_EXEC) && is_vpu_op(opc);
     assign dma_start = (state == S_EXEC) && ((opc == OP_WRMEM) || (opc == OP_RDMEM));
     assign nb_start  = (state == S_EXEC) && (opc == OP_WRNEIGH);
@@ -384,6 +488,7 @@ module scalar_unit #(
         rf_waddr    = a_dst;
         rf_wdata    = '0;
         cfg_prog_we = 1'b0;
+        cfg_reg_we  = 1'b0;
 
         if (state == S_EXEC) begin
             unique case (opc)
@@ -391,7 +496,8 @@ module scalar_unit #(
                 OP_SUBS:   begin rf_we = 1'b1; rf_wdata = r_src0 - r_src1; end
                 OP_MULS:   begin rf_we = 1'b1; rf_wdata = r_src0 * r_src1; end
                 OP_LIS:    begin rf_we = 1'b1; rf_wdata = {{(XLEN-16){imm16[15]}}, imm16}; end
-                OP_SETCFG: cfg_prog_we = 1'b1;
+                OP_SETCFG:  cfg_prog_we = 1'b1;
+                OP_SETCFGR: cfg_reg_we  = 1'b1;
                 default:   ;   // LOADS commits in S_LOAD; others don't write rf
             endcase
         end else if (state == S_LOAD) begin
@@ -447,5 +553,6 @@ module scalar_unit #(
     assign busy   = (state != S_IDLE) && (state != S_HALT);
     assign done   = (state == S_HALT);
     assign pc_dbg = pc;
+    assign wait_active = (state == S_WAIT);
 
 endmodule

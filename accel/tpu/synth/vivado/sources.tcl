@@ -25,7 +25,7 @@ set RTL_SRCS [list \
     [file join $RTL_DIR uart_interface.sv] \
     [file join $RTL_DIR uart_receiver.sv] \
     [file join $RTL_DIR uart_transmitter.sv] \
-    [file join $RTL_DIR cycle_timer.sv] \
+    [file join $RTL_DIR perf_counters.sv] \
 ]
 
 # Sources outside the tpu_top hierarchy. Read anyway so they stay compile-checked

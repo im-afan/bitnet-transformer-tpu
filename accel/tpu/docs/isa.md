@@ -252,6 +252,7 @@ li     d, imm16     d = sign_extend(imm16)      adds  d, a, b   d = a + b
 loads  d, raddr     d = scratch[raddr] (int32)  subs  d, a, b   d = a - b
 stores raddr, rval  scratch[raddr] = rval        muls  d, a, b   d = a * b
 setcfg name, imm16  cfg[name] = imm16            cmps  a, b      set eq/lt flags
+setcfgr name, rN    cfg[name] = rN  (runtime)
 jmp    label        pc = label                   halt            stop, raise done
 branch cond, label  if cond: pc = label          wait  unit      block on unit done
 beq/bne/blt/bge label   conditional jump (cond baked in: eq|ne|lt|ge)
@@ -476,10 +477,11 @@ int32 is little-endian 4-byte, int8 a single signed byte.
 | `0x19` | `jmp`     | JMP    | control | `pc = imm16`                                         |
 | `0x1A` | `wait`    | WAIT   | control | block until `flags`-selected unit is done            |
 | `0x1B` | `sdiv`    | RRR    | VPU     | `dst[i] = round(src0[i]·2¹⁵ / scalar(src1))` (Q15)  |
+| `0x1C` | `setcfgr` | CFGR   | scalar  | `cfg[dst] = r[src0]` (full 32 bits, no extension)   |
 | `0x1F` | `halt`    | NONE   | control | stop; raise `done`                                   |
 
-> `0x1C–0x1E` are unallocated; `sdiv` sits at `0x1B` (added after the `0x00–0x1A` block) —
-> the numeric gap is intentional.
+> `0x1D–0x1E` are unallocated; `sdiv` sits at `0x1B` (added after the `0x00–0x1A` block) —
+> the numeric gap is intentional. The opcode field is 6 bits, so `0x20–0x3E` are also free.
 
 ## A.4 Instruction forms & selectors
 
@@ -493,6 +495,7 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 | `SS`     | —        | src0 reg           | src1 reg    | —           | wrmem, stores, cmps                           |
 | `RIMM`   | dst reg  | ⟵ imm16 ⟶          |             | —           | li                                            |
 | `CFG`    | cfg idx  | ⟵ imm16 ⟶          |             | —           | setcfg                                        |
+| `CFGR`   | cfg idx  | src0 reg           | —           | —           | setcfgr                                       |
 | `BRANCH` | —        | ⟵ imm16 (target) ⟶ |             | cond        | branch, beq/bne/blt/bge                       |
 | `JMP`    | —        | ⟵ imm16 (target) ⟶ |             | —           | jmp                                           |
 | `WAIT`   | —        | —                  | —           | unit        | wait                                          |
@@ -507,12 +510,37 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 | branch cond   | `eq=0b00`, `ne=0b01`, `lt=0b10`, `ge=0b11`              |
 | wait unit     | `mxu=0b00`, `vpu=0b01`, `dma=0b10`, `link=0b11`         |
 | neighbor dir  | `n=0`, `e=1`, `s=2`, `w=3`                               |
-| config index  | `tlen=0`, `vlen=1`, `len=2`, `scalar=3`                 |
+| config index  | see the config-register table below                      |
 
-**Config registers.** Host-presettable while idle (`cfg_we`) and runtime-writable with
-`setcfg`. Indices `0=tlen` (MXU token rows, 6 bits), `1=vlen` (VPU length, ≤1023),
-`2=len` (DMA/LINK byte count, 16 bits), `3=scalar` (`matmul.rq` requant word address).
-Indices `4..15` exist and can be named `cfg4..cfg15`, but are unassigned.
+**Config registers.** Host-presettable while idle (`cfg_we`), runtime-writable with
+`setcfg` (16-bit immediate, zero-extended) and `setcfgr` (a register, full 32 bits).
+Indices `14..15` remain unassigned and can be named `cfg14`/`cfg15`.
+
+| Idx | Name      | Drives                                                        |
+| --- | --------- | ------------------------------------------------------------- |
+| 0   | `tlen`    | MXU token rows `T` (6 bits, so ≤ 63)                          |
+| 1   | `vlen`    | VPU vector length in elements (≤ 1023)                        |
+| 2   | `len`     | DMA / LINK byte count (16 bits)                               |
+| 3   | `scalar`  | `matmul.rq` requant `{m0,n}` word address                     |
+| 4   | `ktiles`  | MXU contraction tiles = `K / ROWS`                            |
+| 5   | `ntiles`  | MXU output tiles = `N / COLS`                                 |
+| 6   | `arow`    | MXU activation row stride, bytes (`= K`)                      |
+| 7   | `crow`    | MXU result row stride, bytes (`= N*4`, or `N` requantized)    |
+| 8   | `wcol`    | MXU weight column stride, bytes (`= K*2/8`)                   |
+| 9   | `vscalar` | VPU macro-op `{m0,n}` word address                            |
+| 10  | `vrows`   | VPU macro-op row count (`vecmatmul`: query rows)              |
+| 11  | `vcols`   | `vecmatmul` key rows                                          |
+| 12  | `vrow0`   | `vecmatmul` `src0` row stride, bytes                          |
+| 13  | `vrow1`   | `vecmatmul` `src1` row stride, bytes                          |
+
+`vscalar` is deliberately separate from `scalar`: the MXU's requant word and a VPU
+macro-op's are live at the same time inside a layer.
+
+**`setcfg` vs `setcfgr`.** `setcfg` takes an immediate, so the value is fixed at assembly
+time. `setcfgr cfgname, rN` takes it from a register, which is what lets a geometry vary at
+run time — the case that matters is incremental decode, where the number of attended keys
+grows by one per step. See [`setcfgr.tpu`](../../tpulang/examples/setcfgr.tpu), which
+computes a length in registers and installs it.
 
 ## A.5 Numeric conventions
 

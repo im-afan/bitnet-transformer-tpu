@@ -100,6 +100,19 @@ module tpu_top_uart_tb;
 
     localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47,
                      TCMD = 8'h54;
+
+    // Performance-counter block returned by 'T'. Must match tpu_top.sv's NPERF
+    // and PERF_* indices — those define the wire order, this decodes it.
+    localparam int NPERF   = 6;
+    localparam int P_RUN   = 0, P_MXU = 1, P_MLOAD = 2,
+                   P_VPU   = 3, P_DMA = 4, P_SWAIT = 5;
+
+    // Word w of a 'T' reply. uart_read_timer() shifts bytes in from the low end,
+    // so the first word received (counter 0) ends up in the highest slice.
+    function automatic logic [31:0] ctr_w(input logic [NPERF*32-1:0] ctr,
+                                          input int w);
+        return ctr[(NPERF-1-w)*32 +: 32];
+    endfunction
     localparam [7:0] ACK  = 8'h06, NAK  = 8'h15;
 
     localparam int   CLK_NS = 10;   // clock period in ns; matches `always #5` below
@@ -285,16 +298,26 @@ module tpu_top_uart_tb;
         if (st !== ACK) begin errors++; $display("  FAIL: go, got %02h", st); end
     endtask
 
-    // 'T' read the run-length counter: one command byte, 4 bytes back MSB first,
-    // no status.
-    task automatic uart_read_timer(output [31:0] cycles);
+    // 'T' read the performance counters: one command byte, NPERF 32-bit words
+    // back, MSB first both within and across words, no status. Word 0 is the
+    // run length (tpu_top.sv PERF_RUN), which is why a 4-byte reader still
+    // decodes it; the rest must be drained regardless or the link desyncs for
+    // the next command.
+    // Packed rather than an unpacked array of words: Icarus does not support
+    // unpacked dimensions on subroutine ports. Word w is ctr[w*32 +: 32], and
+    // `ctr_w(ctr, w)` below does that indexing for the checks.
+    task automatic uart_read_timer(output [NPERF*32-1:0] ctr);
         logic [7:0] b;
         fork
             tx_bit_byte(TCMD);
             begin
-                for (int i = 0; i < 4; i++) begin
+                ctr = '0;
+                // Words arrive high-index-first on the wire, so shifting the
+                // whole block left by a byte per byte received lands word 0 in
+                // the top slice — see ctr_w().
+                for (int i = 0; i < NPERF*4; i++) begin
                     rx_bit_byte(b);
-                    cycles = {cycles[23:0], b};
+                    ctr = {ctr[NPERF*32-9:0], b};
                 end
             end
         join
@@ -353,9 +376,46 @@ module tpu_top_uart_tb;
         end
     endtask
 
+    // Does the loaded image contain a matmul? Scans the program words actually
+    // loaded (opcode is the top 6 bits; OP_MATMUL is 0x00) rather than taking
+    // the answer as a parameter, so the MXU counter is checked against whatever
+    // PROG/PROG2 the Makefile was given instead of against a hardcoded guess
+    // about the default pair. Only [0,nprog) is scanned, which clear_vectors()
+    // guarantees is the defined region — an all-zero word would otherwise
+    // decode as a matmul.
+    // OP_MATMUL (0x00) or OP_MATMUL_T (0x1D) — both drive the MXU.
+    function automatic bit image_has_matmul(input int nwords);
+        for (int i = 0; i < nwords; i++)
+            if (prog_words[i][31:26] == 6'h00 || prog_words[i][31:26] == 6'h1D)
+                return 1'b1;
+        return 1'b0;
+    endfunction
+
+    // Same idea for the VPU: mirrors scalar_unit.sv's is_vpu_op(). Needed
+    // because not every program touches every unit — tiled_matmul.tpu is pure
+    // MXU with no VPU op at all, so "the VPU counter must be nonzero" is only
+    // true of programs that actually dispatch one.
+    function automatic bit is_vpu_opcode(input logic [5:0] o);
+        return (o == 6'h01) || (o == 6'h02) || (o == 6'h03) || (o == 6'h04) ||
+               (o == 6'h05) || (o == 6'h09) || (o == 6'h0A) || (o == 6'h0B) ||
+               (o == 6'h0C) || (o == 6'h0D) || (o == 6'h0E) || (o == 6'h0F) ||
+               (o == 6'h1B) ||
+               (o == 6'h1E) ||  // OP_VECMM  (vecmatmul macro op)
+               (o == 6'h20);    // OP_SOFTMAX (softmax macro op)
+    endfunction
+
+    function automatic bit image_has_vpu(input int nwords);
+        for (int i = 0; i < nwords; i++)
+            if (is_vpu_opcode(prog_words[i][31:26])) return 1'b1;
+        return 1'b0;
+    endfunction
+
     task automatic test_program(input string label);
+        bit expect_mxu, expect_vpu;
         nprog = 0;
         while (nprog < IMEM_DEP && defined32(prog_words[nprog])) nprog++;
+        expect_mxu = image_has_matmul(nprog);
+        expect_vpu = image_has_vpu(nprog);
 
         $display("---- %0s ----", label);
 
@@ -378,17 +438,81 @@ module tpu_top_uart_tb;
         //    per program, not once at the end: the counter must restart on every
         //    run, and program B is the only thing that can prove it does.
         begin
-            logic [31:0] cycles;
+            logic [NPERF*32-1:0] ctr;
             int unsigned want;
-            uart_read_timer(cycles);
+            uart_read_timer(ctr);
             want = expected_run_clocks();
             checks++;
-            if (cycles !== want) begin
+            if (ctr_w(ctr, P_RUN) !== want) begin
                 errors++;
                 $display("  FAIL: 'T' reported %0d clocks, busy was high for %0d",
-                         cycles, want);
+                         ctr_w(ctr, P_RUN), want);
             end else begin
-                $display("run took %0d core clocks (device timer agrees)", cycles);
+                $display("run took %0d core clocks (device timer agrees)",
+                         ctr_w(ctr, P_RUN));
+            end
+            $display("  counters: mxu=%0d mload=%0d vpu=%0d dma=%0d swait=%0d",
+                     ctr_w(ctr, P_MXU), ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_VPU),
+                     ctr_w(ctr, P_DMA), ctr_w(ctr, P_SWAIT));
+
+            // Structural invariants. These hold for *any* program, so they test
+            // the counter block rather than this particular pair of programs.
+            // Every counter is gated by the same run window, so none can exceed
+            // it; and the MXU's load phase is a sub-state of MXU busy.
+            for (int i = 0; i < NPERF; i++) begin
+                checks++;
+                if (ctr_w(ctr, i) > ctr_w(ctr, P_RUN)) begin
+                    errors++;
+                    $display("  FAIL: counter %0d = %0d exceeds run length %0d",
+                             i, ctr_w(ctr, i), ctr_w(ctr, P_RUN));
+                end
+            end
+            checks++;
+            if (ctr_w(ctr, P_MLOAD) > ctr_w(ctr, P_MXU)) begin
+                errors++;
+                $display("  FAIL: mload=%0d exceeds mxu=%0d (must be a subset)",
+                         ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_MXU));
+            end
+
+            // Every example stages tensors over DMA; VPU use is per-program.
+            checks++;
+            if (expect_vpu && ctr_w(ctr, P_VPU) == 0) begin
+                errors++;
+                $display("  FAIL: vpu counter is 0, but the program ran VPU ops");
+            end else if (!expect_vpu && ctr_w(ctr, P_VPU) != 0) begin
+                errors++;
+                $display("  FAIL: vpu counter is %0d, but the program has no VPU op",
+                         ctr_w(ctr, P_VPU));
+            end
+            checks++;
+            if (ctr_w(ctr, P_DMA) == 0) begin
+                errors++;
+                $display("  FAIL: dma counter is 0, but the program staged tensors");
+            end
+
+            // The discriminating check (see the task header).
+            checks++;
+            if (expect_mxu && ctr_w(ctr, P_MXU) == 0) begin
+                errors++;
+                $display("  FAIL: mxu counter is 0, but the program has a matmul");
+            end else if (!expect_mxu && ctr_w(ctr, P_MXU) != 0) begin
+                errors++;
+                $display("  FAIL: mxu counter is %0d, but the program has no matmul",
+                         ctr_w(ctr, P_MXU));
+            end
+            // A matmul must load weights, so mload is nonzero exactly when the
+            // MXU ran at all — this is what proves S_LOAD is really being
+            // isolated rather than mload just mirroring mxu.
+            checks++;
+            if (expect_mxu && ctr_w(ctr, P_MLOAD) == 0) begin
+                errors++;
+                $display("  FAIL: mload is 0, but the MXU ran a matmul");
+            end
+            checks++;
+            if (expect_mxu && ctr_w(ctr, P_MLOAD) >= ctr_w(ctr, P_MXU)) begin
+                errors++;
+                $display("  FAIL: mload=%0d is not a strict subset of mxu=%0d",
+                         ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_MXU));
             end
         end
 

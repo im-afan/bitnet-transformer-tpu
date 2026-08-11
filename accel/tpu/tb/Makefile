@@ -55,6 +55,9 @@ RTL_uart_memory := ../rtl/uart_memory.sv ../rtl/uart_interface.sv \
                    ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv ../rtl/sram.sv
 RTL_uart_bram := ../rtl/uart_bram.sv ../rtl/uart_interface.sv \
                  ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv ../rtl/bram.sv
+# dma_tb instantiates the DUT against the real scratchpad and a behavioral SRAM
+# chip, so it needs all three (without this `make all` cannot elaborate it).
+RTL_dma := ../rtl/dma.sv ../rtl/scratchpad.sv ../rtl/sram.sv
 
 RTL ?= $(if $(RTL_$(TEST)),$(RTL_$(TEST)),../rtl/$(TEST).sv)
 
@@ -69,7 +72,7 @@ UART_TOP := tpu_top_uart_tb
 UART_RTL := ../rtl/tpu_top.sv ../rtl/scalar_unit.sv ../rtl/mxu.sv ../rtl/vpu.sv \
             ../rtl/scratchpad.sv ../rtl/dma.sv ../rtl/sram.sv \
             ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv \
-            ../rtl/cycle_timer.sv
+            ../rtl/perf_counters.sv
 
 # Both tpu_top testbenches need the whole core. Declared here (rather than up with
 # the other RTL_<name> lines) so the file list is written once: the backdoor TB

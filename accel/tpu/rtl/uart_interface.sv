@@ -10,7 +10,7 @@
 //   'W' 0x57  write SRAM : hdr = CMD + A2 A1 A0 + L1 L0 + data[len]-> ACK/NAK
 //   'I' 0x49  write IMEM : hdr = CMD + A2 A1 A0 + L1 L0 + data[len]-> ACK/NAK
 //   'G' 0x47  go / run   : hdr = CMD + A2 A1 A0                    -> ACK/NAK
-//   'T' 0x54  read timer : hdr = CMD                               -> 4 data bytes
+//   'T' 0x54  read timers: hdr = CMD                       -> TIMER_WORDS*4 bytes
 //
 //   * Addresses are 3 bytes, big-endian. For 'R'/'W' this is a 19-bit SRAM byte
 //     address; for 'I' it is an instruction-word index; for 'G' it is the boot PC.
@@ -19,8 +19,13 @@
 //     ascending instruction addresses.
 //   * 'G' pulses `run_start` with `run_pc = addr` — no length, no data.
 //   * 'T' is the whole frame: no address, no length, nothing to validate. It
-//     replies with `cycle_count` as 4 bytes, MSB first, and no status byte —
-//     header-less like a read, because the length is fixed and both ends know it.
+//     replies with `cycle_count` as TIMER_WORDS 32-bit words, MSB first both
+//     within and across words, and no status byte — header-less like a read,
+//     because the length is fixed at build time and both ends know it.
+//     TIMER_WORDS defaults to 1 (the run-length counter alone, the historical
+//     reply); tpu_top raises it to expose the per-unit counters in
+//     perf_counters.sv, keeping the run length in the first word so a short
+//     reader still decodes it correctly.
 //
 // Arbitration (core priority): the scalar unit owns the machine. Any command that
 // arrives while `core_busy` is high is rejected with NAK and touches nothing —
@@ -49,7 +54,11 @@ module uart_interface #(
     parameter integer ADDR_W     = 19,   // external SRAM byte-address width
     parameter integer LENGTH_W   = 16,   // transfer length field width
     parameter integer IMEM_AW    = 10,   // instruction memory address width
-    parameter integer RX_TIMEOUT = 0     // clocks; 0 disables mid-frame abort
+    parameter integer RX_TIMEOUT = 0,    // clocks; 0 disables mid-frame abort
+    // 32-bit words in the 'T' reply. 1 = just the run-length counter, which is
+    // the historical behaviour and what an image with no perf_counters block
+    // behind it should use. tpu_top sets this to perf_counters' N.
+    parameter integer TIMER_WORDS = 1
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -57,12 +66,17 @@ module uart_interface #(
     // arbitration: high while the scalar unit is running (see file header)
     input  logic core_busy,
 
-    // run-length counter (cycle_timer.sv), reported verbatim by the 'T' command.
+    // Run counters (perf_counters.sv), reported verbatim by the 'T' command.
     // Free-running relative to this FSM: sampled once, at the clock the command
-    // byte is decoded, so the four bytes that go out are one coherent reading
-    // and not a value that moved between them. Tie to '0 in an image with no
-    // scalar unit behind it.
-    input  logic [31:0] cycle_count,
+    // byte is decoded, so the bytes that go out are one coherent reading and not
+    // values that moved between them — which also means the whole block is a
+    // consistent snapshot of a single run, so ratios between counters are
+    // meaningful. Tie to '0 in an image with no scalar unit behind it.
+    //
+    // Wire order is high word first: bits [TIMER_WORDS*32-1 -: 32] are sent
+    // before bits [31:0]. tpu_top places the run-length counter in the high word
+    // so a 'T' reply stays prefix-compatible with the single-word version.
+    input  logic [TIMER_WORDS*32-1:0] cycle_count,
 
     // receiver interface (from uart_receiver)
     input  logic [7:0] data_in,
@@ -118,8 +132,9 @@ module uart_interface #(
     localparam [7:0] STAT_ACK  = 8'h06;
     localparam [7:0] STAT_NAK  = 8'h15;
 
-    // bytes in a 'T' reply (the counter, MSB first)
-    localparam integer TIMER_BYTES = 4;
+    // bytes in a 'T' reply (the counter block, MSB first within and across words)
+    localparam integer TIMER_BITS  = TIMER_WORDS * 32;
+    localparam integer TIMER_BYTES = TIMER_WORDS * 4;
 
     // op selector, latched in IDLE from the command byte. 'T' needs no entry: it
     // has no header to collect and no validation to branch on, so IDLE sends it
@@ -196,7 +211,7 @@ module uart_interface #(
     logic [7:0]           rd_byte, wr_byte, status_byte;
     logic [31:0]          word;    // instruction word under assembly
     logic [31:0]          to_cnt;  // inter-byte timeout counter
-    logic [31:0]          tmr;     // 'T': counter snapshot, shifted out MSB first
+    logic [TIMER_BITS-1:0] tmr;    // 'T': counter snapshot, shifted out MSB first
 
     // number of instruction words in an 'I' payload (len is bytes, 4 per word)
     wire [LEN_BITS-1:0] nwords = len >> 2;
@@ -418,8 +433,8 @@ module uart_interface #(
                 TMR_TX: begin
                     if (!transmitter_busy) begin
                         transmitter_start <= 1'b1;
-                        data_out          <= tmr[31:24];
-                        tmr               <= {tmr[23:0], 8'b0};
+                        data_out          <= tmr[TIMER_BITS-1 -: 8];
+                        tmr               <= {tmr[TIMER_BITS-9:0], 8'b0};
                         state             <= TMR_TX_WAIT;
                     end
                 end

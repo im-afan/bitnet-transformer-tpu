@@ -127,14 +127,19 @@ module tpu_top #(
     logic                mxu_start;
     logic [ADDR_W-1:0]   mxu_act_addr, mxu_weight_addr, mxu_out_addr, mxu_scalar_addr;
     logic [5:0]          mxu_t_len;
+    logic                mxu_tiled;
+    logic [ADDR_W-1:0]   mxu_a_row, mxu_c_row, mxu_w_col;
+    logic [7:0]          mxu_k_tiles, mxu_n_tiles;
     logic                mxu_accumulate, mxu_requant;
     logic                mxu_busy, mxu_done;
 
     // ---- scalar_unit → VPU dispatch -----------------------------------------
     logic                vpu_start;
-    logic [3:0]          vpu_op;
+    logic [4:0]          vpu_op;
     logic [ADDR_W-1:0]   vpu_src0, vpu_src1, vpu_scalar, vpu_dst;
     logic [9:0]          vpu_vlen;
+    logic [15:0]         vpu_rows, vpu_cols;
+    logic [ADDR_W-1:0]   vpu_row0, vpu_row1, vpu_crow;
     logic                vpu_busy, vpu_done;
 
     // ---- scalar_unit ↔ scratchpad S_rw --------------------------------------
@@ -211,7 +216,14 @@ module tpu_top #(
     logic                  uart_run_start;
     logic [IMEM_AW-1:0]    uart_run_pc;
 
-    logic [31:0]           run_cycles;   // cycle_timer → UART 'T' command
+    // ---- Performance counters → UART 'T' command ----------------------------
+    //   NPERF event bits, integrated over one run by perf_counters.sv. See the
+    //   PERF_* indices and the wire-order remap where the block is instantiated.
+    localparam int NPERF = 6;
+    logic [NPERF-1:0]      perf_ev;
+    logic [NPERF*32-1:0]   perf_counts;   // counter i at [i*32 +: 32]
+    logic [NPERF*32-1:0]   perf_wire;     // same, reordered for transmission
+    logic                  su_wait_active, mxu_load_active;
 
     // ---- Host program/run path: external host ports OR'd with the UART host --
     //   Both paths write instruction memory and pulse host_run; they are used
@@ -258,9 +270,10 @@ module tpu_top #(
 
         .host_run   (su_host_run),
         .boot_pc    (su_boot_pc),
-        .busy       (busy),
-        .done       (done),
-        .pc_dbg     (pc_dbg),
+        .busy        (busy),
+        .done        (done),
+        .pc_dbg      (pc_dbg),
+        .wait_active (su_wait_active),
         .imem_we    (su_imem_we),
         .imem_waddr (su_imem_waddr),
         .imem_wdata (su_imem_wdata),
@@ -282,6 +295,12 @@ module tpu_top #(
         .mxu_out_addr    (mxu_out_addr),
         .mxu_scalar_addr (mxu_scalar_addr),
         .mxu_t_len       (mxu_t_len),
+        .mxu_tiled       (mxu_tiled),
+        .mxu_a_row       (mxu_a_row),
+        .mxu_c_row       (mxu_c_row),
+        .mxu_w_col       (mxu_w_col),
+        .mxu_k_tiles     (mxu_k_tiles),
+        .mxu_n_tiles     (mxu_n_tiles),
         .mxu_accumulate  (mxu_accumulate),
         .mxu_requant     (mxu_requant),
         .mxu_busy        (mxu_busy),
@@ -295,6 +314,11 @@ module tpu_top #(
         .vpu_scalar (vpu_scalar),
         .vpu_dst    (vpu_dst),
         .vpu_vlen   (vpu_vlen),
+        .vpu_rows   (vpu_rows),
+        .vpu_cols   (vpu_cols),
+        .vpu_row0   (vpu_row0),
+        .vpu_row1   (vpu_row1),
+        .vpu_crow   (vpu_crow),
         .vpu_busy   (vpu_busy),
         .vpu_done   (vpu_done),
 
@@ -340,10 +364,17 @@ module tpu_top #(
         .out_addr    (mxu_out_addr),
         .scalar_addr (mxu_scalar_addr),
         .t_len       (mxu_t_len),
+        .tiled       (mxu_tiled),
+        .a_row       (mxu_a_row),
+        .c_row       (mxu_c_row),
+        .w_col       (mxu_w_col),
+        .k_tiles     (mxu_k_tiles),
+        .n_tiles     (mxu_n_tiles),
         .accumulate  (mxu_accumulate),
         .requant     (mxu_requant),
         .busy        (mxu_busy),
         .done        (mxu_done),
+        .load_active (mxu_load_active),
 
         // A_rd (activation feed)
         .A_re    (A_re),
@@ -386,6 +417,11 @@ module tpu_top #(
         .vpu_scalar (vpu_scalar),
         .vpu_dst    (vpu_dst),
         .vpu_vlen   (vpu_vlen),
+        .vpu_rows   (vpu_rows),
+        .vpu_cols   (vpu_cols),
+        .vpu_row0   (vpu_row0),
+        .vpu_row1   (vpu_row1),
+        .vpu_crow   (vpu_crow),
         .vpu_busy   (vpu_busy),
         .vpu_done   (vpu_done),
 
@@ -535,18 +571,60 @@ module tpu_top #(
     );
 
     // =========================================================================
-    // Run-length counter — times the scalar unit's `busy` interval in core
-    // clocks, i.e. one whole program run from 'G' to HALT. Read over UART with
-    // the 'T' command; nothing else in the core observes it.
+    // Performance counters — integrate six event bits over one program run
+    // (from 'G' to HALT), read over UART with the 'T' command. Nothing else in
+    // the core observes them.
+    //
+    // Counter 0 is the run length itself, which makes it the denominator for
+    // every other counter: each one is directly readable as a fraction of the
+    // run. Together they are the bottleneck breakdown docs/macro_ops.md §7 calls
+    // for — without them, a hardware-sequenced tile loop is invisible, because
+    // the loop no longer appears in the instruction stream.
+    //
+    //   0 run    total clocks busy  (denominator; == the old cycle_timer)
+    //   1 mxu    MXU busy           (systolic array utilization)
+    //   2 mload  MXU in S_LOAD      (weight-load share of MXU time)
+    //   3 vpu    VPU busy           (attention/softmax share vs. GEMM)
+    //   4 dma    DMA busy           (memory-bound vs. compute-bound)
+    //   5 swait  scalar in S_WAIT   (what issue-and-wait costs)
+    //
+    // These overlap by construction: under issue-and-wait `swait` covers nearly
+    // all of `mxu`+`vpu`+`dma`, and `mload` is a subset of `mxu`. They are
+    // fractions of a run, not a partition of it.
     // =========================================================================
-    cycle_timer #(
+    localparam int PERF_RUN = 0, PERF_MXU  = 1, PERF_MLOAD = 2,
+                   PERF_VPU = 3, PERF_DMA  = 4, PERF_SWAIT = 5;
+
+    always_comb begin
+        perf_ev              = '0;
+        perf_ev[PERF_RUN]    = busy;
+        perf_ev[PERF_MXU]    = mxu_busy;
+        perf_ev[PERF_MLOAD]  = mxu_load_active;
+        perf_ev[PERF_VPU]    = vpu_busy;
+        perf_ev[PERF_DMA]    = dma_busy;
+        perf_ev[PERF_SWAIT]  = su_wait_active;
+    end
+
+    perf_counters #(
+        .N (NPERF),
         .W (32)
-    ) u_cycle_timer (
+    ) u_perf (
         .clk    (clk),
         .rst_n  (rst_n),
-        .busy   (busy),
-        .cycles (run_cycles)
+        .run    (busy),
+        .ev     (perf_ev),
+        .counts (perf_counts)
     );
+
+    // Wire order: uart_interface shifts the 'T' reply out of the *high* end, so
+    // reverse the word order here to put counter 0 (the run length) on the wire
+    // first. That keeps a 'T' reply prefix-compatible with the single-word reply
+    // this command used to give, and keeps the natural little-end packing inside
+    // perf_counters.sv rather than hiding a transmission detail in it.
+    always_comb begin
+        for (int i = 0; i < NPERF; i++)
+            perf_wire[(NPERF-1-i)*32 +: 32] = perf_counts[i*32 +: 32];
+    end
 
     // =========================================================================
     // UART host link — serial bring-up/debug path (docs/uart_host.md).
@@ -579,15 +657,16 @@ module tpu_top #(
     uart_interface #(
         .ADDR_W     (MEM_ADDR_W),
         .LENGTH_W   (16),
-        .IMEM_AW    (IMEM_AW),
-        .RX_TIMEOUT (UART_RX_TIMEOUT)
+        .IMEM_AW     (IMEM_AW),
+        .RX_TIMEOUT  (UART_RX_TIMEOUT),
+        .TIMER_WORDS (NPERF)
     ) u_uart (
         .clk   (clk),
         .rst_n (rst_n),
 
         // arbitration: core has priority ('T' excepted — see uart_interface.sv)
         .core_busy   (busy),
-        .cycle_count (run_cycles),
+        .cycle_count (perf_wire),
 
         // receiver / transmitter
         .data_in           (uart_rx_data),

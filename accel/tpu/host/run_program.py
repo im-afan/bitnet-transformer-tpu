@@ -65,7 +65,9 @@ for _p in (HERE, TPULANG_DIR):
 
 import gen_vectors as gv                                    # noqa: E402
 from iss import TPU, s8                                     # noqa: E402
-from tpu_uart import NakError, ProtocolError, TPUUart       # noqa: E402
+from tpu_uart import (                                      # noqa: E402
+    NakError, ProtocolError, TPUUart, format_counters,
+)
 
 DEFAULT_PROGRAM = os.path.join(TPULANG_DIR, "examples", "tiled_matmul.tpu")
 
@@ -229,12 +231,14 @@ def report_run_time(tpu: TPUUart, clk_mhz: float) -> int | None:
     — check its mtime). The run's results are unaffected either way.
     """
     try:
-        cycles = tpu.read_timer()
+        ctr = tpu.read_counters()
     except ProtocolError as exc:
         print(f"timer   : unavailable — {exc}")
         print("          (bitstream predates the 'T' command? reflash board=cmod_a7)")
         return None
+    cycles = ctr["run"]
     print(f"timer   : {cycles} core clocks ({cycles / clk_mhz:.1f} us @ {clk_mhz:g} MHz)")
+    print(format_counters(ctr))
     return cycles
 
 

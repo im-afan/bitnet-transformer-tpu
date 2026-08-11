@@ -1,0 +1,97 @@
+; strided_matmul.tpu — one 8x8 tile taken out of the middle of a larger matrix,
+; using the config strides rather than a tile-shaped copy of the operands.
+;
+; Every other example hands the MXU operands that *are* exactly one tile, so the
+; hardcoded strides it used to carry (a_row=ROWS, c_row=COLS*4, w_col=ROWS*2/8)
+; happened to be right. They are wrong the moment a tile is a window into
+; something bigger, which is the whole reason `arow`/`crow`/`wcol` exist
+; (docs/macro_ops.md §4.1). This program is the test that they are actually
+; consulted: it computes tile (1,1) of a 16x16 problem.
+;
+;     A is 16 rows x 16 cols of int8      -> row stride 16, not ROWS=8
+;     W is 16 rows x 16 cols of trits     -> column stride 16*2/8 = 4, not 2
+;     C is 16 rows x 16 cols of int32     -> row stride 16*4 = 64, not COLS*4=32
+;
+; and the tile wanted is rows 8..15 of A, columns 8..15 of W, landing in rows
+; 8..15 / columns 8..15 of C:
+;
+;     C[8..15][8..15] = A[8..15][8..15] @ W[8..15][8..15]
+;
+; Tile bases are therefore *not* the matrix bases:
+;
+;     act = A + 8*16 + 8      (row 8, column 8, int8)
+;     wgt = W + 8*4  + 2      (column 8's packed bytes, then 8 rows in = 2 bytes)
+;     out = C + 8*64 + 8*4    (row 8, column 8, int32)
+;
+; If the MXU ignored the strides it would walk contiguous rows of 8 bytes and
+; read the wrong half of every operand, so the result would differ in nearly
+; every element rather than subtly — this fails loudly or not at all.
+;
+;     python ../assembler.py strided_matmul.tpu --listing
+;     python ../torch_ref.py -p strided_matmul.tpu
+;
+; Self-contained over DRAM (identical DRAM/scratchpad addresses) like the rest.
+
+; ---- geometry ----------------------------------------------------------------
+.equ M      16          ; full matrix rows
+.equ K      16          ; full contraction dim  (= 2 tiles of ROWS=8)
+.equ N      16          ; full output cols      (= 2 tiles of COLS=8)
+.equ ROWS   8           ; array contraction dim
+.equ COLS   8           ; array output cols
+.equ TI     1           ; which tile row of A to take    (rows  8..15)
+.equ TJ     1           ; which tile col of W to take    (cols  8..15)
+
+; ---- strides (bytes) ---------------------------------------------------------
+.equ AROW   K           ; A row stride: K int8            = 16
+.equ WCOL   K * 2 // 8   ; W column stride: K trits packed = 4
+.equ CROW   N * 4       ; C row stride: N int32           = 64
+
+; ---- addresses (same in DRAM and scratchpad) ---------------------------------
+.equ A      0x0000      ; A[16][16] int8                   (256 bytes)
+.equ W      0x0400      ; W[16][16] trits, col-major 2b    (64 bytes)
+.equ C      0x0800      ; C[16][16] int32                  (1024 bytes)
+
+.equ A_BYTES  M * K         ; 256
+.equ W_BYTES  N * WCOL      ; 64
+.equ C_BYTES  M * N * 4     ; 1024
+
+; ---- tile bases --------------------------------------------------------------
+.equ ATILE  A + TI * ROWS * AROW + TJ * ROWS    ; row 8, col 8   -> A+136
+.equ WTILE  W + TJ * COLS * WCOL + TI * ROWS * 2 // 8  ; col 8, row 8 -> W+34
+.equ CTILE  C + TI * ROWS * CROW + TJ * COLS * 4      ; row 8, col 8 -> C+544
+
+.reg act    r1
+.reg wgt    r2
+.reg out    r3
+
+    li      act, ATILE
+    li      wgt, WTILE
+    li      out, CTILE
+
+    ; ---- stage the whole matrices in (not just the tiles) --------------------
+    ; The point is that the operands are larger than the tile, so bring all of
+    ; A, W and C across and let the strides pick the window out.
+    li      r4, A
+    setcfg  len, A_BYTES
+    rdmem   r4, r4
+    li      r5, W
+    setcfg  len, W_BYTES
+    rdmem   r5, r5
+    li      r6, C
+    setcfg  len, C_BYTES
+    rdmem   r6, r6
+
+    ; ---- tell the MXU how the operands are actually laid out -----------------
+    setcfg  tlen, ROWS      ; 8 token rows in this tile
+    setcfg  arow, AROW      ; without these three the MXU assumes the operand
+    setcfg  wcol, WCOL      ; *is* one tile and reads contiguous rows/columns
+    setcfg  crow, CROW
+
+    matmul_t out, act, wgt  ; C[tile] = A[tile] @ W[tile], int32, no requant
+
+    ; ---- spill the whole C back so the untouched elements are checked too ----
+    ; Anything outside the tile must come back exactly as it went in; a stride
+    ; mistake shows up as collateral damage there as much as as a wrong tile.
+    setcfg  len, C_BYTES
+    wrmem   r6, r6
+    halt
