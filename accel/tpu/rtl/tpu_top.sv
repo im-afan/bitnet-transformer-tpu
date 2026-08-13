@@ -27,8 +27,10 @@
 // async SRAM chip: the DMA engine (dma.sv) owns the scratchpad's DMA port and,
 // behind it, a single sram_controller whose chip pins (`sram_*`) are brought out
 // to the top level. The scalar unit's Read/WriteMemory ops dispatch to the DMA
-// engine, which byte-moves DRAM <-> scratchpad. The scalar unit only emits a
-// 16-bit (ADDR_W) DRAM address, so it is zero-extended to MEM_ADDR_W at the DMA.
+// engine, which byte-moves DRAM <-> scratchpad. The scalar unit emits a full
+// MEM_ADDR_W DRAM address, so a program reaches the whole SRAM chip; only the
+// scratchpad side is ADDR_W. (It used to emit ADDR_W and be zero-extended here,
+// which silently confined every program to the low 64 KB of a 512 KB part.)
 //
 // Deliberately left out (see notes at the stub tie-off below):
 //   * comms / inter-TPU LINK — the scalar unit's WriteNeighbor dispatch is
@@ -175,7 +177,8 @@ module tpu_top #(
 
     // ---- scalar_unit → DMA dispatch -----------------------------------------
     logic                dma_start, dma_write;
-    logic [ADDR_W-1:0]   dma_scratch_addr, dma_dram_addr;
+    logic [ADDR_W-1:0]     dma_scratch_addr;
+    logic [MEM_ADDR_W-1:0] dma_dram_addr;   // the DRAM side is the wider space
     logic [15:0]         dma_len;
     logic                dma_transpose;                       // `.t` instruction flag
     logic [15:0]         dma_tcols, dma_tsrow, dma_tdrow;     // transpose geometry (cfg)
@@ -261,11 +264,12 @@ module tpu_top #(
     // Scalar unit — control processor / ISA sequencer.
     // =========================================================================
     scalar_unit #(
-        .XLEN    (XLEN),
-        .REG_AW  (REG_AW),
-        .IMEM_AW (IMEM_AW),
-        .ADDR_W  (ADDR_W),
-        .CFG_AW  (CFG_AW)
+        .XLEN       (XLEN),
+        .REG_AW     (REG_AW),
+        .IMEM_AW    (IMEM_AW),
+        .ADDR_W     (ADDR_W),
+        .MEM_ADDR_W (MEM_ADDR_W),
+        .CFG_AW     (CFG_AW)
     ) u_scalar (
         .clk   (clk),
         .rst_n (rst_n),
@@ -541,7 +545,7 @@ module tpu_top #(
         .dma_start        (dma_start),
         .dma_write        (dma_write),
         .dma_scratch_addr (dma_scratch_addr),
-        .dma_dram_addr    (MEM_ADDR_W'(dma_dram_addr)),  // zero-extend ADDR_W → MEM_ADDR_W
+        .dma_dram_addr    (dma_dram_addr),   // MEM_ADDR_W on both sides
         .dma_len          (dma_len),
         .dma_transpose    (dma_transpose),
         .dma_tcols        (dma_tcols),

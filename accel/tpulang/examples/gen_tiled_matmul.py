@@ -136,7 +136,8 @@ def run_iss(consts: dict, words: list) -> tuple[dict, int, dict | None]:
     Returns the written-DRAM image, the mismatch count against gen_vectors'
     independent Python A@W, and the problem dimensions.
     """
-    tpu = TPU(rows=gv.ROWS, cols=gv.COLS, addr_w=gv.ADDR_W, m0_w=gv.M0_W, n_w=gv.N_W)
+    tpu = TPU(rows=gv.ROWS, cols=gv.COLS, addr_w=gv.ADDR_W,
+              mem_addr_w=gv.MEM_ADDR_W, m0_w=gv.M0_W, n_w=gv.N_W)
     _in_img, ref, dims = gv.build_image(tpu, consts)
     tpu.run(words)
     out = {a: tpu.dram[a] for a in sorted(tpu.dram_written)}

@@ -1,0 +1,525 @@
+; adder_model.tpu — the entire `adder_ternary_vanilla` model, one program.
+;
+; model/transformer.py's whole forward pass for the shipped ternary adder config
+; (d=128, f=128, 4 layers, 4 heads, head_dim=32, T=32, vocab=13), in its
+; *current* form: no bias, no LayerNorm, ReLU attention, ReLU feed-forward,
+; dropout off. Four transformer layers and the output head, in one run:
+;
+;     for L in 0..3:
+;         Q,K,V = Wq(X), Wk(X), Wv(X)          # ternary, no bias
+;         S     = Q @ K^T / sqrt(head_dim)     # per head
+;         P     = relu(S + causal_mask)        # NOT softmax
+;         A     = P @ V                        # [T, 4*32] = [T, 128]
+;         X     = X + Wo(A)                    # attention residual
+;         X     = X + W2(relu(W1(X)))          # feed-forward residual
+;     logits = X @ fc.weight^T                 # int8 head, on the VPU
+;
+; The host supplies the embedded+positionally-encoded X, all four layers'
+; weights, the mask, the requant words and the quantized `fc` weight; it gets
+; the int32 logits back, plus every layer's X as a checkpoint. Embedding and
+; argmax stay on the host: the ISA has no gather, and `redmax` returns the max
+; rather than its index.
+;
+; ---------------------------------------------------------------------------
+; Why this is one program
+; ---------------------------------------------------------------------------
+; The four layers' ternary weights are 96 KB packed. That used to be
+; unreachable: `scalar_unit.sv` truncated a rdmem/wrmem DRAM address to
+; ADDR_W = 16 bits, so a program could only name the low 64 KB of the 512 KB
+; SRAM chip, even though the DMA, the SRAM controller and the UART host all
+; addressed the full 19 bits. The scalar unit now emits MEM_ADDR_W, so the
+; whole chip is program-visible and the model fits with 380 KB to spare.
+;
+; Two consequences shape the code below:
+;
+;   * X never round-trips through DRAM between layers — it lives in the
+;     scratchpad and each layer updates it in place. The per-layer `wrmem` near
+;     the bottom is a *checkpoint* for verification, not a data path.
+;   * Weights are addressed by a running base register `wl`, advanced one layer
+;     block per iteration. `li` is a 16-bit immediate and layer 3's block starts
+;     at 0x1AC00, so the base is built by `adds` — which is exactly why the
+;     globals sit below 0x5000 where they *are* li-able.
+;
+; ---------------------------------------------------------------------------
+; The three sharp edges, stated once
+; ---------------------------------------------------------------------------
+; 1. `cfg vlen` is 10 bits, so the maximum VPU vector length is 1023 — and a
+;    [32][32] score block is exactly 1024 elements. `vlen = 1024` reads as 0 and
+;    the dispatch silently does nothing. Every elementwise pass here therefore
+;    runs in CHUNK = 512-element pieces.
+;
+; 2. `vecadd` adds two int8 *operands*, so a residual add only means anything if
+;    both sides are at the same scale. That is a constraint on the host's
+;    requant words, not on this program: RQ_O must land Wo's output on X's
+;    scale and RQ_F must land W2's output on X1's. ../adder_kernel.md §4.
+;
+; 3. There is no LayerNorm, so nothing bounds the residual stream. Each layer's
+;    activation scale has to grow to cover it, and int8 has 8 bits to spend.
+;    That is a property of the checkpoint, not of this kernel, but it is where
+;    accuracy will go if it goes anywhere.
+;
+;     python ../assembler.py adder_model.tpu --listing
+;     python ../gen_vectors.py -p examples/adder_model.tpu
+
+; ===========================================================================
+; Geometry — model/transformer.py adder_ternary_vanilla()
+; ===========================================================================
+.equ T        32            ; tokens (train.py --max_tokens; <= 63 for cfg tlen)
+.equ D        128           ; model dim
+.equ HEADS    4             ; q_heads == kv_heads, so heads_per_q = 1
+.equ DH       32            ; head_dim = D // HEADS
+.equ D3       D * 3         ; fused Q|K|V row: 384 bytes
+.equ F        128           ; feed-forward hidden dim
+.equ VOCAB    13            ; len(numbers_data.VOCAB)
+.equ LAYERS   4
+
+.equ ROWS     8             ; MXU array contraction dim
+.equ COLS     8             ; MXU array output cols
+.equ KT       D // ROWS     ; contraction tiles per matmul       = 16
+.equ NTD      D // COLS     ; output tiles for a 128-col matmul  = 16
+
+.equ CHUNK    512           ; VPU pass length (cfg vlen is 10 bits: max 1023)
+.equ NCHUNK   T * D // CHUNK    ; passes over a [T][D] activation = 8
+
+; ---- strides (bytes) ------------------------------------------------------
+.equ AROW     D             ; activation row stride: D int8             = 128
+.equ WCOL     D * 2 // 8    ; ternary weight column stride: D trits     = 32
+.equ CROWQ    D3 * 4        ; int32 row stride of the fused [T][3D] out = 1536
+.equ CROWD    D * 4         ; int32 row stride of a [T][D] out          = 512
+.equ SROW     T * 4         ; int32 row stride of a [T][T] block        = 128
+.equ LROW     VOCAB * 4     ; int32 row stride of the [T][VOCAB] logits = 52
+
+; ===========================================================================
+; Scratchpad map (64 KB; highest byte used is 0xC833)
+; ===========================================================================
+.equ WBUF     0x0000        ; weight window, refilled 4x/layer     (12288 B)
+.equ QKV      0x3000        ; [T][3D] int8, fused projection       (12288 B)
+.equ VT       0x6000        ; [D][T] int8, V transposed, all heads  (4096 B)
+.equ X        0x7000        ; [T][D] int8 residual stream, in place (4096 B)
+.equ T1       0x8000        ; [T][D] int8 temp: A, H, F             (4096 B)
+.equ T2       0x9000        ; [T][D] int8 temp: O, relu(H)          (4096 B)
+.equ S32      0xA000        ; [T][T] int32: scores, A_h^T, logits   (4096 B)
+.equ TMP32    0xB000        ; CHUNK int32 elementwise temp          (2048 B)
+.equ S8       0xB800        ; [T][T] int8 scores                    (1024 B)
+.equ P8       0xBC00        ; [T][T] int8 attention weights         (1024 B)
+.equ AH8T     0xC000        ; [DH][T] int8, one head's A^T          (1024 B)
+.equ MASK     0xC400        ; [T][T] int8 causal mask, 0 / -128     (1024 B)
+.equ RQW      0xC800        ; this layer's 13 requant {m0,n} words     (52 B)
+.equ LOG      S32           ; logits reuse the score buffer (1664 <= 4096)
+
+; ---- the requant words, in the order adder_kernel.md §4 lists them ---------
+; Reloaded from the layer block each iteration, so these addresses are fixed
+; and every `setcfg scalar` stays a compile-time immediate.
+.equ RQ_Q     RQW +  0      ; X @ Wq   -> Q      int8
+.equ RQ_K     RQW +  4      ; X @ Wk   -> K      int8
+.equ RQ_V     RQW +  8      ; X @ Wv   -> V      int8
+.equ RQ_S     RQW + 12      ; Q@K^T int32 -> S8  (folds 1/sqrt(head_dim))
+.equ RQ_ID    RQW + 16      ; {m0=1, n=0} — narrow + clip only
+.equ RQ_P     RQW + 20      ; relu(S8) -> P8     ({1,0} is the natural choice)
+.equ RQ_A     RQW + 24      ; P@V int32 -> A8
+.equ RQ_O     RQW + 28      ; A8 @ Wo  -> O      **must land on X's scale**
+.equ RQ_X1    RQW + 32      ; X + O    -> X1
+.equ RQ_H     RQW + 36      ; X1 @ W1  -> H
+.equ RQ_HR    RQW + 40      ; relu(H)  -> HR     ({1,0} is the natural choice)
+.equ RQ_F     RQW + 44      ; HR @ W2  -> F      **must land on X1's scale**
+.equ RQ_X2    RQW + 48      ; X1 + F   -> X2
+
+; ===========================================================================
+; DRAM map (512 KB available; highest byte used is 0x21FFF = 135 KB)
+; ===========================================================================
+; Globals live below 0x5000 so every one of them fits a 16-bit `li`. The layer
+; blocks sit above and are reached through the `wl` base register instead.
+.equ D_XIN    0x0000        ; [T][D] int8, embedded + PE'd input    (4096 B)
+.equ D_MASK   0x1000        ; [T][T] int8 causal mask               (1024 B)
+.equ D_A8     0x1400        ; [T][D] int8 attention out (scratch)   (4096 B)
+.equ D_VT     0x2400        ; [D][T] int8 V^T (scratch)             (4096 B)
+.equ D_WFC    0x3400        ; [VOCAB][D] int8, quantized fc.weight  (1664 B)
+.equ D_LOG    0x3C00        ; [T][VOCAB] int32 logits — **the result** (1664 B)
+
+.equ D_L0     0x5000        ; layer 0's block
+.equ LSTRIDE  0x7400        ; per-layer block stride (29696 B)
+
+; ---- offsets inside one layer block ---------------------------------------
+.equ O_WQKV   0x0000        ; [D][3D] trits, col-major 2b          (12288 B)
+.equ O_WO     0x3000        ; [D][D]  trits                         (4096 B)
+.equ O_W1     0x4000        ; [D][F]  trits                         (4096 B)
+.equ O_W2     0x5000        ; [F][D]  trits                         (4096 B)
+.equ O_RQW    0x6000        ; this layer's 13 requant words            (52 B)
+.equ O_XOUT   0x6400        ; [T][D] int8 — this layer's X, a checkpoint
+
+; ---- byte counts ----------------------------------------------------------
+.equ B_WQKV   D3 * WCOL     ; 12288
+.equ B_WD     D * WCOL      ;  4096
+.equ B_ACT    T * D         ;  4096   a [T][D] int8 activation
+.equ B_VT     D * T         ;  4096
+.equ B_SQ     T * T         ;  1024   a [T][T] int8 block
+.equ B_RQW    52
+.equ B_WFC    VOCAB * D     ;  1664
+.equ B_LOG    T * VOCAB * 4 ;  1664
+
+; ===========================================================================
+; Registers — all 31 are live; see the note at `pa`/`pb`.
+; ===========================================================================
+.reg sa    r1               ; scratchpad-side address scratch
+.reg da    r2               ; DRAM-side address scratch
+.reg rq    r3               ; address of the live requant {m0,n} word
+.reg wbuf  r4
+.reg x     r5
+.reg qkv   r6
+.reg vt    r7
+.reg s32   r8               ; [T][T] int32 block, first CHUNK (also LOG)
+.reg s32b  r9               ; ...second CHUNK (CHUNK int32 = 2048 B in)
+.reg tmp   r10              ; TMP32
+.reg s8a   r11
+.reg s8b   r12
+.reg p8a   r13
+.reg p8b   r14
+.reg mska  r15
+.reg mskb  r16
+.reg ah8   r17
+.reg ah8b  r18
+.reg q     r19              ; head h's Q column base inside QKV
+.reg kp    r20              ; head h's K column base
+.reg vth   r21              ; head h's V^T row base
+.reg a8d   r22              ; head h's DRAM column base inside A8
+.reg i     r23              ; inner loop counter (heads, then chunks)
+.reg n     r24              ; inner loop bound / stride scratch
+; T1 and T2 have no permanent register: `pa`/`pb` carry them, re-`li`'d at each
+; use, and double as the chunk-loop pointers. That is what buys the two
+; registers the layer loop needs (`l`, `wl`) inside a 31-register budget.
+.reg pa    r25
+.reg pb    r26
+.reg one   r27
+.reg k512  r28              ; CHUNK, the chunk pointer step
+.reg k32   r29              ; DH, the per-head column step
+.reg l     r30              ; layer counter
+.reg wl    r31              ; this layer's DRAM block base
+
+; ===========================================================================
+; 0. Constants, fixed scratchpad bases, and the model-wide inputs
+; ===========================================================================
+    li      one,  1
+    li      k512, CHUNK
+    li      k32,  DH
+
+    li      wbuf, WBUF
+    li      x,    X
+    li      qkv,  QKV
+    li      vt,   VT
+    li      s32,  S32
+    li      s32b, S32 + CHUNK * 4
+    li      tmp,  TMP32
+    li      s8a,  S8
+    li      s8b,  S8 + CHUNK
+    li      p8a,  P8
+    li      p8b,  P8 + CHUNK
+    li      mska, MASK
+    li      mskb, MASK + CHUNK
+    li      ah8,  AH8T
+    li      ah8b, AH8T + CHUNK
+
+    ; X and the mask are loaded once for the whole model. X then stays resident
+    ; and every layer updates it in place — no inter-layer DRAM round trip.
+    li      da, D_XIN
+    setcfg  len, B_ACT
+    rdmem   x, da
+    li      da, D_MASK
+    setcfg  len, B_SQ
+    rdmem   mska, da
+
+    ; MXU geometry that is the same for all four matmuls of every layer.
+    setcfg  tlen,   T           ; 32 token rows, one MXU pass (TOK_W = 6 bits)
+    setcfg  arow,   AROW        ; activations are [T][D] row-major
+    setcfg  wcol,   WCOL        ; weight columns are D trits = 32 bytes
+    setcfg  ktiles, KT          ; contract the full D = 16 array tiles
+    setcfg  ntiles, NTD         ; 128 output columns per dispatch
+
+    ; Attention block geometry — both vecmatmuls in the head loop are T x T.
+    setcfg  vrows, T
+    setcfg  vcols, T
+    setcfg  vcrow, SROW
+
+    li      wl, D_L0
+    li      l,  0
+
+; ===========================================================================
+; ============================ PER-LAYER BODY ===============================
+; ===========================================================================
+layer:
+    ; ---- this layer's requant words, into the fixed RQW slot -------------
+    ; Reloading them per layer is what keeps every `setcfg scalar` below a
+    ; compile-time immediate instead of needing `setcfgr`.
+    li      sa, O_RQW
+    adds    da, wl, sa
+    li      pa, RQW
+    setcfg  len, B_RQW
+    rdmem   pa, da
+
+; ---------------------------------------------------------------------------
+; 1. Q, K, V — three ternary matmuls out of one fused weight block
+; ---------------------------------------------------------------------------
+; [Wq|Wk|Wv] is one [D][3D] block in DRAM, so it is one `rdmem`; but the three
+; are *separate* matmuls because each carries its own absmean, hence its own
+; requant word. Fusing them into a single 48-tile `matmul_t` would force one
+; multiplier on all three (adder_kernel.md §4). Three 16-tile dispatches cost
+; six extra instructions and keep each projection's scale its own.
+;
+; All three write into the same [T][3D] buffer at column offsets 0, D, 2D —
+; `crow` = 3D*4, so the requantized store steps 3D bytes per token row and the
+; three blocks interleave into the fused layout the transpose below expects.
+
+    adds    da, wl, r0          ; layer block base + O_WQKV (= 0)
+    setcfg  len, B_WQKV
+    rdmem   wbuf, da
+
+    setcfg  crow,   CROWQ
+    setcfg  scalar, RQ_Q
+    matmul_t.rq  qkv, x, wbuf               ; Q -> QKV[:, 0:D]
+
+    li      sa, QKV + D
+    li      pa, WBUF + D * WCOL
+    setcfg  scalar, RQ_K
+    matmul_t.rq  sa, x, pa                  ; K -> QKV[:, D:2D]
+
+    li      sa, QKV + 2 * D
+    li      pa, WBUF + 2 * D * WCOL
+    setcfg  scalar, RQ_V
+    matmul_t.rq  sa, x, pa                  ; V -> QKV[:, 2D:3D]
+
+; ---------------------------------------------------------------------------
+; 2. V^T — every head, in one transposing DMA
+; ---------------------------------------------------------------------------
+; `vecmatmul` contracts over each operand's contiguous axis, and P @ V contracts
+; over *keys*, which is V's row axis — so V must be key-contiguous. The `.t` DMA
+; reads the V columns straight out of the fused block (`tsrow` = 3D is what
+; makes the source a column slice) and writes [D][T]. Head h's rows land at
+; VT + h*DH*T, so the per-head base is a plain pointer step.
+
+    li      sa, QKV + 2 * D
+    li      da, D_VT
+    setcfg  tcols, D            ; D elements per source row...
+    setcfg  tsrow, D3           ; ...from rows 3D bytes apart (the V slice)
+    setcfg  tdrow, T            ; destination rows are T tokens long
+    setcfg  len,   B_VT
+    wrmem.t sa, da              ; scratchpad V slice -> DRAM V^T
+    rdmem   vt, da              ; plain fill back (the mode is in the instr)
+
+; ---------------------------------------------------------------------------
+; 3. Attention, one head at a time
+; ---------------------------------------------------------------------------
+; Head h is a contiguous 32-byte slice of each 384-byte QKV row (kv_heads ==
+; q_heads, so heads_per_q = 1 and mha_torch's 5-D layout collapses to
+; [T, 4, 32]) — no reshape anywhere, just a column offset and a row stride.
+
+    li      q,   QKV                        ; head 0's Q columns
+    li      kp,  QKV + D                    ; head 0's K columns
+    li      vth, VT                         ; head 0's V^T rows
+    li      a8d, D_A8                       ; head 0's A column block
+    li      i,   0
+    li      n,   HEADS
+
+head:
+    ; ---- S = Q_h @ K_h^T ------------------------------------------------
+    ; K^T is never materialized: `vecmatmul` reads src1 row-major and contracts
+    ; over its own rows, so the transpose is the loop order (macro_ops.md §5.3).
+    setcfg  vlen,  DH           ; contract over the head dim
+    setcfg  vrow0, D3           ; Q and K rows are 3D bytes apart
+    setcfg  vrow1, D3
+    vecmatmul s32, q, kp        ; S32[t][s] int32
+
+    ; ---- P = relu(S + mask), in two CHUNK passes ------------------------
+    ; The mask is *data*, not control flow: an int8 tensor of 0 (allowed) and
+    ; -128 (masked). vecadd widens to int32, the {1,0} requant narrows back and
+    ; clips, so a masked entry lands in [-128,-1] — always negative, therefore
+    ; always zero after relu — while an allowed entry adds 0 and is unchanged.
+    ; That is exactly mha_torch's `relu(scores + -1e9)`, and it is exact for
+    ; every score scale rather than a tolerance.
+    ;
+    ; Five passes per chunk and every one is load-bearing: `requant` is the only
+    ; op that narrows int32 -> int8, and vecadd/relu read int8.
+    setcfg  vlen, CHUNK
+    li      rq, RQ_S
+    requant s8a, s32,  rq       ; int32 -> int8, 1/sqrt(head_dim) folded in
+    requant s8b, s32b, rq
+    li      rq, RQ_ID
+    vecadd  tmp, s8a, mska      ; + causal mask   -> int32
+    requant s8a, tmp, rq        ; -> int8, masked entries now <= -1
+    vecadd  tmp, s8b, mskb
+    requant s8b, tmp, rq
+    li      rq, RQ_P
+    relu    tmp, s8a            ; masked -> 0     -> int32
+    requant p8a, tmp, rq        ; -> int8 attention weights
+    relu    tmp, s8b
+    requant p8b, tmp, rq
+
+    ; ---- A_h^T = V_h^T @ P_h^T ------------------------------------------
+    ; Operands swapped relative to the obvious P @ V^T so the result comes out
+    ; *transposed*, as [DH][T]. That is not a detour: the transposed form is
+    ; what lets one `.t` DMA scatter it into A's column block below. The score
+    ; buffer is dead by now, so A^T reuses it.
+    setcfg  vlen,  T            ; contract over keys
+    setcfg  vrow0, T            ; V^T rows are T tokens
+    setcfg  vrow1, T            ; P rows are T keys
+    vecmatmul s32, vth, p8a     ; A^T[d][t] int32
+
+    setcfg  vlen, CHUNK
+    li      rq, RQ_A
+    requant ah8,  s32,  rq
+    requant ah8b, s32b, rq      ; [DH][T] int8
+
+    ; ---- scatter A_h^T into A[:, h*DH : (h+1)*DH] -----------------------
+    ; A must be [T][D] row-major for the Wo matmul, so head h's 32 columns have
+    ; to be interleaved 128 bytes apart. Written from the transposed block that
+    ; is exactly what a `.t` spill does: source (d, t) -> dst + t*D + d. One
+    ; dispatch instead of the 32 row-copies a non-transposed layout would need.
+    setcfg  tcols, T
+    setcfg  tsrow, T
+    setcfg  tdrow, D
+    setcfg  len,   B_SQ
+    wrmem.t ah8, a8d
+
+    ; ---- next head ------------------------------------------------------
+    adds    q,   q,   k32       ; Q/K advance one head_dim of columns
+    adds    kp,  kp,  k32
+    adds    vth, vth, k512      ; V^T advances DH*T = 1024 = 2*CHUNK bytes
+    adds    vth, vth, k512
+    adds    a8d, a8d, k32
+    adds    i,   i,   one
+    cmps    i,   n
+    blt     head
+
+; ---------------------------------------------------------------------------
+; 4. O = A @ Wo, then the attention residual X <- X + O
+; ---------------------------------------------------------------------------
+    li      da, D_A8
+    li      pa, T1
+    setcfg  len, B_ACT
+    rdmem   pa, da              ; A[T][D] int8, all four heads assembled
+
+    li      sa, O_WO
+    adds    da, wl, sa
+    setcfg  len, B_WD
+    rdmem   wbuf, da
+
+    li      pb, T2
+    setcfg  crow,   CROWD       ; back to a D-wide output row
+    setcfg  scalar, RQ_O
+    matmul_t.rq  pb, pa, wbuf   ; O = requant(A @ Wo)   [T][D] int8
+
+    ; X1 = requant(X + O). Both operands are int8 at the *same* scale (that is
+    ; RQ_O's job), and the result overwrites X in place — vecadd reads the whole
+    ; chunk before requant writes it, and dispatches are atomic.
+    setcfg  vlen, CHUNK
+    li      rq, RQ_X1
+    li      pa, X
+    li      pb, T2
+    li      i,  0
+    li      n,  NCHUNK
+resid1:
+    vecadd  tmp, pa, pb
+    requant pa,  tmp, rq
+    adds    pa,  pa, k512
+    adds    pb,  pb, k512
+    adds    i,   i,  one
+    cmps    i,   n
+    blt     resid1
+
+; ---------------------------------------------------------------------------
+; 5. Feed-forward: X <- X1 + W2(relu(W1(X1)))
+; ---------------------------------------------------------------------------
+    li      sa, O_W1
+    adds    da, wl, sa
+    setcfg  len, B_WD
+    rdmem   wbuf, da
+    li      pa, T1
+    setcfg  scalar, RQ_H
+    matmul_t.rq  pa, x, wbuf    ; H = requant(X1 @ W1)   [T][F] int8
+
+    setcfg  vlen, CHUNK
+    li      rq, RQ_HR
+    li      pa, T1
+    li      pb, T2
+    li      i,  0
+    li      n,  NCHUNK
+ffrelu:
+    relu    tmp, pa             ; int8 -> int32
+    requant pb,  tmp, rq        ; -> int8
+    adds    pa,  pa, k512
+    adds    pb,  pb, k512
+    adds    i,   i,  one
+    cmps    i,   n
+    blt     ffrelu
+
+    li      sa, O_W2
+    adds    da, wl, sa
+    setcfg  len, B_WD
+    rdmem   wbuf, da
+    li      pa, T1
+    li      pb, T2
+    setcfg  scalar, RQ_F
+    matmul_t.rq  pa, pb, wbuf   ; F = requant(relu(H) @ W2)   [T][D] int8
+
+    ; X2 = requant(X1 + F), again in place and again requiring RQ_F to have
+    ; landed F on X1's scale.
+    setcfg  vlen, CHUNK
+    li      rq, RQ_X2
+    li      pa, X
+    li      pb, T1
+    li      i,  0
+    li      n,  NCHUNK
+resid2:
+    vecadd  tmp, pa, pb
+    requant pa,  tmp, rq
+    adds    pa,  pa, k512
+    adds    pb,  pb, k512
+    adds    i,   i,  one
+    cmps    i,   n
+    blt     resid2
+
+; ---------------------------------------------------------------------------
+; 6. Checkpoint this layer's X, then advance to the next layer block
+; ---------------------------------------------------------------------------
+; X stays resident in the scratchpad; this spill exists so every layer boundary
+; is a comparable intermediate for the integer reference (adder_kernel.md §7),
+; not because the data has to move.
+    li      sa, O_XOUT
+    adds    da, wl, sa
+    setcfg  len, B_ACT
+    wrmem   x, da
+
+    li      n,  LSTRIDE         ; `n` is free here — the inner loops are done
+    adds    wl, wl, n
+    adds    l,  l,  one
+    li      n,  LAYERS
+    cmps    l,  n
+    blt     layer
+
+; ===========================================================================
+; 7. Output head: logits = X @ fc.weight^T
+; ===========================================================================
+; `Model.fc` is a plain `nn.Linear`, *not* a TernaryLinear (`make_linear` is
+; never applied to it), so its weights are int8 and the ternary-weight MXU
+; cannot touch it — the VPU is the only unit that can do int8 x int8. And
+; `nn.Linear` stores its weight as [out, in] = [13, 128], which is already the
+; contraction-contiguous layout `vecmatmul` wants for src1, so W^T is never
+; formed.
+;
+; Spilled as raw int32 with no requant: the host only needs an argmax over 13
+; logits, and narrowing first would throw away resolution for nothing.
+
+    li      da, D_WFC
+    setcfg  len, B_WFC
+    rdmem   wbuf, da
+
+    setcfg  vlen,  D            ; contract over the model dim
+    setcfg  vrows, T            ; one output row per token
+    setcfg  vcols, VOCAB        ; one column per vocabulary entry
+    setcfg  vrow0, AROW
+    setcfg  vrow1, AROW
+    setcfg  vcrow, LROW
+    vecmatmul s32, x, wbuf      ; LOG[t][v] = sum_d X[t][d] * W[v][d]
+
+    li      da, D_LOG
+    setcfg  len, B_LOG
+    wrmem   s32, da
+    halt

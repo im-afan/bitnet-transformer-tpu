@@ -21,6 +21,7 @@ The toolchain (all in this directory):
 | [`luts.py`](luts.py)          | generates the VPU's `gelu`/`exp` activation ROMs (`../tpu/rtl/luts/*.hex`) at their canonical input scale; the ISS imports the same tables |
 | [`gen_vectors.py`](gen_vectors.py) | ties both together: assemble + simulate → golden test vectors for `tpu_top_tb.sv` |
 | [`torch_ref.py`](torch_ref.py) | PyTorch references for the examples — an independent check on the ISS *and* the FPGA |
+| [`adder_export.py`](adder_export.py) | real checkpoint → integers: calibrate every activation scale, derive the 13 requant words per layer, run the integer pipeline, and report task accuracy against the float model. `--iss-check` runs the real weights through `adder_model.tpu` in the ISS to prove the numbers describe the kernel |
 | [`examples/`](examples)       | annotated `.tpu` programs (vector add, relu layer, tiled matmul, VPU matmul, softmax) |
 
 For the machine-level encoding and per-opcode semantics, read the
@@ -70,9 +71,10 @@ Three operand kinds, chosen by the instruction's form (see [ISA Appendix A.4](..
 
 **Expression evaluator.** Immediates are evaluated over a restricted, safe AST (no
 general `eval`): integer literals, previously-defined `.equ` constants and labels,
-parentheses, and the operators `+ - * // % << >> & | ^ ~` plus unary `+`/`-`. `li`
-immediates are sign-checked to 16-bit signed range; `setcfg` immediates to 16-bit
-unsigned.
+parentheses, and the operators `+ - * // % << >> & | ^ ~` plus unary `+`/`-`. `li` and
+`setcfg` immediates are both range-checked to 16-bit **unsigned** (0..65535); a negative
+one is an error rather than a silent `imm & 0xFFFF`, because both instructions
+zero-extend. For a negative constant use `li rN, K` then `subs rN, r0, rN`.
 
 ### 1.4 Instruction set
 
@@ -129,7 +131,7 @@ adds     rdst, ra, rb                   rdst = ra + rb
 subs     rdst, ra, rb                   rdst = ra - rb
 muls     rdst, ra, rb                   rdst = ra * rb
 cmps     ra, rb                          set flags from cmp(ra, rb)
-li       rdst, imm16                    rdst = sign_extend(imm16)
+li       rdst, imm16                    rdst = zero_extend(imm16)
 loads    rdst, raddr                    rdst = scratch[raddr]        (int32)
 stores   raddr, rval                    scratch[raddr] = rval        (int32)
 setcfg   cfgname, imm16                 cfg[name] = zero_extend(imm16)
@@ -227,6 +229,19 @@ Each stages its own operands over DRAM (§2.2) and ends in `halt`.
 | [`vpu_matmul.tpu`](examples/vpu_matmul.tpu) | a matmul with **no** ternary operand, so the MXU cannot help: attention's `S = Q@K^T` as a `T x T` nest of `vecdot`, contracting over the head dim — `K^T` is never materialised — then a per-row `requant` back to int8 for softmax |
 | [`softmax_row.tpu`](examples/softmax_row.tpu) | a multi-op micro-sequence + scalar↔vector interplay (`redmax → sadd → exp → redsum → sdiv`) — illustrative only, see the caveat below |
 | [`transpose_dma.tpu`](examples/transpose_dma.tpu) | `Vᵀ` and `Qᵀ` out of a fused `[T][3D]` QKV block in one dispatch each — `wrmem.t` (spill) and `rdmem.t` (fill), with `tsrow` reading a column slice in place |
+| [`highmem_dma.tpu`](examples/highmem_dma.tpu) | DMA above the low 64 KB of DRAM — the only thing here that leaves the first window. Builds a `0x10000` base with `li`+`adds` (no immediate can name it) and spills there linearly and transposed |
+| [`adder_model.tpu`](examples/adder_model.tpu) | **not an example — the real thing.** The entire `adder_ternary_vanilla` model in one program: four layers (3 ternary projections, both attention matmuls, the causal mask, ReLU attention, `Wo`, the feed-forward, both residuals) plus the output head. 196 words |
+
+`adder_model.tpu` is a full forward pass of the shipped adder checkpoint in a
+single run. It was five runs until `scalar_unit.sv` stopped truncating a
+`rdmem`/`wrmem` DRAM address to 16 bits: the SRAM is 512 KB and the UART host
+always reached all of it, but a *program* could only name the low 64 KB, which
+the model's 96 KB of weights do not fit in. With the full `MEM_ADDR_W` visible
+the weights are staged once and stay resident, so a forward pass is a 4 KB
+upload rather than a 96 KB one. The byte-level contract the host has to satisfy
+— memory maps, the 13 requant words per layer and where their scales come from,
+the weight packing — is in [`adder_kernel.md`](adder_kernel.md); §2 there has
+the RTL/ISS change and §7 the verification order.
 
 > **`softmax_row.tpu` does not compute a correct softmax.** It is not type-correct:
 > `exp`, `redsum` and `sdiv` read int8 operands at stride 1, but the `sadd` and `exp`
@@ -309,8 +324,9 @@ python torch_ref.py                          # every example with a reference, v
 python torch_ref.py -p examples/relu_layer.tpu
 ```
 
-`relu_layer`, `vector_add`, `tiled_matmul` and `vpu_matmul` have references;
-`softmax_row` is registered as unsupported with the reason in `torch_ref.UNSUPPORTED`.
+`relu_layer`, `vector_add`, `tiled_matmul`, `vpu_matmul`, `transpose_dma`,
+`highmem_dma` and `adder_model` have references; `softmax_row` is registered as
+unsupported with the reason in `torch_ref.UNSUPPORTED`.
 The same references run against **real hardware** — `accel/tpu/host/run_program.py`
 calls `torch_ref.verify()` on the bytes it reads back off the FPGA, so one command
 checks the device against both the ISS and PyTorch.

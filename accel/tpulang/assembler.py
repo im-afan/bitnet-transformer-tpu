@@ -424,6 +424,15 @@ class Assembler:
     def _imm16(self, expr: str, lineno: int, signed_ok: bool) -> int:
         v = self.eval_expr(expr, lineno)
         lo = -32768 if signed_ok else 0
+        if v < 0 and not signed_ok:
+            # `li` and `setcfg` both zero-extend, so a negative immediate cannot
+            # mean what it says. Fail rather than silently delivering v & 0xFFFF.
+            raise AsmError(
+                lineno,
+                f"immediate {v} is negative, but this instruction zero-extends "
+                f"(a register would receive {v & 0xFFFF}). For a negative "
+                f"constant use `li rN, {abs(v)}` then `subs rN, r0, rN`"
+            )
         if not (lo <= v <= 65535):
             raise AsmError(lineno, f"immediate {v} out of 16-bit range")
         return v & 0xFFFF
@@ -456,10 +465,10 @@ class Assembler:
         if form == "SS":  # src0, src1 (dst unused; wrmem/stores/cmps)
             self._need(ins, 2)
             return _pack(spec.opcode, 0, reg(ops[0]), reg(ops[1]), ins.flags)
-        if form == "RIMM":  # li rdst, imm16 (sign-extended by hw)
+        if form == "RIMM":  # li rdst, imm16 (zero-extended by hw)
             self._need(ins, 2)
             return _pack_imm(
-                spec.opcode, reg(ops[0]), self._imm16(ops[1], ln, signed_ok=True)
+                spec.opcode, reg(ops[0]), self._imm16(ops[1], ln, signed_ok=False)
             )
         if form == "CFG":  # setcfg cfgname, imm16 (zero-extended by hw)
             self._need(ins, 2)

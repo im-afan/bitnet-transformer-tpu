@@ -21,8 +21,15 @@ Numerics are kept bit-exact with the RTL:
 
 DMA (rdmem/wrmem) is modelled as a real byte copy between a separate external
 **DRAM** space and the on-chip scratchpad, over ``cfg 'len'`` bytes — matching the
-``dma.sv``/``sram.sv`` engine now wired into ``tpu_top.sv`` (and how
-``tpu_top_tb.sv`` seeds/reads DRAM). This lets a kernel stream tiles: fill a small
+``dma.sv``/``sram.sv`` engine. The two memories are **different sizes**: the
+scratchpad is ``2**addr_w`` (16 bits) and DRAM is ``2**mem_addr_w`` (19 bits, the
+Cmod A7's 512K x 8 SRAM), so each side of a transfer is masked in its own space
+(``_a`` vs ``_d``). Sizing DRAM off ``addr_w`` — as this did until
+``scalar_unit.sv`` stopped truncating its DRAM address — silently aliases
+anything above 64 KB back into the low window.
+
+The engine is the one wired into ``tpu_top.sv`` (and is how ``tpu_top_tb.sv``
+seeds/reads DRAM). This lets a kernel stream tiles: fill a small
 fixed scratchpad buffer from an advancing DRAM address, compute, spill the result
 back to a distinct DRAM address — so the operands need not all fit in scratchpad.
 Inputs live in DRAM, ``rdmem`` fills scratchpad, and ``wrmem`` is what makes a byte
@@ -92,6 +99,12 @@ class TPU:
     rows: int = 8          # MXU contraction dim d (activation vector length)
     cols: int = 8          # MXU output features
     addr_w: int = 16       # scratchpad byte-address width (2**addr_w bytes)
+    # External DRAM is a *wider, separate* space: the async SRAM chip is 2**19
+    # bytes (tpu_top.sv MEM_ADDR_W). This used to be sized off addr_w, which
+    # modelled the scalar unit's old ADDR_W-truncated rdmem/wrmem address and so
+    # made a 64 KB program window look like a hardware ceiling. scalar_unit.sv
+    # now emits the full width; the two spaces are masked separately below.
+    mem_addr_w: int = 19   # external DRAM byte-address width (2**mem_addr_w)
     m0_w: int = 12         # requant fixed-point multiplier width
     n_w: int = 4           # requant shift width
     recip_q: int = 31      # VOP_SCALAR_DIV reciprocal exponent (vpu.sv)
@@ -114,8 +127,9 @@ class TPU:
 
     def __post_init__(self):
         self.depth = 1 << self.addr_w
+        self.dram_depth = 1 << self.mem_addr_w
         self.mem = bytearray(self.depth)
-        self.dram = bytearray(self.depth)
+        self.dram = bytearray(self.dram_depth)
         self.regs = [0] * 32
         self.cfg = [0] * 32
         self.written = set()
@@ -129,6 +143,17 @@ class TPU:
     # ---- scratchpad access (addresses wrap mod depth, like the RTL) ----------
     def _a(self, addr: int) -> int:
         return addr & (self.depth - 1)
+
+    def _d(self, addr: int) -> int:
+        """Mask a **DRAM** byte address (mod 2**mem_addr_w).
+
+        Distinct from :meth:`_a` because the two memories are different sizes.
+        Every DRAM-side address goes through here and every scratchpad-side one
+        through ``_a``; mixing them is the one way this model can silently
+        disagree with the RTL, since a DRAM address masked to 16 bits aliases
+        back into the low window instead of reaching the rest of the chip.
+        """
+        return addr & (self.dram_depth - 1)
 
     def rd_u32(self, addr: int) -> int:
         return sum(self.mem[self._a(addr + k)] << (8 * k) for k in range(4))
@@ -172,10 +197,10 @@ class TPU:
 
         if not transpose:
             for k in range(n):
-                if to_scratch:
-                    self.mem[self._a(dst + k)] = self.dram[self._a(src + k)]
-                else:
-                    a = self._a(dst + k)
+                if to_scratch:              # fill: DRAM -> scratchpad
+                    self.mem[self._a(dst + k)] = self.dram[self._d(src + k)]
+                else:                       # spill: scratchpad -> DRAM
+                    a = self._d(dst + k)
                     self.dram[a] = self.mem[self._a(src + k)]
                     self.dram_written.add(a)
             return
@@ -184,13 +209,18 @@ class TPU:
         srow = (self.cfg[CFG_TSROW] & 0xFFFF) or cols
         drow = (self.cfg[CFG_TDROW] & 0xFFFF) or 1
 
+        # The source always gets the row-major offset and the destination the
+        # transposed one (dma.sv's lin_off/tr_off); which *memory* that is
+        # follows from the direction, so each side is masked in its own space.
         col = row = src_row_off = dst_col_off = 0
         for _ in range(n):
-            s = self._a(src + src_row_off + col)
-            d = self._a(dst + dst_col_off + row)
-            if to_scratch:
+            if to_scratch:                  # fill: source is DRAM
+                s = self._d(src + src_row_off + col)
+                d = self._a(dst + dst_col_off + row)
                 self.mem[d] = self.dram[s]
-            else:
+            else:                           # spill: source is the scratchpad
+                s = self._a(src + src_row_off + col)
+                d = self._d(dst + dst_col_off + row)
                 self.dram[d] = self.mem[s]
                 self.dram_written.add(d)
             # Only the byte count ends the transfer, so a `len` that is not a
@@ -239,7 +269,8 @@ class TPU:
     def run(self, words: list, boot_pc: int = 0, max_steps: int = 100_000) -> None:
         pc = boot_pc
         flag_eq = flag_lt = False
-        addr_mask = self.depth - 1
+        addr_mask = self.depth - 1              # scratchpad: ADDR_W bits
+        dram_mask = self.dram_depth - 1         # DRAM: MEM_ADDR_W bits
 
         for _ in range(max_steps):
             if pc >= len(words):
@@ -282,11 +313,14 @@ class TPU:
                 self._vpu(opc, r_dst & addr_mask, r_src0 & addr_mask,
                           r_src1 & addr_mask)
 
+            # Each operand is truncated in its own space, matching
+            # scalar_unit.sv's split of dma_scratch_addr (ADDR_W) from
+            # dma_dram_addr (MEM_ADDR_W).
             elif opc == OP_RDMEM:    # fill: DRAM(src0) -> scratchpad(dst)
-                self._dma(dst=r_dst & addr_mask, src=r_src0 & addr_mask,
+                self._dma(dst=r_dst & addr_mask, src=r_src0 & dram_mask,
                           to_scratch=True, transpose=bool(flags & 0b01))
             elif opc == OP_WRMEM:    # spill: scratchpad(src0) -> DRAM(src1)
-                self._dma(dst=r_src1 & addr_mask, src=r_src0 & addr_mask,
+                self._dma(dst=r_src1 & dram_mask, src=r_src0 & addr_mask,
                           to_scratch=False, transpose=bool(flags & 0b01))
             elif opc == OP_WRNEIGH:
                 pass  # no LINK engine attached in tpu_top.sv — completing no-op
@@ -298,7 +332,10 @@ class TPU:
             elif opc == OP_MULS:
                 self.wreg(f_dst, r_src0 * r_src1)
             elif opc == OP_LIS:
-                self.wreg(f_dst, imm16 - 0x10000 if imm16 & 0x8000 else imm16)
+                # Zero-extended (scalar_unit.sv OP_LIS). Sign extension made
+                # `li r, 0x8000` alias to 0x78000 once DRAM addresses stopped
+                # being truncated to 16 bits; see that file for the argument.
+                self.wreg(f_dst, imm16)
             elif opc == OP_SETCFG:
                 self.cfg[f_dst & 0x1F] = imm16          # zero-extended
             elif opc == OP_SETCFGR:

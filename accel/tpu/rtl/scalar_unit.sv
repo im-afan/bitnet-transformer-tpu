@@ -36,7 +36,16 @@ module scalar_unit #(
     parameter int XLEN     = 32,  // scalar datapath width
     parameter int REG_AW   = 5,   // register file: 2**REG_AW regs (fields are 8b)
     parameter int IMEM_AW  = 10,  // instruction memory depth = 2**IMEM_AW
-    parameter int ADDR_W   = 16,  // scratchpad / DRAM byte-address width
+    parameter int ADDR_W   = 16,  // scratchpad byte-address width
+    // External DRAM is a *wider* space than the scratchpad: the async SRAM chip
+    // is 2**19 bytes (tpu_top.sv MEM_ADDR_W, Cmod A7 512K x 8). The DMA engine,
+    // the SRAM controller and the UART host have always addressed all of it —
+    // only this unit's rdmem/wrmem address was truncated to ADDR_W, which
+    // confined a *program* to the low 64 KB of a 512 KB chip while the host
+    // could reach every byte of it. Registers are XLEN wide, so carrying the
+    // full width costs three extra wires on one port. See
+    // accel/tpulang/adder_kernel.md §2 for what it unblocks.
+    parameter int MEM_ADDR_W = 19, // external DRAM (SRAM chip) byte-address width
     // Config register file: 2**CFG_AW regs. Widened 4 -> 5 for the DMA's
     // transpose geometry (docs/dma.md §5): 0..14 were assigned and index 15 was
     // the last free slot, which three registers do not fit into. The `dst`
@@ -113,7 +122,7 @@ module scalar_unit #(
     output logic                 dma_start,
     output logic                 dma_write,      // 1: scratch->DRAM, 0: DRAM->scratch
     output logic [ADDR_W-1:0]    dma_scratch_addr,
-    output logic [ADDR_W-1:0]    dma_dram_addr,
+    output logic [MEM_ADDR_W-1:0] dma_dram_addr,   // wider than the scratchpad
     output logic [15:0]          dma_len,        // bytes (config reg)
     output logic                 dma_transpose,  // transposed addressing (instr flag)
     output logic [15:0]          dma_tcols,      // source row length, elements (config reg)
@@ -159,7 +168,7 @@ module scalar_unit #(
         OP_SUBS    = 6'h11,  // r[dst] = r[src0] - r[src1]   (support op)
         OP_MULS    = 6'h12,  // r[dst] = r[src0] * r[src1]   (low XLEN bits)
         OP_CMPS    = 6'h13,  // flags <- cmp(r[src0], r[src1])
-        OP_LIS     = 6'h14,  // r[dst] = sign-extend(imm16)  (support op)
+        OP_LIS     = 6'h14,  // r[dst] = zero-extend(imm16)  (support op)
         OP_SETCFG  = 6'h15,  // cfg[dst] = zero-extend(imm16)
         OP_LOADS   = 6'h16,  // r[dst] = scratch[r[src0]]    (support op)
         OP_STORES  = 6'h17,  // scratch[r[src0]] = r[src1]   (support op)
@@ -402,9 +411,15 @@ module scalar_unit #(
     end
 
     // WRMEM: scratch r[src0] -> DRAM r[src1];  RDMEM: DRAM r[src0] -> scratch r[dst]
+    //
+    // The two sides are truncated to *different* widths on purpose: the
+    // scratchpad is ADDR_W (16) and external DRAM is MEM_ADDR_W (19). A program
+    // therefore names any byte of the SRAM chip, not just its low 64 KB. Note
+    // that `li` is a 16-bit immediate, so a base above 64 KB is built with
+    // scalar arithmetic (`adds` on a 32-bit register) rather than loaded whole.
     assign dma_write        = (opc == OP_WRMEM);
-    assign dma_scratch_addr = (opc == OP_WRMEM) ? r_src0[ADDR_W-1:0] : r_dst [ADDR_W-1:0];
-    assign dma_dram_addr    = (opc == OP_WRMEM) ? r_src1[ADDR_W-1:0] : r_src0[ADDR_W-1:0];
+    assign dma_scratch_addr = (opc == OP_WRMEM) ? r_src0[ADDR_W-1:0]     : r_dst [ADDR_W-1:0];
+    assign dma_dram_addr    = (opc == OP_WRMEM) ? r_src1[MEM_ADDR_W-1:0] : r_src0[MEM_ADDR_W-1:0];
     // `.t`: read the source row-major, write the destination transposed. Both DMA
     // ops leave flags[0] free (RDMEM is RS-form, WRMEM SS-form), so this needs no
     // opcode of its own — and being an instruction flag rather than a "the stride
@@ -412,6 +427,10 @@ module scalar_unit #(
     // from rearranging the next program's plain rdmem (docs/macro_ops.md §4.0).
     assign dma_transpose    = flags[0];
 
+    // LINK addresses stay at ADDR_W. They are nominally DRAM addresses too, but
+    // no comms block is attached (tpu_top.sv ties `nb_done` high, so `wrneigh`
+    // is a completing no-op) and widening an interface nothing drives would be
+    // churn. Widen these alongside the rest when comms.md lands.
     assign nb_dir      = flags;
     assign nb_src_addr = r_src0[ADDR_W-1:0];
     assign nb_dst_addr = r_src1[ADDR_W-1:0];
@@ -519,7 +538,16 @@ module scalar_unit #(
                 OP_ADDS:   begin rf_we = 1'b1; rf_wdata = r_src0 + r_src1; end
                 OP_SUBS:   begin rf_we = 1'b1; rf_wdata = r_src0 - r_src1; end
                 OP_MULS:   begin rf_we = 1'b1; rf_wdata = r_src0 * r_src1; end
-                OP_LIS:    begin rf_we = 1'b1; rf_wdata = {{(XLEN-16){imm16[15]}}, imm16}; end
+                // ZERO-extended, not sign-extended. `li` almost always loads an
+                // address, and registers now feed a 19-bit DRAM address as well
+                // as the 16-bit scratchpad one. Under sign extension
+                // `li r, 0x8000` puts 0xFFFF8000 in the register: masking that
+                // to ADDR_W wraps back to 0x8000, but masking it to MEM_ADDR_W
+                // gives 0x78000 — so every DRAM address in [0x8000, 0xFFFF]
+                // silently aliased to the top of the chip. Zero extension makes
+                // the register hold what was written. A negative constant is
+                // `li t, N` then `subs t, r0, t`; nothing in the tree needed one.
+                OP_LIS:    begin rf_we = 1'b1; rf_wdata = {{(XLEN-16){1'b0}}, imm16}; end
                 OP_SETCFG:  cfg_prog_we = 1'b1;
                 OP_SETCFGR: cfg_reg_we  = 1'b1;
                 default:   ;   // LOADS commits in S_LOAD; others don't write rf

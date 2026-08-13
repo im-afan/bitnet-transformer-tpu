@@ -147,8 +147,17 @@ register*:
     matmul  out, act, wgt       ; MXU reads scratchpad starting at that address
 ```
 
-`li` sign-extends a 16-bit immediate, which spans the whole 16-bit scratchpad, so any
-scratchpad address fits directly.
+`li` **zero-extends** a 16-bit immediate, so any scratchpad address fits directly. DRAM is
+wider than 16 bits (`MEM_ADDR_W = 19`), so an address above 64 KB is *built* rather than
+loaded — `li hi, 0x8000` then `adds hi, hi, hi` reaches 0x10000. See
+[`highmem_dma.tpu`](../../tpulang/examples/highmem_dma.tpu).
+
+Zero extension is why that works. Under the sign extension this instruction used to have,
+`li r, 0x8000` put `0xFFFF8000` in the register: masked to the scratchpad's 16 bits that
+wrapped back to `0x8000`, but masked to a 19-bit DRAM address it became `0x78000` — so
+every DRAM address in `[0x8000, 0xFFFF]` silently aliased to the top of the chip. A
+negative constant is now `li rN, K` followed by `subs rN, r0, rN`, and the assembler
+rejects a negative `li` immediate rather than delivering `imm & 0xFFFF`.
 
 ### 4.2 Set sizes in config before you compute
 
@@ -282,7 +291,7 @@ wrneigh rmy, rnb, dir       push local DRAM -> neighbor DRAM  (dir: n|e|s|w)
 **Scalar & control:**
 
 ```
-li     d, imm16     d = sign_extend(imm16)      adds  d, a, b   d = a + b
+li     d, imm16     d = zero_extend(imm16)      adds  d, a, b   d = a + b
 loads  d, raddr     d = scratch[raddr] (int32)  subs  d, a, b   d = a - b
 stores raddr, rval  scratch[raddr] = rval        muls  d, a, b   d = a * b
 setcfg name, imm16  cfg[name] = imm16            cmps  a, b      set eq/lt flags
@@ -506,7 +515,7 @@ int32 is little-endian 4-byte, int8 a single signed byte.
 | `0x11` | `subs`    | RRR    | scalar  | `dst = src0 − src1`                                  |
 | `0x12` | `muls`    | RRR    | scalar  | `dst = src0 × src1` (low 32 bits)                    |
 | `0x13` | `cmps`    | SS     | scalar  | set `eq`/`lt` from `cmp(src0, src1)`                 |
-| `0x14` | `li`      | RIMM   | scalar  | `dst = sign_extend(imm16)`                           |
+| `0x14` | `li`      | RIMM   | scalar  | `dst = zero_extend(imm16)` (§4.1)                    |
 | `0x15` | `setcfg`  | CFG    | scalar  | `cfg[dst] = zero_extend(imm16)`                      |
 | `0x16` | `loads`   | RS     | scalar  | `dst = scratch[src0]` (int32)                        |
 | `0x17` | `stores`  | SS     | scalar  | `scratch[src0] = src1` (int32)                       |

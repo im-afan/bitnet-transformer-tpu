@@ -325,6 +325,116 @@ def vpu_matmul(c: dict, get_in, get_out) -> list:
     ]
 
 
+def adder_model(c: dict, get_in, get_out) -> list:
+    """The whole `adder_ternary_vanilla` forward pass — examples/adder_model.tpu.
+
+    Written from the *model* (model/transformer.py) rather than from the
+    kernel's instruction order: four layers of ternary projections, ReLU
+    attention with a causal mask, `Wo`, a ReLU feed-forward, both residuals, and
+    an int8 output head. It shares no address arithmetic and no loop structure
+    with the program — only the DRAM layout, which comes from the program's own
+    `.equ` table above.
+
+    Two places where the kernel does something non-obvious and this does the
+    plain thing instead, which is the point of checking:
+
+    * The kernel computes ``A^T`` (swapping vecmatmul's operands) so one `.t`
+      DMA can scatter each head into A's columns. Here it is
+      ``V_h^T @ P_h^T`` written out and transposed back, so a mistake in that
+      trick shows up rather than being mirrored.
+    * The kernel applies the causal mask as ``requant(S8 + mask)`` with a
+      ``{1,0}`` word, relying on ``S8 - 128 <= -1`` to make every masked entry
+      negative before the ReLU. Here that is the same two operations, so the
+      *claim* is tested; ``relu`` is a plain ``clamp(min=0)``.
+
+    Every layer's `X` is checked (the program spills one per layer block), plus
+    the final layer's `V^T` and `A` scratch tensors and the int32 logits.
+    """
+    T, D, D3 = c["T"], c["D"], c["D3"]
+    HEADS, DH, VOCAB, LAYERS = c["HEADS"], c["DH"], c["VOCAB"], c["LAYERS"]
+    WCOL, NRQ = c["WCOL"], 13
+
+    X = i8_tensor(get_in, c["D_XIN"], (T, D))
+    mask = i8_tensor(get_in, c["D_MASK"], (T, T))
+    Wfc = i8_tensor(get_in, c["D_WFC"], (VOCAB, D))
+
+    checks = []
+    V = A = None
+    for L in range(LAYERS):
+        base = c["D_L0"] + L * c["LSTRIDE"]
+        # The fused [Wq|Wk|Wv] block is three [D][D] matrices back to back in
+        # the column axis, so each starts D columns (D*WCOL bytes) further in.
+        wq = ternary_tensor(get_in, base + c["O_WQKV"] + 0 * D * WCOL, D, D, WCOL)
+        wk = ternary_tensor(get_in, base + c["O_WQKV"] + 1 * D * WCOL, D, D, WCOL)
+        wv = ternary_tensor(get_in, base + c["O_WQKV"] + 2 * D * WCOL, D, D, WCOL)
+        wo = ternary_tensor(get_in, base + c["O_WO"], D, D, WCOL)
+        w1 = ternary_tensor(get_in, base + c["O_W1"], D, D, WCOL)
+        w2 = ternary_tensor(get_in, base + c["O_W2"], D, D, WCOL)
+        rq = [requant_params(get_in, base + c["O_RQW"] + 4 * k) for k in range(NRQ)]
+
+        Q = requant8(int_matmul(X, wq), *rq[0])
+        K = requant8(int_matmul(X, wk), *rq[1])
+        V = requant8(int_matmul(X, wv), *rq[2])
+
+        A = torch.zeros((T, D), dtype=torch.int64)
+        for h in range(HEADS):
+            sl = slice(h * DH, (h + 1) * DH)
+            S8 = requant8(int_matmul(Q[:, sl], K[:, sl].t()), *rq[3])
+            S8 = requant8(S8 + mask, *rq[4])            # mask, then narrow+clip
+            P8 = requant8(S8.clamp(min=0), *rq[5])      # ReLU attention
+            AhT = requant8(int_matmul(V[:, sl].t(), P8.t()), *rq[6])
+            A[:, sl] = AhT.t()
+
+        O = requant8(int_matmul(A, wo), *rq[7])
+        X1 = requant8(X + O, *rq[8])                    # attention residual
+        H = requant8(int_matmul(X1, w1), *rq[9])
+        HR = requant8(H.clamp(min=0), *rq[10])
+        F = requant8(int_matmul(HR, w2), *rq[11])
+        X = requant8(X1 + F, *rq[12])                   # feed-forward residual
+
+        checks.append(Check(f"layer {L}: X out          [{T}x{D}] int8",
+                            X, i8_tensor(get_out, base + c["O_XOUT"], (T, D))))
+
+    # The two scratch tensors survive from the last layer only (each is
+    # overwritten in place every iteration), so they pin down the final layer's
+    # attention internals rather than just its output.
+    checks.append(Check(f"final layer: V^T        [{D}x{T}] int8",
+                        V.t(), i8_tensor(get_out, c["D_VT"], (D, T))))
+    checks.append(Check(f"final layer: A          [{T}x{D}] int8",
+                        A, i8_tensor(get_out, c["D_A8"], (T, D))))
+    checks.append(Check(f"logits = X @ fc^T       [{T}x{VOCAB}] int32",
+                        int_matmul(X, Wfc.t()),
+                        i32_tensor(get_out, c["D_LOG"], (T, VOCAB))))
+    return checks
+
+
+def highmem_dma(c: dict, get_in, get_out) -> list:
+    """A copy, a transpose and a round trip, all above 64 KB of DRAM.
+
+    The point is the *addresses*, not the arithmetic: every expected byte sits
+    at ``0x10000`` or beyond, which nothing else in this suite touches. If the
+    scalar unit went back to truncating its DRAM address to 16 bits, or if `li`
+    went back to sign-extending (so the ``0x8000 + 0x8000`` base landed at
+    ``0x70000``), the program would never write these addresses and every check
+    here fails as a missing byte rather than as a wrong value.
+
+    ``hi`` is recomputed the way the program builds it rather than restated as a
+    literal, so the reference and the kernel cannot drift apart.
+    """
+    R, C = c["R"], c["C"]
+    hi = 2 * c["HI_HALF"]                       # what `adds hi, hi, hi` makes
+    src = i8_tensor(get_in, c["SRC"], (R, C))
+
+    return [
+        Check(f"linear spill      -> DRAM {hi + c['LIN_OFF']:#07x}  [{R}x{C}]",
+              src, i8_tensor(get_out, hi + c["LIN_OFF"], (R, C))),
+        Check(f"transposed spill  -> DRAM {hi + c['T_OFF']:#07x}  [{C}x{R}]",
+              src.t(), i8_tensor(get_out, hi + c["T_OFF"], (C, R))),
+        Check(f"fill from high DRAM, back down to {c['BACK']:#06x}  [{R}x{C}]",
+              src, i8_tensor(get_out, c["BACK"], (R, C))),
+    ]
+
+
 def transpose_dma(c: dict, get_in, get_out) -> list:
     """``V^T`` and ``Q^T`` out of a fused QKV block — examples/transpose_dma.tpu.
 
@@ -355,6 +465,8 @@ def transpose_dma(c: dict, get_in, get_out) -> list:
 # renamed or derived program still resolves.
 
 KERNELS = [
+    ("adder_model",  lambda c: "LSTRIDE" in c,  adder_model),
+    ("highmem_dma",  lambda c: "HI_HALF" in c,  highmem_dma),
     ("transpose_dma", lambda c: "VT" in c,       transpose_dma),
     ("relu_layer",   lambda c: "RLU" in c,       relu_layer),
     ("vector_add",   lambda c: "VEC_BYTES" in c, vector_add),
@@ -422,7 +534,7 @@ def print_report(rep: Report, limit: int = 8) -> int:
 def run_in_iss(consts: dict, words: list) -> tuple[dict, dict]:
     """Seed DRAM and run the program in the ISS. Returns (in_img, out_img)."""
     tpu = TPU(rows=gv.ROWS, cols=gv.COLS, addr_w=gv.ADDR_W,
-              m0_w=gv.M0_W, n_w=gv.N_W)
+              mem_addr_w=gv.MEM_ADDR_W, m0_w=gv.M0_W, n_w=gv.N_W)
     in_img, _ref, _dims = gv.build_image(tpu, consts)
     tpu.run(words)
     return in_img, {a: tpu.dram[a] for a in sorted(tpu.dram_written)}

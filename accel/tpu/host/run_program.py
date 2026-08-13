@@ -145,7 +145,8 @@ class Plan:
 def build_plan(path: str) -> Plan:
     """Assemble the program and run it in the ISS to get the golden images."""
     words, consts = gv.assemble_program(path)
-    tpu = TPU(rows=gv.ROWS, cols=gv.COLS, addr_w=gv.ADDR_W, m0_w=gv.M0_W, n_w=gv.N_W)
+    tpu = TPU(rows=gv.ROWS, cols=gv.COLS, addr_w=gv.ADDR_W,
+              mem_addr_w=gv.MEM_ADDR_W, m0_w=gv.M0_W, n_w=gv.N_W)
 
     in_img, ref, dims = gv.build_image(tpu, consts)
     shape = (f"[{dims['M']}x{dims['K']}] @ [{dims['K']}x{dims['N']}]"

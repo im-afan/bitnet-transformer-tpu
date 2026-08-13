@@ -51,6 +51,9 @@
 `ifndef SPAD_IN_FILE
   `define SPAD_IN_FILE "vectors/tpu_spad_in.hex"
 `endif
+`ifndef WATCHDOG_NS
+  `define WATCHDOG_NS 2000000
+`endif
 `ifndef SPAD_EXP_FILE
   `define SPAD_EXP_FILE "vectors/tpu_spad_exp.hex"
 `endif
@@ -82,7 +85,11 @@ module tpu_top_tb;
     localparam int MEM_ADDR_W = 19;    // external SRAM byte address (DUT default)
     localparam int MEM_DATA_W = 8;     // external SRAM data width (bits)
 
-    localparam int DEPTH     = (1 << ADDR_W);      // scratchpad size in bytes
+    // in_bytes/exp_bytes are **DRAM** byte maps (the TB seeds and checks DRAM
+    // through the backdoor), so this spans MEM_ADDR_W. It was ADDR_W, which
+    // silently discarded any expectation above 64 KB — see the same note in
+    // tpu_top_uart_tb.sv.
+    localparam int DEPTH     = (1 << MEM_ADDR_W);  // DRAM span scanned for tensors
     localparam int IMEM_DEP  = (1 << IMEM_AW);     // instruction memory depth
 
     // -------------------------------------------------------------------------
@@ -154,14 +161,21 @@ module tpu_top_tb;
     // DRAM preload/readback via backdoor poke/peek of the SRAM chip model.
     // Zero-time: preload runs before host_run (no DMA writer is active) and
     // readback runs after HALT (memory is stable). Byte k of a word lives at
-    // addr+k; tensor addresses (< 2^ADDR_W) index directly into the wider DRAM.
+    // addr+k.
+    //
+    // These are MEM_ADDR_W wide, not ADDR_W. They used to be ADDR_W on the
+    // assumption that "tensor addresses (< 2^ADDR_W) index directly into the
+    // wider DRAM" — true only while the scalar unit could not name DRAM above
+    // 64 KB. Once it could, a 16-bit backdoor silently poked every high input
+    // byte to `addr & 0xFFFF` and read every high expectation from the wrong
+    // place, which reads back as x rather than as a wrong value.
     // -------------------------------------------------------------------------
-    task automatic dram_wr_byte(input logic [ADDR_W-1:0] addr, input logic [7:0] d);
+    task automatic dram_wr_byte(input logic [MEM_ADDR_W-1:0] addr, input logic [7:0] d);
         sram_mem[addr] = d;
     endtask
 
     // Read a 32-bit window starting at addr (byte k at addr+k).
-    task automatic dram_rd(input logic [ADDR_W-1:0] addr, output logic [31:0] d);
+    task automatic dram_rd(input logic [MEM_ADDR_W-1:0] addr, output logic [31:0] d);
         for (int k = 0; k < 4; k++)
             d[k*8 +: 8] = sram_mem[MEM_ADDR_W'(addr + k)];
     endtask
@@ -216,7 +230,7 @@ module tpu_top_tb;
         cnt = 0;
         for (a = 0; a < DEPTH; a++)
             if (defined8(in_bytes[a])) begin
-                dram_wr_byte(a[ADDR_W-1:0], in_bytes[a]);
+                dram_wr_byte(a[MEM_ADDR_W-1:0], in_bytes[a]);
                 cnt++;
             end
         $display("loaded %0d DRAM input bytes from %s", cnt, `SPAD_IN_FILE);
@@ -232,7 +246,7 @@ module tpu_top_tb;
             // Only read BRAM when this word carries an expected output byte.
             if (defined8(exp_bytes[wa])  || defined8(exp_bytes[wa+1]) ||
                 defined8(exp_bytes[wa+2])|| defined8(exp_bytes[wa+3])) begin
-                dram_rd(wa[ADDR_W-1:0], rd);
+                dram_rd(wa[MEM_ADDR_W-1:0], rd);
                 for (lane = 0; lane < 4; lane++) begin
                     eb = exp_bytes[wa+lane];
                     if (defined8(eb)) begin
@@ -284,17 +298,28 @@ module tpu_top_tb;
         $finish;
     end
 
-    // Watchdog.
+    // Watchdog. Overridable because run length is a property of the *program*,
+    // not of this testbench: relu_layer halts in microseconds, but a whole
+    // transformer is ~190 KB of byte-serial DMA at ~14 clocks/byte, i.e. tens of
+    // milliseconds. Default unchanged, so every existing invocation is
+    // unaffected.
+    //   iverilog ... -DWATCHDOG_NS=200000000
     initial begin
-        #2000000;
-        $display("TPU_TOP: TIMEOUT — program did not halt");
+        #(`WATCHDOG_NS);
+        $display("TPU_TOP: TIMEOUT — program did not halt after %0d ns",
+                 `WATCHDOG_NS);
         $fatal(1);
     end
 
-    // Waveform dump.
+    // Waveform dump. Also guardable: at this timescale a full-model run dumps
+    // every net of the whole core for tens of milliseconds, which is hundreds of
+    // megabytes of VCD that nobody reads. `-DNO_VCD` skips it.
+    //   iverilog ... -DNO_VCD
+`ifndef NO_VCD
     initial begin
         $dumpfile("tpu_top_tb.vcd");
         $dumpvars(0, tpu_top_tb);
     end
+`endif
 
 endmodule

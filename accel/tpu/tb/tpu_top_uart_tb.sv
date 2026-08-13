@@ -95,7 +95,12 @@ module tpu_top_uart_tb;
     localparam int MEM_DATA_W = 8;
 
     localparam int CPB       = 16;             // UART clocks-per-bit (fast, for sim)
-    localparam int DEPTH     = (1 << ADDR_W);  // address span we scan for tensors
+    // The vector images are **DRAM** byte maps, so this spans MEM_ADDR_W, not
+    // ADDR_W. Sizing it off the scratchpad width silently dropped every
+    // expectation above 64 KB: $readmemh reported "address out of range" and
+    // then the run-scanner found nothing there, so a program writing high DRAM
+    // was scored as passing without a single byte of it being checked.
+    localparam int DEPTH     = (1 << MEM_ADDR_W);  // DRAM span scanned for tensors
     localparam int IMEM_DEP  = (1 << IMEM_AW);
 
     localparam [7:0] WCMD = 8'h57, RCMD = 8'h52, ICMD = 8'h49, GCMD = 8'h47,

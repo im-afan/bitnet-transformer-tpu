@@ -31,6 +31,12 @@ constants (:func:`program_kind`, dispatched by :func:`build_image`):
     is checked against an independent Python reference matmul.
   * transpose_dma (defines ``VT``): a fused [T][3D] QKV block, checked against
     the transpose permutation written out directly.
+  * highmem_dma (defines ``HI_HALF``): one int8 block in low DRAM; every output
+    lands above 64 KB, which nothing else here touches.
+  * adder_model (defines ``LSTRIDE``): the whole 4-layer transformer — X, the
+    causal mask, ``fc``, and every layer's ternary weights and requant words.
+    Operands go through :func:`_mix` rather than an index formula; see its
+    docstring for why that matters at this scale.
 
 A program that produces no reference result here can still be checked against
 PyTorch — see ``torch_ref.py``, which decodes these same images into tensors.
@@ -51,7 +57,8 @@ from iss import TPU, CFG_TLEN, CFG_VLEN, CFG_SCALAR, s8
 ROWS = 8          # MXU contraction dim d (activation vector length)
 COLS = 8          # MXU output features
 T = 4             # token rows
-ADDR_W = 16
+ADDR_W = 16       # scratchpad byte address
+MEM_ADDR_W = 19   # external SRAM (DRAM) byte address — a *wider* space
 M0_W, N_W = 12, 4
 
 # --- scratchpad address map (matches relu_layer.tpu / tpu_top_tb.sv) ----------
@@ -118,7 +125,7 @@ def build_default_image(tpu: TPU) -> dict:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     # Activations: A[t][i] int8, row-major.
@@ -163,7 +170,7 @@ def build_vector_add_image(tpu: TPU, c: dict) -> dict:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     for k in range(c["VEC_BYTES"]):
@@ -196,7 +203,7 @@ def build_vpu_matmul_image(tpu: TPU, c: dict) -> dict:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     for t in range(T):
@@ -235,7 +242,7 @@ def build_matmul_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     # A tiles [mt][kt], each T x ROWS int8 row-major, tiles back to back.
@@ -303,7 +310,7 @@ def build_strided_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     for m in range(M):                      # A: M x K int8, row-major
@@ -367,7 +374,7 @@ def build_tiled_hw_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     for m in range(M):                      # A: M x K int8, row-major
@@ -411,7 +418,7 @@ def build_vecmatmul_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     for t in range(TQ):
@@ -444,7 +451,7 @@ def build_softmax_rows_image(tpu: TPU, c: dict) -> dict:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     ROWS_, N = c["ROWS"], c["N"]
@@ -482,7 +489,7 @@ def build_transpose_image(tpu: TPU, c: dict) -> tuple[dict, dict, None]:
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
-        tpu.dram[tpu._a(addr)] = byte & 0xFF
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
     # The whole row is seeded, including the K columns nothing should read.
@@ -500,6 +507,144 @@ def build_transpose_image(tpu: TPU, c: dict) -> tuple[dict, dict, None]:
 
 
 # =============================================================================
+# highmem_dma (examples/highmem_dma.tpu): DMA above the low 64 KB of DRAM.
+# =============================================================================
+def build_highmem_image(tpu: TPU, c: dict) -> dict:
+    """Seed one [R][C] int8 block in *low* DRAM; every output lands high.
+
+    No independent reference here — the program's outputs are a copy, a
+    transpose and a round trip, which torch_ref.py checks against what those
+    operations mean rather than against a second address calculation.
+
+    Values depend on both indices and span most of int8, so a transfer that
+    dropped the row stride, transposed the wrong way, or aliased a high address
+    down into this seeded low block cannot accidentally agree.
+    """
+    R, C = c["R"], c["C"]
+    img: dict[int, int] = {}
+
+    def put(addr: int, byte: int):
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
+        img[addr] = byte & 0xFF
+
+    for r in range(R):
+        for k in range(C):
+            put(c["SRC"] + r * C + k, ((r * 7 + k * 3) % 251) - 125)
+    return img
+
+
+# =============================================================================
+# adder_model (examples/adder_model.tpu): the whole transformer, 4 layers + head.
+# =============================================================================
+# Requant {m0, n} per layer, in the program's slot order (adder_kernel.md §4).
+# A real checkpoint derives these from calibrated scales; here they are chosen
+# only so no stage is degenerate — the ISS and the reference apply whatever
+# words are in DRAM, so equality does not depend on the values, but a set that
+# saturated everything to +-127 would make the comparison vacuous. The shifts
+# below track the accumulator growth at each stage: ternary matmuls over K=128
+# land around +-1e3, the two attention matmuls over 32 terms around +-5e4.
+ADDER_RQ = [
+    (1, 1),   # 0  RQ_Q    X @ Wq      128 terms, sd ~43
+    (1, 1),   # 1  RQ_K    X @ Wk
+    (1, 1),   # 2  RQ_V    X @ Wv
+    (1, 6),   # 3  RQ_S    Q @ K^T     32 terms of ~21*21, sd ~2.5k
+    (1, 0),   # 4  RQ_ID   mask clamp — must be identity
+    (1, 0),   # 5  RQ_P    relu(S8), already in [0,127]
+    (1, 7),   # 6  RQ_A    P @ V       32 terms; P is unsigned, so this one
+              #                        carries a mean as well as a spread
+    (1, 4),   # 7  RQ_O    A @ Wo      128 terms, sd ~530
+    (1, 1),   # 8  RQ_X1   X + O
+    (1, 3),   # 9  RQ_H    X1 @ W1     128 terms, sd ~250
+    (1, 0),   # 10 RQ_HR   relu(H)
+    (1, 3),   # 11 RQ_F    HR @ W2
+    (1, 1),   # 12 RQ_X2   X1 + F
+]
+
+
+def _mix(x: int) -> int:
+    """A cheap avalanche hash, for deterministic well-mixed test operands.
+
+    The other builders use index formulas like ``(i*3 + j) % 9 - 4``, which are
+    fine for an 8x8 tile but degenerate at model scale: a ternary weight of
+    ``(k*31 + n*17) % 3`` is a period-3 lattice in both indices, and contracting
+    it over K=128 against an equally regular activation makes ~97% of the
+    products cancel. Mixing first keeps the operands deterministic without that
+    structure, so the accumulators behave like the real thing.
+    """
+    x &= 0xFFFFFFFF
+    x = (x * 0x9E3779B1) & 0xFFFFFFFF
+    x ^= x >> 15
+    x = (x * 0x85EBCA6B) & 0xFFFFFFFF
+    x ^= x >> 13
+    return x
+
+
+def build_adder_model_image(tpu: TPU, c: dict) -> dict:
+    """Seed X, the causal mask, `fc`, and all four layers' weights + requant words.
+
+    No independent reference here: the pipeline is 4 layers of matmul/requant/
+    LUT-free integer stages whose *definition* is the program, so restating it
+    in this file would only duplicate iss.py. torch_ref.py checks it against a
+    from-scratch PyTorch implementation instead, which is the comparison that
+    means something.
+
+    Weight trits mix all three indices so no two columns (or layers) are alike;
+    a kernel that read the wrong layer block, the wrong projection out of the
+    fused block, or the wrong column stride cannot accidentally agree.
+    """
+    T, D, D3 = c["T"], c["D"], c["D3"]
+    VOCAB, LAYERS, WCOL = c["VOCAB"], c["LAYERS"], c["WCOL"]
+    img: dict[int, int] = {}
+
+    def put(addr: int, byte: int):
+        tpu.dram[tpu._d(addr)] = byte & 0xFF
+        img[addr] = byte & 0xFF
+
+    # X[t][d] int8 in [-8, 8], the embedded + positionally-encoded input.
+    for t in range(T):
+        for d in range(D):
+            put(c["D_XIN"] + t * D + d, _mix(t * 4099 + d * 13 + 1) % 17 - 8)
+
+    # Causal mask: 0 where key <= query, -128 above the diagonal.
+    for t in range(T):
+        for s in range(T):
+            put(c["D_MASK"] + t * T + s, 0 if s <= t else -128)
+
+    # fc.weight [VOCAB][D] int8 — nn.Linear stores [out, in] already.
+    for v in range(VOCAB):
+        for d in range(D):
+            put(c["D_WFC"] + v * D + d, _mix(v * 65537 + d * 29 + 2) % 31 - 15)
+
+    for L in range(LAYERS):
+        base = c["D_L0"] + L * c["LSTRIDE"]
+
+        # Fused [Wq|Wk|Wv]: [D][3D] trits, column-major, 2-bit packed. The salt
+        # carries the layer and the block, so no two layers and no two of the
+        # three projections share a weight — a kernel that read the wrong layer
+        # block or the wrong third of the fused block cannot agree by accident.
+        for n in range(D3):
+            col = [_mix(L * 1000003 + n * 1021 + k + 3) % 3 - 1 for k in range(D)]
+            for b, byte in enumerate(pack_wcol(col, WCOL)):
+                put(base + c["O_WQKV"] + n * WCOL + b, byte)
+
+        # Wo, W1, W2: [D][D] trits each, distinct salts.
+        for off, salt in ((c["O_WO"], 11), (c["O_W1"], 22), (c["O_W2"], 33)):
+            for n in range(D):
+                col = [_mix(L * 1000003 + n * 1021 + k + salt * 7919)
+                       % 3 - 1 for k in range(D)]
+                for b, byte in enumerate(pack_wcol(col, WCOL)):
+                    put(base + off + n * WCOL + b, byte)
+
+        # This layer's 13 requant {m0,n} words.
+        for k, (m0, nsh) in enumerate(ADDER_RQ):
+            word = requant_word(m0, nsh)
+            for b in range(4):
+                put(base + c["O_RQW"] + 4 * k + b, (word >> (8 * b)) & 0xFF)
+
+    return img
+
+
+# =============================================================================
 # Dispatch: pick the input image from the program's own constants.
 # =============================================================================
 def program_kind(consts: dict) -> str:
@@ -508,6 +653,10 @@ def program_kind(consts: dict) -> str:
     Keyed on constants rather than filename so a renamed or derived program
     still resolves. ``torch_ref.KERNELS`` identifies programs the same way.
     """
+    if "LSTRIDE" in consts:         # adder_model: the whole transformer
+        return "adder_model"
+    if "HI_HALF" in consts:         # highmem_dma: DRAM above the low 64 KB
+        return "highmem_dma"
     if "VT" in consts:              # transpose_dma: the DMA's `.t` mode
         return "transpose_dma"
     if "MTILES" in consts:
@@ -535,6 +684,10 @@ def build_image(tpu: TPU, consts: dict) -> tuple[dict, dict | None, dict | None]
     computes them (tiled matmul only; ``None`` otherwise).
     """
     kind = program_kind(consts)
+    if kind == "adder_model":
+        return build_adder_model_image(tpu, consts), None, None
+    if kind == "highmem_dma":
+        return build_highmem_image(tpu, consts), None, None
     if kind == "transpose_dma":
         return build_transpose_image(tpu, consts)
     if kind == "tiled_matmul":
@@ -558,7 +711,7 @@ def check_reference(tpu: TPU, ref: dict) -> int:
     """Compare the ISS DRAM result against the reference; return #mismatches."""
     bad = 0
     for addr in sorted(ref):
-        got = s8(tpu.dram[tpu._a(addr)])
+        got = s8(tpu.dram[tpu._d(addr)])
         if got != ref[addr]:
             bad += 1
             if bad <= 8:
@@ -598,7 +751,8 @@ def main(argv=None) -> int:
     os.makedirs(args.out_dir, exist_ok=True)
 
     words, consts = assemble_program(args.program)
-    tpu = TPU(rows=ROWS, cols=COLS, addr_w=ADDR_W, m0_w=M0_W, n_w=N_W)
+    tpu = TPU(rows=ROWS, cols=COLS, addr_w=ADDR_W, mem_addr_w=MEM_ADDR_W,
+              m0_w=M0_W, n_w=N_W)
 
     in_img, ref, dims = build_image(tpu, consts)
     shape = (f"[{dims['M']}x{dims['K']}] @ [{dims['K']}x{dims['N']}]"

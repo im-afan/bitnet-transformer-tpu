@@ -1,5 +1,26 @@
 # tpunn — running `model/transformer.py` on the TPU
 
+> **Superseded — kept for the reasoning, not the design.** This plan was written
+> against a model with LayerNorm, GELU, softmax, biases and `f=512`, and against
+> an ISA with no `matmul_t`, no `vecmatmul` and no transposing DMA. Both have
+> changed: the model is now bias-free, norm-free and uses ReLU attention, and
+> the macro-ops run the tile loops in hardware. The result is that IMEM stopped
+> being the binding constraint, so the ~82 per-op programs below collapse to
+> **one**.
+>
+> §2's claim that "the hardware DMA only emits a 16-bit DRAM address" was also
+> wrong, and load-bearing: the SRAM is 512 KB, the DMA and the UART host both
+> address all 19 bits, and it was `scalar_unit.sv` that truncated a *program's*
+> DRAM address to 16 bits. §3's wording ("DRAM *visible to a program*") is the
+> accurate one. That truncation has since been removed, so the 64 KB budget
+> this whole document is built around no longer exists.
+>
+> See [`adder_kernel.md`](adder_kernel.md) and
+> [`examples/adder_model.tpu`](examples/adder_model.tpu) for what was actually
+> built; §2 there compares the two directly. The parts of this document that
+> still hold are the constraint table (§3, minus the DRAM row), the numerics
+> discussion (§5) and the verification structure (§9).
+
 **Status: plan, for review.** Nothing below is built yet. Read [`pytpu.md`](pytpu.md) (the
 emitter), [`README.md`](README.md) (the language) and
 [`../tpu/docs/isa.md`](../tpu/docs/isa.md) (the target) first; this document is only the
