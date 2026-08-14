@@ -120,6 +120,7 @@ def make_linear(in_dim, out_dim, use_ternary=False, bias=True):
 # try using no gamma & beta at first
 class DyT(nn.Module):
     def __init__(self, C, init_a=0.5):
+        super().__init__()
         self.alpha = nn.Parameter(torch.ones(1) * init_a)
 
     def forward(self, x):
