@@ -116,6 +116,16 @@ def make_linear(in_dim, out_dim, use_ternary=False, bias=True):
     return nn.Linear(in_dim, out_dim, bias=bias)
 
 
+# https://arxiv.org/pdf/2503.10622
+# try using no gamma & beta at first
+class DyT(nn.Module):
+    def __init__(self, C, init_a=0.5):
+        self.alpha = nn.Parameter(torch.ones(1) * init_a)
+
+    def forward(self, x):
+        return F.hardtanh(x * self.alpha, min_val=-1, max_val=1)
+
+
 @torch.no_grad()
 def calibrate_activations(model, run_forward):
     """Calibrate per-tensor symmetric int8 activation scales for a ternary model.
@@ -191,7 +201,6 @@ class MultiHeadAttention(nn.Module):
         K = torch.reshape(K, [batch_size, n_tokens, self.kv_heads, self.head_dim])
         V = torch.reshape(V, [batch_size, n_tokens, self.kv_heads, self.head_dim])
 
-        A = None
         A = mha_torch(Q, K, V)
 
         O = self.Wo(A)
@@ -215,7 +224,7 @@ class Transformer(nn.Module):
         self.attention = MultiHeadAttention(
             d, q_heads, kv_heads, head_dim, use_ternary=use_ternary, use_bias=use_bias
         )
-        # self.norm1 = nn.LayerNorm(d)
+        self.norm1 = DyT(d)
 
 
         self.ff = nn.Sequential(
@@ -224,15 +233,15 @@ class Transformer(nn.Module):
             make_linear(f, d, use_ternary, bias=use_bias),
         )
 
-        # self.norm2 = nn.LayerNorm(d)
+        self.norm2 = DyT(d)
         self.dropout = nn.Dropout(p=0.1)
 
     def forward(self, X, attn_mask, use_custom_attention=False):
-        # X = self.norm1(
-            # X + self.dropout(self.attention(X, attn_mask, use_custom_attention))
-        # )
-        X = self.dropout(self.attention(X, attn_mask, use_custom_attention))
-        return X + self.dropout(self.ff(X))
+        X = self.norm1(
+            X + self.dropout(self.attention(X, attn_mask, use_custom_attention))
+        )
+        # X = self.dropout(self.attention(X, attn_mask, use_custom_attention))
+        return self.norm2(X + self.dropout(self.ff(X)))
 
 
 class Model(nn.Module):
@@ -277,7 +286,7 @@ class Model(nn.Module):
                 for i in range(layers)
             ]
         )
-        self.fc = nn.Linear(self.d, self.vocab_size, bias=use_bias)
+        self.fc = make_linear(self.d, self.vocab_size, bias=use_bias)
         self.dropout = nn.Dropout(p=0.1)
 
     def positional_encoding(self, n_tokens):
