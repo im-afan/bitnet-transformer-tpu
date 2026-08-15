@@ -553,11 +553,13 @@ ADDER_RQ = [
     (1, 7),   # 6  RQ_A    P @ V       32 terms; P is unsigned, so this one
               #                        carries a mean as well as a spread
     (1, 4),   # 7  RQ_O    A @ Wo      128 terms, sd ~530
-    (1, 1),   # 8  RQ_X1   X + O
-    (1, 3),   # 9  RQ_H    X1 @ W1     128 terms, sd ~250
-    (1, 0),   # 10 RQ_HR   relu(H)
-    (1, 3),   # 11 RQ_F    HR @ W2
-    (1, 1),   # 12 RQ_X2   X1 + F
+    (1, 0),   # 8  RQ_XO   X + O       must be identity: the second add needs
+              #                        both operands back on X's scale
+    (1, 1),   # 9  RQ_X1   dyt(XO + X) — norm1; carries alpha, clips at +-127
+    (1, 3),   # 10 RQ_H    X1 @ W1     128 terms, sd ~250
+    (1, 0),   # 11 RQ_HR   relu(H)
+    (1, 3),   # 12 RQ_F    HR @ W2
+    (1, 1),   # 13 RQ_X2   dyt(X1 + F) — norm2
 ]
 
 
@@ -635,7 +637,7 @@ def build_adder_model_image(tpu: TPU, c: dict) -> dict:
                 for b, byte in enumerate(pack_wcol(col, WCOL)):
                     put(base + off + n * WCOL + b, byte)
 
-        # This layer's 13 requant {m0,n} words.
+        # This layer's 14 requant {m0,n} words.
         for k, (m0, nsh) in enumerate(ADDER_RQ):
             word = requant_word(m0, nsh)
             for b in range(4):

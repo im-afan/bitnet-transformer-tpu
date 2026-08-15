@@ -5,14 +5,17 @@ ternary adder model — four transformer layers and the output head — as **one
 program, one run**. This document is the byte-level contract the host has to
 satisfy to drive it.
 
-> **Status: built and verified; the kernel is correct and the checkpoint is not
-> int8-quantizable.** The program assembles to 196 words and runs to completion
-> in both the ISS and the RTL. It matches an independent PyTorch implementation
-> byte-for-byte (24 992 elements), the RTL matches the ISS on all 26 240 output
-> bytes, and on the *real* checkpoint the ISS matches the reference logits
-> exactly. But the shipped model scores **96.09% exact-sequence in float and
-> 0.00% with int8 activations** — a property of the model (no LayerNorm), not of
-> this kernel, established four ways in §7.6. Not yet run on the board.
+> **Status: built and verified; the kernel is correct and neither checkpoint is
+> int8-quantizable.** The program assembles to 208 words and runs to completion
+> in the ISS. It matches an independent PyTorch implementation byte-for-byte
+> (24 992 elements), and on both *real* checkpoints the ISS matches the
+> reference logits exactly. But the norm-free model scores **96.09%
+> exact-sequence in float and 0.00% with int8 activations** (§7.6), and the DyT
+> retrain — with `dyt` wired into the kernel — scores **93.36% / 0.00%** (§7.6b).
+> DyT does fix the mechanism §7.6 identified; what it exposes is the *residual
+> addend*, which is a training property and not a kernel one. The RTL matched
+> the ISS on all 26 240 bytes of the 196-word version; that run has not been
+> repeated since the `dyt` op landed. Not yet run on the board.
 
 Read [`README.md`](README.md) (the language), [`../tpu/docs/isa.md`](../tpu/docs/isa.md)
 (the target) and [`../tpu/docs/macro_ops.md`](../tpu/docs/macro_ops.md) (the
@@ -37,14 +40,22 @@ for L in 0..3:
     S       = Q @ K^T / sqrt(head_dim)       # per head
     P       = relu(S + causal_mask)          # ReLU attention, NOT softmax
     A       = P @ V                          # [T, 4*32] -> [T, 128]
-    X       = X + Wo(A)                      # attention residual
-    X       = X + W2(relu(W1(X)))            # feed-forward residual
+    X       = norm1(X + (Wo(A) + X))         # DOUBLE residual, then DyT
+    X       = norm2(X + W2(relu(W1(X))))     # feed-forward residual, then DyT
 logits = X @ fc.weight^T                     # fc is int8, not ternary
 ```
 
-There is **no LayerNorm** — `norm1`/`norm2` are commented out — and **no bias**
-anywhere. `mha_torch` ignores the padding mask it is handed, so the only mask
-is the causal one.
+There is **no LayerNorm** and **no bias** anywhere. `norm1`/`norm2` are `DyT` —
+`hardtanh(α·x, -1, 1)` with one learned scalar and no gamma/beta
+([arxiv 2503.10622](https://arxiv.org/abs/2503.10622)) — which the device runs
+as the `dyt` instruction, i.e. as the clip of the narrow the residual add needed
+anyway (§4). `MultiHeadAttention.forward` ignores the padding mask it is handed,
+so the only mask is the causal one.
+
+**The attention residual is `2X + O`**, not `X + O`:
+`MultiHeadAttention.forward` ends in `return O + X` and `Transformer.forward`
+adds `X` again. Whether or not that was intended, the checkpoints were fitted to
+it, so it is part of the contract.
 
 Two things stay on the host, structurally rather than by convenience:
 
@@ -188,7 +199,7 @@ Inside layer `L`'s block:
 | `+0x3000` | 4096 | `Wo` `[128][128]` trits |
 | `+0x4000` | 4096 | `W1` `[128][128]` trits |
 | `+0x5000` | 4096 | `W2` `[128][128]` trits |
-| `+0x6000` | 52 | this layer's 13 requant `{m0,n}` words |
+| `+0x6000` | 56 | this layer's 14 requant `{m0,n}` words |
 | `+0x6400` | 4096 | `X` after this layer — a **checkpoint**, device-written |
 
 The requant words live inside the layer block so the program can reload them
@@ -197,7 +208,7 @@ into one fixed scratchpad slot each iteration, which keeps every
 per-layer `X` spill is for verification (§7), not a data path — `X` itself
 stays in the scratchpad the whole run.
 
-### Scratchpad (64 KB; top byte `0xC833`)
+### Scratchpad (64 KB; top byte `0xC837`)
 
 A 12 KB weight window (refilled four times per layer), the 12 KB fused QKV
 block, and small fixed buffers — 51 KB of 64, laid out in the program's `.equ`
@@ -220,9 +231,10 @@ Ternary weights are already `trit · absmean` in the checkpoint
 (`TernaryLinear.forward`: `RoundClip(w/scale) * w.abs().mean()`), so `absmean`
 is never a tensor — it is just a factor in the following requant's `m`.
 
-### The 13 words, per layer, in block order
+### The 14 words, per layer, in block order
 
-`a_M` is matrix `M`'s `absmean`; `s_T` is tensor `T`'s scale.
+`a_M` is matrix `M`'s `absmean`; `s_T` is tensor `T`'s scale. `α1`/`α2` are the
+two `DyT` layers' learned scalars.
 
 | # | Slot | Op | `m = m0/2^n` |
 | --- | --- | --- | --- |
@@ -234,19 +246,34 @@ is never a tensor — it is just a factor in the following requant's `m`.
 | 5 | `RQ_P` | `relu(S8) → P8` | `s_s / s_p` — **`{1,0}`** is natural |
 | 6 | `RQ_A` | `P@V int32 → A8` | `s_p · s_v / s_a` |
 | 7 | `RQ_O` | `A8 @ Wo → O` | `s_a · a_o / s_x` ← **must land on `s_x`** |
-| 8 | `RQ_X1` | `X + O → X1` | `s_x / s_x1` |
-| 9 | `RQ_H` | `X1 @ W1 → H` | `s_x1 · a_1 / s_h` |
-| 10 | `RQ_HR` | `relu(H) → HR` | `s_h / s_hr` — **`{1,0}`** is natural |
-| 11 | `RQ_F` | `HR @ W2 → F` | `s_hr · a_2 / s_x1` ← **must land on `s_x1`** |
-| 12 | `RQ_X2` | `X1 + F → X2` | `s_x1 / s_x2` |
+| 8 | `RQ_XO` | `X + O → XO` | **`{1,0}`** ← stays on `s_x` for the second add |
+| 9 | `RQ_X1` | `dyt(XO + X) → X1` | `s_x · α1 / s_x1` |
+| 10 | `RQ_H` | `X1 @ W1 → H` | `s_x1 · a_1 / s_h` |
+| 11 | `RQ_HR` | `relu(H) → HR` | `s_h / s_hr` — **`{1,0}`** is natural |
+| 12 | `RQ_F` | `HR @ W2 → F` | `s_hr · a_2 / s_x1` ← **must land on `s_x1`** |
+| 13 | `RQ_X2` | `dyt(X1 + F) → X2` | `s_x1 · α2 / s_x2` |
 
-Four constraints, stated flat because they are where a plausible host will get
+Six constraints, stated flat because they are where a plausible host will get
 it wrong:
 
 - **`vecadd` adds int8 operands, so a residual add is only meaningful if both
-  sides share a scale.** That pins `RQ_O` to `s_x` and `RQ_F` to `s_x1`. Those
-  two matmul outputs do not get to choose their own scale, so they are the two
-  most likely places to clip. Measure them.
+  sides share a scale.** That pins `RQ_O` and `RQ_XO` to `s_x` and `RQ_F` to
+  `s_x1`. Those outputs do not get to choose their own scale, so they are the
+  most likely places to clip. Measure them — on the DyT checkpoint they are
+  where the accuracy goes (§8.1).
+- **The attention residual is `2X + O`, not `X + O`.**
+  `MultiHeadAttention.forward` ends in `return O + X` and `Transformer.forward`
+  adds `X` again. `vecadd` takes two operands, so this is two adds with a narrow
+  between them, and that narrow (`RQ_XO`) has to be the `{1,0}` identity because
+  the second add needs both sides still on `s_x`.
+- **DyT is a `dyt` instruction, not an extra pass.** `norm1`/`norm2` are
+  `hardtanh(α·x, -1, 1)`. Pin the output scale to `1/127` and the saturating
+  narrow the residual add already needed *is* the hardtanh, with `α` folded into
+  its multiplier. `dyt` differs from `requant` only in clipping at `-127`
+  instead of `-128`, because hardtanh is odd (vpu.sv `dyt8`). The corollary is
+  that `s_x1` and `s_x2` are **analytic, not calibrated**: DyT's range is `[-1,
+  1]` by construction, so every layer after the first enters at `1/127` with no
+  calibration set involved.
 - **`1/sqrt(head_dim)` is not an op.** It folds into `RQ_S`.
 - **Q, K and V get separate requant words** even though they come from one
   weight block, because each has its own `absmean`. Fusing them into a single
@@ -259,15 +286,24 @@ it wrong:
 
 ### Where the scales come from
 
-**All of them are calibrated; the checkpoint supplies none.** `TernaryLinear`
-carries an `act_scale` buffer that would give four of them per layer, but in
-`colab_ternary_mha_small_nobias.pt` all 24 are `NaN` — the model was never run
-through `calibrate_activations`. [`adder_export.py`](adder_export.py) therefore
-derives every scale itself, from one instrumented float forward over a
-calibration set disjoint from the evaluation set (`absmax / 127`, the same
-symmetric-int8 convention).
+**Almost all of them are calibrated; the checkpoint supplies none directly.**
+`TernaryLinear` carries an `act_scale` buffer that would give four of them per
+layer, but every one is `NaN` in the shipped checkpoints — the model was never
+run through `calibrate_activations`. The exceptions are `s_x1` and `s_x2`, which
+DyT makes analytic (`1/127`, see above), and therefore also `s_x` for every
+layer but the first.
 
-Two of the thirteen are not the obvious thing, and both were found by measuring
+The derivation lives in [`model/quant.py`](../../model/quant.py), not here:
+`calibrate` runs one instrumented float forward over a set disjoint from the
+evaluation set (`absmax / 127`, the symmetric-int8 convention),
+`derive_layer` turns that into the 14 words, and `int_forward` is the integer
+pipeline. [`adder_export.py`](adder_export.py) only *stages* the result into the
+DRAM map above and runs the kernel. That split matters: the pipeline has to
+track the model as it changes, and the two copies that existed before this
+(one here, one next to the model) had already drifted apart on the double
+residual.
+
+Two of the fourteen are not the obvious thing, and both were found by measuring
 rather than by deriving:
 
 - **`s_s` is calibrated on the scores that survive, not on the widest score.**
@@ -488,13 +524,78 @@ this *checkpoint* cannot be served in int8 activations by this hardware. The
 clip rates §8.3 asked for, for completeness: `RQ_O` 8.24% mean (L0 14.63%,
 L2 17.68%), `RQ_F` 0.00%.
 
+### §7.6b — DyT: the diagnosed cause is fixed, and it is still 0.00%
+
+`python accel/tpulang/adder_export.py -n 256 -c 128 --iss-check`, on
+`colab_ternary_mha_small_dyt.pt` (the `no-layernorm` branch's DyT retrain), with
+the `dyt` op wired into the kernel:
+
+| | exact-sequence | token |
+| --- | --- | --- |
+| float model | **93.36%** | 99.59% |
+| int8 activations, this kernel | **0.00%** | 51.56% |
+
+**The ISS cross-check passed again: 0 of 416 logits differ.** 208 instruction
+words, up from 196 — the extra twelve are the second residual add the `2X + O`
+form needs. So this is again a measurement of the kernel.
+
+**DyT fixed exactly the thing §7.6 blamed, and it was not enough.** The
+`median/max` statistic that collapsed with depth is now *perfect* at every
+residual site, because `hardtanh` bounds the tensor analytically and the pinned
+`1/127` output scale spends the whole int8 range on `[-1, 1]`:
+
+| site | median/max | fraction → exactly 0 |
+| --- | --- | --- |
+| L0 `X1`, `X2` | 1.000 | 0.0% |
+| L3 `X`, `X1`, `X2` | 1.000 | 0.4% |
+
+Compare 91.6% for L3's `A` before. The residual stream is no longer the problem.
+
+**What replaced it is the residual *addend*.** DyT bounds `X` to `[-1, 1]`, but
+nothing bounds `O = Wo(A)`, and `vecadd` forces both onto one scale — `s_x`,
+i.e. `1/127`. Measured on this checkpoint:
+
+| layer | `|O|` max | `|X|` max | `RQ_O` clip rate |
+| --- | --- | --- | --- |
+| 0 | 40.0 | 2.30 | 50.4% |
+| 1 | 577.6 | 1.00 | 73.1% |
+| 2 | 2007.5 | 1.00 | 69.2% |
+| 3 | 7259.5 | 1.00 | **92.3%** |
+
+`RQ_XO` then clips a further 48.7% on average and `RQ_F` 45.9%. So `O` is
+saturated to `±1` *before* the add, which is not a rounding loss but a change of
+function: in float, `norm1 = hardtanh(α·(2X + O))` with `|O| ~ 7·10³` and
+`α = 0.010` is essentially `sign(O)` — the model learned to let `Wo` run away
+precisely because DyT was going to throw the magnitude away. In int8 the
+saturation happens two steps too early, at `RQ_O`, and by the time `dyt` runs
+there is nothing left for it to saturate: **L3's `X1` clips 0.00% of the time**
+where the float model clips almost always.
+
+Widening the shared scale to cover `O` is the other horn of the same dilemma
+§4 records: at `s = |O|/127`, `X` (bounded by 1) maps to well under one int8
+level and the residual connection disappears entirely. Neither end of that
+trade is available while `vecadd` takes two operands at one scale.
+
+**So the conclusion of §7.6 survives with a sharper cause.** It is no longer
+"nothing renormalizes the residual stream" — DyT does. It is "the residual
+*add* has one scale and its two operands differ by 7000×". The remedies are the
+same shape as before and both are outside this kernel: (a) train with the
+addend bounded — weight decay on `Wo`/`W2`, or a normalization applied to the
+branch rather than to the sum, so `|O|` and `|X|` are comparable; or (b) give
+`vecadd` a per-operand shift so the two sides can arrive at different scales,
+which is a much smaller VPU change than the per-channel requant §7.6 costed and
+is now the specific thing worth costing.
+
 ---
 
 ## 8. Risks
 
-1. **No LayerNorm means nothing bounds the residual stream — and this is now
-   the confirmed cause of §7.6's result, not a prediction.** Two independent
-   measurements:
+1. **Nothing bounds the residual *addend*, and that is now the confirmed cause,
+   superseding "nothing bounds the residual stream".** DyT bounds the stream
+   (§7.6b) and the result did not move: the live constraint is that `vecadd`
+   puts `X` and `O` on one scale while they differ by up to 7259×. The
+   measurements below are the norm-free checkpoint's and still describe what
+   happens *without* normalization; §7.6b is what happens with it.
 
    *Synthetic.* While tuning §7's requant words, moving a single word by two
    shifts (`RQ_A` `{1,6}`→`{1,8}`) took the model from 45% of `A` saturated at
@@ -516,8 +617,10 @@ L2 17.68%), `RQ_F` 0.00%.
    to cover both ends. If 7.6 shows heavy clipping, the honest fix is per-row
    scaling, which the ISA cannot broadcast cheaply — so measure before
    designing anything.
-3. **`RQ_O` and `RQ_F` are pinned by the residual adds** (§4) and are the two
-   requants with no freedom left. Clip rates there are the diagnostic.
+3. **`RQ_O`, `RQ_XO` and `RQ_F` are pinned by the residual adds** (§4) and are
+   the requants with no freedom left. Clip rates there are the diagnostic, and
+   on the DyT checkpoint they are 71.2% / 48.8% / 45.9% — i.e. the diagnostic
+   fired (§7.6b).
 4. **`cfg vlen` maxes at 1023 and a `[32][32]` block is 1024 elements.**
    `vlen = 1024` reads as zero and the dispatch silently does nothing — no
    error, just a missing result. This is why every elementwise pass is chunked

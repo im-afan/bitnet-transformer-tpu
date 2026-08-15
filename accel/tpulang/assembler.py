@@ -59,6 +59,9 @@ Compute / dispatch — operands are registers holding scratchpad byte addresses:
     sadd     rdst, rsrc0, rscalar            dst[i] = src0[i] + scalar (broadcast)
     sdiv     rdst, rsrc0, rscalar            dst[i] = round(src0[i]*2^15 / scalar)
     requant  rdst, rsrc0, rparam             dst[i] = clip((src0*m0+rnd) >> n)
+    dyt      rdst, rsrc0, rparam             as requant, clipped to +-127
+                                             (DyT = hardtanh(alpha*x); the clip
+                                              is the hardtanh, vpu.sv header)
 
 Vector length for the VPU ops comes from cfg 'vlen'; MXU token count from cfg
 'tlen'.
@@ -224,6 +227,11 @@ SPECS: dict[str, Spec] = {
     "relu": Spec(0x04, "RR", {}),
     "gelu": Spec(0x05, "RR", {}),
     "requant": Spec(0x09, "RRR", {}),
+    # DyT / hardtanh. Byte-for-byte `requant`'s fixed point with a symmetric
+    # +-127 clip, so a normalization costs the same one dispatch a rescale
+    # does — see vpu.sv's header and adder_kernel.md §4 for why the clip *is*
+    # the hardtanh once the output scale is pinned to 1/127.
+    "dyt": Spec(0x21, "RRR", {}),
     "vecemul": Spec(0x0A, "RRR", {}),
     "square": Spec(0x0B, "RR", {}),
     "exp": Spec(0x0C, "RR", {}),

@@ -184,6 +184,11 @@ module scalar_unit #(
                              //       requant {m0,n} from cfg vscalar. The tmp
                              //       row needs vlen+4 bytes: the trailing int32
                              //       is where the denominator is parked.
+        OP_DYT     = 6'h21,  // VPU : r[dst] = dyt(r[src0], {n,m0}=r[src1]).
+                             //       Same operands and same fixed point as
+                             //       REQUANT, symmetric +-127 clip: DyT's
+                             //       hardtanh with the output scale pinned to
+                             //       1/127 (vpu.sv header, adder_kernel.md §4).
         OP_VECMM   = 6'h1E,  // VPU : macro op — S[t][s] = sum_d src0[t][d]*
                              //       src1[s][d] over cfg vrows x vcols.
                              //       Attention's Q@K^T / P@V: both operands
@@ -217,7 +222,8 @@ module scalar_unit #(
         VOP_SQUARE = 5'd5, VOP_EXP = 5'd6, VOP_REDUCEMAX = 5'd7, VOP_REDUCESUM = 5'd8,
         VOP_ELEMENT_MUL = 5'd9, VOP_REQUANT = 5'd10, VOP_SCALAR_ADD = 5'd11,
         VOP_SCALAR_DIV = 5'd12, VOP_VECMATMUL = 5'd13,
-        VOP_SOFTMAX = 5'd14;   // VOP_SM_EXP (15) is internal to vpu.sv
+        VOP_SOFTMAX = 5'd14,   // VOP_SM_EXP (15) is internal to vpu.sv
+        VOP_DYT = 5'd16;
 
     // Named config registers (host-, SETCFG- or SETCFGR-written; scalar_unit.md
     // §6). 0..3 are the original set; 4..13 carry the macro ops' geometry
@@ -404,6 +410,7 @@ module scalar_unit #(
             OP_REDSUM:  vpu_op = VOP_REDUCESUM;
             OP_VECEMUL: vpu_op = VOP_ELEMENT_MUL;
             OP_REQUANT: vpu_op = VOP_REQUANT;   // in=r[src0], {n,m0}=r[src1], out=r[dst]
+            OP_DYT:     vpu_op = VOP_DYT;       // same operands, symmetric clip
             OP_SADD:    vpu_op = VOP_SCALAR_ADD; // in=r[src0], scalar=r[src1], out=r[dst]
             OP_SDIV:    vpu_op = VOP_SCALAR_DIV; // in=r[src0], divisor=r[src1], out=r[dst]
             default:    vpu_op = VOP_DOT;
@@ -442,7 +449,8 @@ module scalar_unit #(
                (o == OP_RELU)    || (o == OP_GELU)    || (o == OP_SQUARE)   ||
                (o == OP_EXP)     || (o == OP_REDMAX)  || (o == OP_REDSUM)   ||
                (o == OP_VECEMUL) || (o == OP_REQUANT) || (o == OP_SADD)     ||
-               (o == OP_SDIV)    || (o == OP_VECMM) || (o == OP_SOFTMAX);
+               (o == OP_SDIV)    || (o == OP_VECMM)   || (o == OP_SOFTMAX)  ||
+               (o == OP_DYT);
     endfunction
 
     // Is this opcode a compute/comms dispatch (assert start, then wait on done)?

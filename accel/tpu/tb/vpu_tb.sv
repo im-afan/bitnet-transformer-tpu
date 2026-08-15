@@ -10,7 +10,13 @@
 //   scalar div  (int8 -> int32): SCALAR_DIV (reciprocate-then-multiply, Q15)
 //   LUT         (int8 -> int32): GELU, EXP
 //   reductions  (int8 -> int32 scalar): DOT, REDUCESUM, REDUCEMAX
-//   requant     (int32 -> int8): REQUANT
+//   narrowing   (int32 -> int8): REQUANT, DYT
+//
+// REQUANT and DYT share a fixed point and differ only in the lower clip (-128
+// vs -127, DyT's hardtanh being odd), so `test_dyt_floor` asserts that one
+// input directly: a random spread hits the single value that separates them
+// almost never, and without it a DUT that routed `dyt` to requant8 would pass
+// everything else here.
 //
 // Coverage includes multi-chunk streaming (vlen > LANES), an exact-boundary
 // vlen, and partial-tail vlen so the lane-active predicate / V_wstrb masking is
@@ -40,7 +46,8 @@ module vpu_tb;
         VOP_RELU        = 5'd3,  VOP_GELU       = 5'd4,  VOP_SQUARE     = 5'd5,
         VOP_EXP         = 5'd6,  VOP_REDUCEMAX  = 5'd7,  VOP_REDUCESUM  = 5'd8,
         VOP_ELEMENT_MUL = 5'd9,  VOP_REQUANT    = 5'd10, VOP_SCALAR_ADD = 5'd11,
-        VOP_SCALAR_DIV  = 5'd12, VOP_VECMATMUL  = 5'd13, VOP_SOFTMAX    = 5'd14;
+        VOP_SCALAR_DIV  = 5'd12, VOP_VECMATMUL  = 5'd13, VOP_SOFTMAX    = 5'd14,
+        VOP_DYT         = 5'd16;   // VOP_SM_EXP (15) is internal to vpu.sv
 
     // ---- Scratchpad address map (generous spacing; int8 chunks over-read) ---
     localparam logic [ADDR_W-1:0] A_ADDR  = 16'h1000;  // src0
@@ -242,6 +249,20 @@ module vpu_tb;
         else                     return int'(shifted);
     endfunction
 
+    // Reference for DYT: the same rescale clipped symmetrically. Written out
+    // rather than delegating to ref_requant with a bound argument, so that the
+    // one constant separating the two ops appears twice and independently —
+    // a shared helper would agree with a DUT that had them backwards.
+    function automatic int ref_dyt(input int x, input int m0, input int n);
+        longint prod, round, shifted;
+        prod    = longint'(x) * longint'(m0);
+        round   = (n == 0) ? 0 : (longint'(1) << (n - 1));
+        shifted = (prod + round) >>> n;
+        if      (shifted >  127) return  127;
+        else if (shifted < -127) return -127;
+        else                     return int'(shifted);
+    endfunction
+
     // -------------------------------------------------------------------------
     // Op-level tests.
     // -------------------------------------------------------------------------
@@ -310,6 +331,38 @@ module vpu_tb;
         for (int i = 0; i < vlen; i++)
             exp8(D_ADDR + i, ref_requant(tv32[i], m0, n), tag);
         $display("[%s] vlen=%0d m0=%0d n=%0d  (errors so far: %0d)", tag, vlen, m0, n, errors);
+    endtask
+
+    // DyT / hardtanh. Same operands and same fixed point as REQUANT; the only
+    // observable difference is the floor, so this task also asserts that
+    // difference directly on a value engineered to land below -127 (see the
+    // call sites), which is the one input that separates the two ops.
+    task automatic test_dyt(input int vlen, input int m0, input int n, input string tag);
+        gen_i32(vlen);
+        for (int i = 0; i < vlen; i++) put32(A_ADDR + i*4, tv32[i]);
+        put32(SC_ADDR, (n << M0_W) | m0);
+        run_op(VOP_DYT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
+        for (int i = 0; i < vlen; i++)
+            exp8(D_ADDR + i, ref_dyt(tv32[i], m0, n), tag);
+        $display("[%s] vlen=%0d m0=%0d n=%0d  (errors so far: %0d)", tag, vlen, m0, n, errors);
+    endtask
+
+    // The one input that tells DYT and REQUANT apart: an accumulator that
+    // rescales to exactly -128. REQUANT must return -128, DYT must return -127.
+    // Without this, a DUT that routed `dyt` to requant8 would pass every test
+    // above, because gen_i32's random spread hits that single value ~never.
+    task automatic test_dyt_floor();
+        int got_dyt, got_rq;
+        put32(A_ADDR, -128);
+        put32(SC_ADDR, (0 << M0_W) | 1);        // {m0=1, n=0}: pass through
+        run_op(VOP_DYT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, 1);
+        got_dyt = $signed(mem[D_ADDR]);
+        exp8(D_ADDR, -127, "DYT-floor");
+        run_op(VOP_REQUANT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, 1);
+        got_rq = $signed(mem[D_ADDR]);
+        exp8(D_ADDR, -128, "REQUANT-floor");
+        $display("[DYT-floor] -128 -> dyt %0d / requant %0d  (errors so far: %0d)",
+                 got_dyt, got_rq, errors);
     endtask
 
     // Reference for VOP_SCALAR_DIV / softmax's normalize pass: reciprocate the
@@ -448,6 +501,12 @@ module vpu_tb;
         test_requant(40, 1500, 10, "REQUANT");
         test_requant(33,  512,  8, "REQUANT-half");
         test_requant(20, 4095,  0, "REQUANT-noshift");
+
+        // ---- DyT / hardtanh: requant's fixed point, symmetric clip ---------
+        test_dyt(40, 1500, 10, "DYT");
+        test_dyt(33,  512,  8, "DYT-half");
+        test_dyt(20, 4095,  0, "DYT-noshift");
+        test_dyt_floor();
 
         // Macro op: row-wise softmax (docs/macro_ops.md §5.1). Multiple rows,
         // and a row length that is not a whole number of chunks, so both the

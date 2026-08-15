@@ -270,7 +270,15 @@ sadd    d, a, s     d[i]=a[i]+scalar(s)   square  d, a    a[i]^2
 sdiv    d, a, s     round(a[i]*2^15/s)    redmax  d, a    max_i a[i]  -> scalar
 vecdot  d, a, b     Σ a[i]*b[i] -> scalar redsum  d, a    Σ a[i]      -> scalar
 requant d, a, p     clip((a[i]*m0+rnd)>>n) int32->int8, {m0,n} at p
+dyt     d, a, p     as requant, clipped to +-127 (DyT / hardtanh)
 ```
+
+`dyt` is `requant` with a symmetric clip. DyT — `hardtanh(alpha*x, -1, 1)`, the
+normalization `model/transformer.py` uses — needs no pass of its own on this
+datapath: pin the output scale to `1/127`, fold `alpha` into the multiplier, and
+the saturating narrow the caller already needed *is* the hardtanh. The floor is
+`-127` rather than int8's `-128` because hardtanh is odd. See
+[vpu.md](vpu.md) and `accel/tpulang/adder_kernel.md` §4.
 
 All read `cfg vlen` elements. `gelu`/`exp` use fixed 256-entry LUTs loaded at init
 (`accel/tpulang/luts.py`), which means their operands must **already be at the tables'
@@ -524,10 +532,15 @@ int32 is little-endian 4-byte, int8 a single signed byte.
 | `0x1A` | `wait`    | WAIT   | control | block until `flags`-selected unit is done            |
 | `0x1B` | `sdiv`    | RRR    | VPU     | `dst[i] = round(src0[i]·2¹⁵ / scalar(src1))` (Q15)  |
 | `0x1C` | `setcfgr` | CFGR   | scalar  | `cfg[dst] = r[src0]` (full 32 bits, no extension)   |
+| `0x1D` | `matmul_t`| RRR    | MXU     | as `matmul`, strides from `cfg arow/crow/wcol` (§3)  |
+| `0x1E` | `vecmatmul`| RRR   | VPU     | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]` (macro op)  |
 | `0x1F` | `halt`    | NONE   | control | stop; raise `done`                                   |
+| `0x20` | `softmax` | RRR    | VPU     | row-wise softmax, Q15 result (macro op)             |
+| `0x21` | `dyt`     | RRR    | VPU     | as `requant`, clipped to ±127 — DyT / hardtanh       |
 
-> `0x1D–0x1E` are unallocated; `sdiv` sits at `0x1B` (added after the `0x00–0x1A` block) —
-> the numeric gap is intentional. The opcode field is 6 bits, so `0x20–0x3E` are also free.
+> `sdiv` sits at `0x1B` (added after the `0x00–0x1A` block) — the numeric gap is
+> intentional. The opcode field is 6 bits, so `0x22–0x3E` remain free; `halt` keeps `0x1F`
+> even though allocation has continued past it.
 
 ## A.4 Instruction forms & selectors
 
@@ -535,7 +548,7 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 
 | Form     | `dst`    | `src0`             | `src1`      | `flags`     | Mnemonics                                     |
 | -------- | -------- | ------------------ | ----------- | ----------- | --------------------------------------------- |
-| `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul, vecdot/mul/add/emul, sadd, sdiv, requant, adds/subs/muls |
+| `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul[_t], vecdot/mul/add/emul, sadd, sdiv, requant, dyt, vecmatmul, softmax, adds/subs/muls |
 | `RR`     | dst reg  | src0 reg           | —           | —           | relu, gelu, square, exp, redmax, redsum       |
 | `RS`     | dst reg  | src0 reg           | —           | `.t` (rdmem)| rdmem, loads                                  |
 | `SS`     | —        | src0 reg           | src1 reg    | `.t` (wrmem)| wrmem, stores, cmps                           |

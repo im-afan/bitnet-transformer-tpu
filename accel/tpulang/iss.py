@@ -17,7 +17,9 @@ Numerics are kept bit-exact with the RTL:
   * MXU matmul: int8 activations x ternary weights, int32 accumulate, optional
     ``clip((acc*m0 + round) >> n)`` requantize on store (mxu.sv requant8).
   * VPU ops: int8 operands, int32 accumulate, int32 writeback; VOP_REQUANT
-    narrows int32->int8 with the same fixed-point rescale (vpu.sv requant8).
+    narrows int32->int8 with the same fixed-point rescale (vpu.sv requant8),
+    and VOP_DYT does the same with a symmetric +-127 clip (vpu.sv dyt8) — that
+    clip is DyT's hardtanh, not an approximation of it.
 
 DMA (rdmem/wrmem) is modelled as a real byte copy between a separate external
 **DRAM** space and the on-chip scratchpad, over ``cfg 'len'`` bytes — matching the
@@ -57,6 +59,7 @@ OP_SETCFGR = 0x1C
 OP_MATMUL_T = 0x1D
 OP_VECMM = 0x1E
 OP_SOFTMAX = 0x20
+OP_DYT = 0x21
 
 # --- named config registers (scalar_unit.sv CFG_*) ----------------------------
 CFG_TLEN, CFG_VLEN, CFG_LEN, CFG_SCALAR = 0, 1, 2, 3
@@ -255,6 +258,24 @@ class TPU:
             return -128
         return shifted
 
+    # ---- DyT: the same rescale, clipped symmetrically (vpu.sv dyt8) ----------
+    def dyt8(self, acc: int, m0: int, n: int) -> int:
+        """``clip_pm127((acc*m0 + round) >> n)`` — DyT / hardtanh.
+
+        Identical to :meth:`requant8` except for the lower bound. ``hardtanh``
+        is an odd function, so its floor has to be the negative of its ceiling;
+        int8's -128 would put the saturated end at -128/127 = -1.0079. The
+        multiplier carries ``alpha * s_in * 127``, which is what makes the clip
+        coincide with the hardtanh rather than merely resemble it.
+        """
+        rnd = 0 if n == 0 else (1 << (n - 1))
+        shifted = (acc * m0 + rnd) >> n         # Python >> floors, like >>>
+        if shifted > 127:
+            return 127
+        if shifted < -127:
+            return -127
+        return shifted
+
     # ---- ternary weight decode (scratchpad.md §2: 00=0, 01=+1, 11=-1) --------
     @staticmethod
     def _trit(colint: int, i: int) -> int:
@@ -309,7 +330,7 @@ class TPU:
 
             elif opc in (OP_VECDOT, OP_VECMUL, OP_VECADD, OP_RELU, OP_GELU,
                          OP_REQUANT, OP_VECEMUL, OP_SQUARE, OP_EXP, OP_REDMAX,
-                         OP_REDSUM, OP_SADD, OP_SDIV):
+                         OP_REDSUM, OP_SADD, OP_SDIV, OP_DYT):
                 self._vpu(opc, r_dst & addr_mask, r_src0 & addr_mask,
                           r_src1 & addr_mask)
 
@@ -531,12 +552,15 @@ class TPU:
         # src1 doubles as the scalar/param address for scalar & requant ops.
         scalar = self.rd_i32(src1)
 
-        if opc == OP_REQUANT:
+        # The two narrowing ops: int32 in at stride 4, int8 out at stride 1,
+        # {m0,n} from the third operand. They differ only in the clip.
+        if opc in (OP_REQUANT, OP_DYT):
             m0 = scalar & ((1 << self.m0_w) - 1)
             n = (scalar >> self.m0_w) & ((1 << self.n_w) - 1)
+            narrow = self.requant8 if opc == OP_REQUANT else self.dyt8
             for i in range(vlen):
                 a32 = self.rd_i32(src0 + i * 4)
-                self.wr_i8(dst + i, self.requant8(a32, m0, n))
+                self.wr_i8(dst + i, narrow(a32, m0, n))
             return
 
         if opc in (OP_VECDOT, OP_REDSUM, OP_REDMAX):   # reductions -> one int32

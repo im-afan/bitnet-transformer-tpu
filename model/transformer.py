@@ -15,27 +15,6 @@ if torch.cuda.is_available():
 
 
 
-def mha_torch(Q, K, V):
-    batch_size = Q.shape[0]
-    n_tokens = Q.shape[1]
-    q_heads = Q.shape[2] * Q.shape[3]
-    head_dim = Q.shape[4]
-
-    mask = torch.triu(torch.ones([n_tokens, n_tokens]) * -1e9, diagonal=1).reshape(
-        [1, n_tokens, n_tokens, 1, 1]
-    )
-    mask = mask.to(device)
-
-    attention_scores = torch.einsum("btkgh,bskh->btskg", Q, K) / math.sqrt(head_dim)
-
-    attention_scores = F.relu(attention_scores + mask)  # btskg revert to softmax if training bad
-    A = torch.einsum("btskg,bskh->btkgh", attention_scores, V).reshape(
-        [batch_size, n_tokens, q_heads * head_dim]
-    )
-
-    return A
-
-
 class RoundClip(torch.autograd.Function):
     @staticmethod
     def forward(input):
@@ -202,7 +181,19 @@ class MultiHeadAttention(nn.Module):
         K = torch.reshape(K, [batch_size, n_tokens, self.kv_heads, self.head_dim])
         V = torch.reshape(V, [batch_size, n_tokens, self.kv_heads, self.head_dim])
 
-        A = mha_torch(Q, K, V)
+
+        mask = torch.triu(torch.ones([n_tokens, n_tokens]) * -1e9, diagonal=1).reshape(
+            [1, n_tokens, n_tokens, 1, 1]
+        )
+        mask = mask.to(device)
+
+        attention_scores = torch.einsum("btkgh,bskh->btskg", Q, K) / math.sqrt(self.head_dim)
+
+        attention_scores = F.relu(attention_scores + mask)  # btskg revert to softmax if training bad
+        A = torch.einsum("btskg,bskh->btkgh", attention_scores, V).reshape(
+            [batch_size, n_tokens, self.q_heads * self.head_dim]
+        )
+
 
         O = self.Wo(A)
         return O + X

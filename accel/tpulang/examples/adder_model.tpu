@@ -2,17 +2,34 @@
 ;
 ; model/transformer.py's whole forward pass for the shipped ternary adder config
 ; (d=128, f=128, 4 layers, 4 heads, head_dim=32, T=32, vocab=13), in its
-; *current* form: no bias, no LayerNorm, ReLU attention, ReLU feed-forward,
-; dropout off. Four transformer layers and the output head, in one run:
+; *current* form: no bias, DyT for normalization, ReLU attention, ReLU
+; feed-forward, dropout off. Four transformer layers and the output head, in one
+; run:
 ;
 ;     for L in 0..3:
 ;         Q,K,V = Wq(X), Wk(X), Wv(X)          # ternary, no bias
 ;         S     = Q @ K^T / sqrt(head_dim)     # per head
 ;         P     = relu(S + causal_mask)        # NOT softmax
 ;         A     = P @ V                        # [T, 4*32] = [T, 128]
-;         X     = X + Wo(A)                    # attention residual
-;         X     = X + W2(relu(W1(X)))          # feed-forward residual
+;         X     = norm1(X + (Wo(A) + X))       # DyT; note the DOUBLE residual
+;         X     = norm2(X + W2(relu(W1(X))))   # DyT
 ;     logits = X @ fc.weight^T                 # int8 head, on the VPU
+;
+; Two things in that loop a reader of the class hierarchy would not predict, and
+; that this kernel therefore has to reproduce deliberately:
+;
+;   * `MultiHeadAttention.forward` ends in `return O + X`, and
+;     `Transformer.forward` then adds `X` again — so the attention residual is
+;     `2X + O`, not `X + O`. `vecadd` takes two int8 operands, so that is two
+;     adds and an extra narrow between them (RQ_XO, pinned to {1,0} because the
+;     second add needs both sides back on X's scale).
+;   * `norm1`/`norm2` are DyT — `hardtanh(alpha*x, -1, 1)` with one learned
+;     scalar, no gamma/beta (arxiv 2503.10622). On this datapath that is not a
+;     new pass at all: it is the narrow the residual add already needed, with
+;     the multiplier carrying `alpha` and the output scale pinned to 1/127 so
+;     the clip *is* the hardtanh. The `dyt` instruction is `requant` with a
+;     symmetric +-127 clip, because hardtanh is odd and int8's -128 is not.
+;     ../adder_kernel.md §4.
 ;
 ; The host supplies the embedded+positionally-encoded X, all four layers'
 ; weights, the mask, the requant words and the quantized `fc` weight; it gets
@@ -50,13 +67,16 @@
 ;
 ; 2. `vecadd` adds two int8 *operands*, so a residual add only means anything if
 ;    both sides are at the same scale. That is a constraint on the host's
-;    requant words, not on this program: RQ_O must land Wo's output on X's
-;    scale and RQ_F must land W2's output on X1's. ../adder_kernel.md §4.
+;    requant words, not on this program: RQ_O and RQ_XO must land on X's scale
+;    and RQ_F must land W2's output on X1's. ../adder_kernel.md §4.
 ;
-; 3. There is no LayerNorm, so nothing bounds the residual stream. Each layer's
-;    activation scale has to grow to cover it, and int8 has 8 bits to spend.
-;    That is a property of the checkpoint, not of this kernel, but it is where
-;    accuracy will go if it goes anywhere.
+; 3. DyT is what bounds the residual stream, and it is the reason this kernel is
+;    worth running at int8 at all. Without normalization nothing renormalizes X
+;    between layers, each layer's requant multiplies it by a constant, and the
+;    error compounds geometrically — which is the 0.00% exact-sequence result in
+;    ../adder_kernel.md §7.6. `norm2` bounds its output to [-1, 1]
+;    *analytically*, so every layer after the first enters at a known scale of
+;    1/127 with no calibration involved.
 ;
 ;     python ../assembler.py adder_model.tpu --listing
 ;     python ../gen_vectors.py -p examples/adder_model.tpu
@@ -90,7 +110,7 @@
 .equ LROW     VOCAB * 4     ; int32 row stride of the [T][VOCAB] logits = 52
 
 ; ===========================================================================
-; Scratchpad map (64 KB; highest byte used is 0xC833)
+; Scratchpad map (64 KB; highest byte used is 0xC837)
 ; ===========================================================================
 .equ WBUF     0x0000        ; weight window, refilled 4x/layer     (12288 B)
 .equ QKV      0x3000        ; [T][3D] int8, fused projection       (12288 B)
@@ -104,12 +124,13 @@
 .equ P8       0xBC00        ; [T][T] int8 attention weights         (1024 B)
 .equ AH8T     0xC000        ; [DH][T] int8, one head's A^T          (1024 B)
 .equ MASK     0xC400        ; [T][T] int8 causal mask, 0 / -128     (1024 B)
-.equ RQW      0xC800        ; this layer's 13 requant {m0,n} words     (52 B)
+.equ RQW      0xC800        ; this layer's 14 requant {m0,n} words     (56 B)
 .equ LOG      S32           ; logits reuse the score buffer (1664 <= 4096)
 
 ; ---- the requant words, in the order adder_kernel.md §4 lists them ---------
 ; Reloaded from the layer block each iteration, so these addresses are fixed
-; and every `setcfg scalar` stays a compile-time immediate.
+; and every `setcfg scalar` stays a compile-time immediate. Two of the fourteen
+; are consumed by `dyt` rather than `requant`; the word format is identical.
 .equ RQ_Q     RQW +  0      ; X @ Wq   -> Q      int8
 .equ RQ_K     RQW +  4      ; X @ Wk   -> K      int8
 .equ RQ_V     RQW +  8      ; X @ Wv   -> V      int8
@@ -118,11 +139,12 @@
 .equ RQ_P     RQW + 20      ; relu(S8) -> P8     ({1,0} is the natural choice)
 .equ RQ_A     RQW + 24      ; P@V int32 -> A8
 .equ RQ_O     RQW + 28      ; A8 @ Wo  -> O      **must land on X's scale**
-.equ RQ_X1    RQW + 32      ; X + O    -> X1
-.equ RQ_H     RQW + 36      ; X1 @ W1  -> H
-.equ RQ_HR    RQW + 40      ; relu(H)  -> HR     ({1,0} is the natural choice)
-.equ RQ_F     RQW + 44      ; HR @ W2  -> F      **must land on X1's scale**
-.equ RQ_X2    RQW + 48      ; X1 + F   -> X2
+.equ RQ_XO    RQW + 32      ; X + O    -> XO     **{1,0}: still on X's scale**
+.equ RQ_X1    RQW + 36      ; XO + X   -> X1     `dyt`: carries norm1's alpha
+.equ RQ_H     RQW + 40      ; X1 @ W1  -> H
+.equ RQ_HR    RQW + 44      ; relu(H)  -> HR     ({1,0} is the natural choice)
+.equ RQ_F     RQW + 48      ; HR @ W2  -> F      **must land on X1's scale**
+.equ RQ_X2    RQW + 52      ; X1 + F   -> X2     `dyt`: carries norm2's alpha
 
 ; ===========================================================================
 ; DRAM map (512 KB available; highest byte used is 0x21FFF = 135 KB)
@@ -144,7 +166,7 @@
 .equ O_WO     0x3000        ; [D][D]  trits                         (4096 B)
 .equ O_W1     0x4000        ; [D][F]  trits                         (4096 B)
 .equ O_W2     0x5000        ; [F][D]  trits                         (4096 B)
-.equ O_RQW    0x6000        ; this layer's 13 requant words            (52 B)
+.equ O_RQW    0x6000        ; this layer's 14 requant words            (56 B)
 .equ O_XOUT   0x6400        ; [T][D] int8 — this layer's X, a checkpoint
 
 ; ---- byte counts ----------------------------------------------------------
@@ -153,7 +175,7 @@
 .equ B_ACT    T * D         ;  4096   a [T][D] int8 activation
 .equ B_VT     D * T         ;  4096
 .equ B_SQ     T * T         ;  1024   a [T][T] int8 block
-.equ B_RQW    52
+.equ B_RQW    56
 .equ B_WFC    VOCAB * D     ;  1664
 .equ B_LOG    T * VOCAB * 4 ;  1664
 
@@ -389,7 +411,7 @@ head:
     blt     head
 
 ; ---------------------------------------------------------------------------
-; 4. O = A @ Wo, then the attention residual X <- X + O
+; 4. O = A @ Wo, then the attention residual X <- norm1(X + (O + X))
 ; ---------------------------------------------------------------------------
     li      da, D_A8
     li      pa, T1
@@ -406,10 +428,34 @@ head:
     setcfg  scalar, RQ_O
     matmul_t.rq  pb, pa, wbuf   ; O = requant(A @ Wo)   [T][D] int8
 
-    ; X1 = requant(X + O). Both operands are int8 at the *same* scale (that is
-    ; RQ_O's job), and the result overwrites X in place — vecadd reads the whole
-    ; chunk before requant writes it, and dispatches are atomic.
+    ; The attention residual is `2X + O`, not `X + O`: MultiHeadAttention
+    ; returns `O + X` and Transformer adds `X` again. `vecadd` takes two int8
+    ; operands, so that is two passes with a narrow between them.
+    ;
+    ; XO = requant(X + O), written *over* O. Both operands are int8 at the same
+    ; scale (that is RQ_O's job) and RQ_XO is {1,0}, so XO stays on X's scale and
+    ; is a legal operand for the second add. Overwriting O is safe because the
+    ; vecadd has already consumed the whole chunk — dispatches are atomic.
     setcfg  vlen, CHUNK
+    li      rq, RQ_XO
+    li      pa, X
+    li      pb, T2
+    li      i,  0
+    li      n,  NCHUNK
+attnxo:
+    vecadd  tmp, pa, pb
+    requant pb,  tmp, rq
+    adds    pa,  pa, k512
+    adds    pb,  pb, k512
+    adds    i,   i,  one
+    cmps    i,   n
+    blt     attnxo
+
+    ; X1 = norm1(XO + X) = DyT(...), in place over X. `dyt` is the same narrow
+    ; as `requant` with a symmetric clip: RQ_X1's multiplier carries norm1's
+    ; alpha and lands the result on 1/127, at which point saturating at +-127 is
+    ; exactly hardtanh saturating at +-1. No extra pass — the residual add had
+    ; to be narrowed anyway, so the normalization is free.
     li      rq, RQ_X1
     li      pa, X
     li      pb, T2
@@ -417,7 +463,7 @@ head:
     li      n,  NCHUNK
 resid1:
     vecadd  tmp, pa, pb
-    requant pa,  tmp, rq
+    dyt     pa,  tmp, rq
     adds    pa,  pa, k512
     adds    pb,  pb, k512
     adds    i,   i,  one
@@ -425,7 +471,7 @@ resid1:
     blt     resid1
 
 ; ---------------------------------------------------------------------------
-; 5. Feed-forward: X <- X1 + W2(relu(W1(X1)))
+; 5. Feed-forward: X <- norm2(X1 + W2(relu(W1(X1))))
 ; ---------------------------------------------------------------------------
     li      sa, O_W1
     adds    da, wl, sa
@@ -459,8 +505,10 @@ ffrelu:
     setcfg  scalar, RQ_F
     matmul_t.rq  pa, pb, wbuf   ; F = requant(relu(H) @ W2)   [T][D] int8
 
-    ; X2 = requant(X1 + F), again in place and again requiring RQ_F to have
-    ; landed F on X1's scale.
+    ; X2 = norm2(X1 + F), again in place and again requiring RQ_F to have landed
+    ; F on X1's scale. RQ_X2 carries norm2's alpha and targets 1/127, so this
+    ; `dyt` is what makes the *next* layer's input scale known analytically
+    ; rather than calibrated — see sharp edge 3 at the top.
     setcfg  vlen, CHUNK
     li      rq, RQ_X2
     li      pa, X
@@ -469,7 +517,7 @@ ffrelu:
     li      n,  NCHUNK
 resid2:
     vecadd  tmp, pa, pb
-    requant pa,  tmp, rq
+    dyt     pa,  tmp, rq
     adds    pa,  pa, k512
     adds    pb,  pb, k512
     adds    i,   i,  one

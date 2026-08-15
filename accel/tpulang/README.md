@@ -21,7 +21,7 @@ The toolchain (all in this directory):
 | [`luts.py`](luts.py)          | generates the VPU's `gelu`/`exp` activation ROMs (`../tpu/rtl/luts/*.hex`) at their canonical input scale; the ISS imports the same tables |
 | [`gen_vectors.py`](gen_vectors.py) | ties both together: assemble + simulate → golden test vectors for `tpu_top_tb.sv` |
 | [`torch_ref.py`](torch_ref.py) | PyTorch references for the examples — an independent check on the ISS *and* the FPGA |
-| [`adder_export.py`](adder_export.py) | real checkpoint → integers: calibrate every activation scale, derive the 13 requant words per layer, run the integer pipeline, and report task accuracy against the float model. `--iss-check` runs the real weights through `adder_model.tpu` in the ISS to prove the numbers describe the kernel |
+| [`adder_export.py`](adder_export.py) | real checkpoint → integers. The calibration, the 14 requant words per layer and the integer pipeline all live in [`model/quant.py`](../../model/quant.py); this script stages them into the kernel's DRAM map and reports task accuracy against the float model. `--iss-check` runs the real weights through `adder_model.tpu` in the ISS to prove the numbers describe the kernel |
 | [`examples/`](examples)       | annotated `.tpu` programs (vector add, relu layer, tiled matmul, VPU matmul, softmax) |
 
 For the machine-level encoding and per-opcode semantics, read the
@@ -102,9 +102,15 @@ exp      rdst, rsrc0                    dst[i] = exp_lut[src0[i]]
 redmax   rdst, rsrc0                    dst = max_i src0[i]      (scalar result)
 redsum   rdst, rsrc0                    dst = Σ_i src0[i]        (scalar result)
 requant  rdst, rsrc0, rparam            dst[i] = clip((src0*m0+rnd) >> n)  int32→int8
+dyt      rdst, rsrc0, rparam            as requant, clipped to ±127  (DyT / hardtanh)
 ```
 
 VPU vector length comes from `cfg 'vlen'`; MXU token count from `cfg 'tlen'`.
+
+`dyt` is `requant` with a symmetric clip, which is all DyT
+(`hardtanh(alpha*x, -1, 1)`) costs on this datapath: pin the output scale to
+`1/127`, fold `alpha` into the multiplier, and the clip of the narrow the caller
+already needed *is* the hardtanh. See [`../tpu/docs/vpu.md`](../tpu/docs/vpu.md).
 
 **Memory / comms** (operands are registers holding *DRAM/scratchpad* addresses; byte
 length from `cfg 'len'`):
@@ -230,7 +236,7 @@ Each stages its own operands over DRAM (§2.2) and ends in `halt`.
 | [`softmax_row.tpu`](examples/softmax_row.tpu) | a multi-op micro-sequence + scalar↔vector interplay (`redmax → sadd → exp → redsum → sdiv`) — illustrative only, see the caveat below |
 | [`transpose_dma.tpu`](examples/transpose_dma.tpu) | `Vᵀ` and `Qᵀ` out of a fused `[T][3D]` QKV block in one dispatch each — `wrmem.t` (spill) and `rdmem.t` (fill), with `tsrow` reading a column slice in place |
 | [`highmem_dma.tpu`](examples/highmem_dma.tpu) | DMA above the low 64 KB of DRAM — the only thing here that leaves the first window. Builds a `0x10000` base with `li`+`adds` (no immediate can name it) and spills there linearly and transposed |
-| [`adder_model.tpu`](examples/adder_model.tpu) | **not an example — the real thing.** The entire `adder_ternary_vanilla` model in one program: four layers (3 ternary projections, both attention matmuls, the causal mask, ReLU attention, `Wo`, the feed-forward, both residuals) plus the output head. 196 words |
+| [`adder_model.tpu`](examples/adder_model.tpu) | **not an example — the real thing.** The entire `adder_ternary_vanilla` model in one program: four layers (3 ternary projections, both attention matmuls, the causal mask, ReLU attention, `Wo`, the feed-forward, both residuals with their `dyt` normalizations) plus the output head. 208 words |
 
 `adder_model.tpu` is a full forward pass of the shipped adder checkpoint in a
 single run. It was five runs until `scalar_unit.sv` stopped truncating a
@@ -239,7 +245,7 @@ always reached all of it, but a *program* could only name the low 64 KB, which
 the model's 96 KB of weights do not fit in. With the full `MEM_ADDR_W` visible
 the weights are staged once and stay resident, so a forward pass is a 4 KB
 upload rather than a 96 KB one. The byte-level contract the host has to satisfy
-— memory maps, the 13 requant words per layer and where their scales come from,
+— memory maps, the 14 requant words per layer and where their scales come from,
 the weight packing — is in [`adder_kernel.md`](adder_kernel.md); §2 there has
 the RTL/ISS change and §7 the verification order.
 

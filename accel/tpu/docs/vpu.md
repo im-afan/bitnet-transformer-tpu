@@ -64,6 +64,10 @@ those reductions need).
 | `10`     | `REQUANT`     | requant     | `src0`(int32), `scalar`   | `dst[i] = clip((src0[i]·m0 + rnd) >> n)`|
 | `11`     | `SCALAR_ADD`  | elementwise | `src0`, `scalar`          | `dst[i] = src0[i] + scalar`            |
 | `12`     | `SCALAR_DIV`  | scalar div  | `src0`, `scalar`          | `dst[i] = round(src0[i]·2^15 / scalar)`|
+| `13`     | `VECMATMUL`   | macro op    | `src0`, `src1`, geometry  | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]` |
+| `14`     | `SOFTMAX`     | macro op    | `src0`, `tmp`, `vscalar`  | row-wise softmax, Q15 (four inner passes)|
+| `15`     | `SM_EXP`      | *internal*  | —                         | `SOFTMAX`'s fused pass 2; never dispatched|
+| `16`     | `DYT`         | requant     | `src0`(int32), `scalar`   | `dst[i] = clip±127((src0[i]·m0 + rnd) >> n)`|
 
 `REDUCEMAX`/`REDUCESUM`/`DOT` collapse the whole vector to one int32 scalar; the other
 compute ops produce a same-length vector. `GELU`/`EXP` are 256-entry int8→int8 LUTs
@@ -156,6 +160,34 @@ right before an MXU matmul — instead of clipping after every pointwise op. The
 scale is chosen entirely by `m0`/`n`, so a producer emits its result already in the
 consumer's scale (this is how residual adds with differing operand scales are
 reconciled: rescale-then-add via `SCALAR_MUL`/`REQUANT`, then `ADD`).
+
+### DyT (`DYT`)
+
+`DYT` is the same instruction with the clip moved: `-127` instead of `-128`.
+
+```
+dst[i] = clip_±127( (src0[i] * m0 + (1 << (n-1))) >> n )
+```
+
+That one constant is the whole op, and the reason it exists is that it turns a
+*normalization* into an instruction the datapath already had. DyT
+([arxiv 2503.10622](https://arxiv.org/abs/2503.10622)) is
+`hardtanh(alpha·x, -1, 1)` with one learned scalar — the drop-in LayerNorm
+replacement `model/transformer.py` uses. Pin the output scale to `1/127` and
+fold `alpha` into the multiplier, and the saturation of a narrow *is* the
+hardtanh: every value the clip catches is exactly one hardtanh would have
+flattened to ±1. The clip has to be symmetric because hardtanh is odd; int8's
+`-128` would put the saturated end at `-1.0079`.
+
+The consequence for a kernel is that DyT costs **zero extra passes**: a
+normalization always follows a residual add, and that add's result was going to
+be narrowed from int32 to int8 anyway. See
+`accel/tpulang/adder_kernel.md` §4 and `examples/adder_model.tpu`, where the two
+`dyt`s replace two `requant`s and nothing else changes.
+
+Nothing checks that the output scale really is `1/127`. A `DYT` whose word
+targets some other scale is a rescale with an odd clip, not a hardtanh — the
+scale contract is the compiler's, exactly as it is for the LUT ops above.
 
 ## Interface
 

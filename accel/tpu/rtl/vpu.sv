@@ -20,6 +20,19 @@
 // residual stream / softmax temporaries wide and requantize only where an int8
 // activation is actually needed (e.g. before feeding the MXU).
 //
+// DyT (VOP_DYT). Dynamic tanh — `hardtanh(alpha*x, -1, 1)`, arxiv 2503.10622 —
+// is the normalization model/transformer.py uses in place of LayerNorm, and on
+// an int8 datapath it is *the same instruction as a requant with a different
+// clip*. If the output scale is pinned to 1/127 then a saturating narrow from
+// int32 already computes the hardtanh: the multiplier `m0/2**n` carries
+// `alpha * s_in * 127`, and every value the clip catches is exactly one that
+// hardtanh would have flattened to +-1. The only difference from VOP_REQUANT is
+// the *lower* bound, -127 instead of int8's -128: hardtanh is an odd function,
+// so a floor of -128/127 = -1.0079 would be off-spec at one end only. One
+// comparison constant is the whole cost of the op, and having it be an op at
+// all is what lets a kernel say "this is a normalization" instead of "this is a
+// rescale that happens to clip". See accel/tpulang/adder_kernel.md §4.
+//
 // Broadcast scalar ops. VOP_SCALAR_ADD / VOP_SCALAR_MUL / VOP_SCALAR_DIV read one
 // int32 word from `vpu_scalar` (once, on the first chunk) and apply it to every
 // lane — the broadcast forms softmax's `x - max` and LayerNorm's `x - mean` need.
@@ -140,7 +153,11 @@ module vpu #(
         // construction: writing int32 here and reading int8 there is precisely
         // the latent stride bug in softmax_row.tpu (its `sadd` writes at
         // 4-byte stride and its `exp` reads at 1-byte stride).
-        VOP_SM_EXP      = 5'd15;
+        VOP_SM_EXP      = 5'd15,
+        // dst[i] = clip_pm127((src0[i]*m0 + round) >> n) — DyT / hardtanh.
+        // int32 in, int8 out, {m0,n} from the scalar operand, exactly like
+        // VOP_REQUANT; see the header note for why the clip is symmetric.
+        VOP_DYT         = 5'd16;
 
     // -------------------------------------------------------------------------
     // Activation LUTs (256 x int8). Preloaded on the host from the reference.
@@ -161,7 +178,7 @@ module vpu #(
     function automatic logic needs_scalar(input logic [4:0] o);
         return (o == VOP_SCALAR_MUL) || (o == VOP_REQUANT) ||
                (o == VOP_SCALAR_ADD) || (o == VOP_SCALAR_DIV) ||
-               (o == VOP_SM_EXP);
+               (o == VOP_SM_EXP)     || (o == VOP_DYT);
     endfunction
     function automatic logic is_reduction(input logic [4:0] o);
         return (o == VOP_DOT) || (o == VOP_REDUCESUM) || (o == VOP_REDUCEMAX);
@@ -179,6 +196,22 @@ module vpu #(
         if (shifted >  127)      requant8 =  8'sd127;
         else if (shifted < -128) requant8 = -8'sd128;
         else                     requant8 = shifted[7:0];
+    endfunction
+
+    // DyT / hardtanh: the same rescale, clipped **symmetrically**. Sharing the
+    // shifter with requant8 is deliberate — the two ops differ in exactly one
+    // constant, and writing that difference out here rather than hiding it in a
+    // flag is what keeps the numerics reviewable against iss.py / model/quant.py.
+    function automatic logic [7:0] dyt8(input logic signed [ACC_W-1:0] acc32,
+                                        input logic [M0_W-1:0]         m0,
+                                        input logic [N_W-1:0]          n);
+        logic signed [RQ_W-1:0] prod, round, shifted;
+        prod    = acc32 * $signed({1'b0, m0});
+        round   = (n == 0) ? '0 : (RQ_W'(1) <<< (n - 1));
+        shifted = (prod + round) >>> n;
+        if (shifted >  127)      dyt8 =  8'sd127;
+        else if (shifted < -127) dyt8 = -8'sd127;   // hardtanh is odd: no -128
+        else                     dyt8 = shifted[7:0];
     endfunction
 
     // -------------------------------------------------------------------------
@@ -222,8 +255,9 @@ module vpu #(
     // Element widths are per-op, and the two are independent: most compute ops
     // read int8 and write int32; REQUANT reads int32 and writes int8; SM_EXP
     // reads int8 and writes int8. src1 is always an int8 vector (binary ops).
-    wire src0_is32   = (op_r == VOP_REQUANT);
-    wire dst_is8     = (op_r == VOP_REQUANT) || (op_r == VOP_SM_EXP);
+    wire src0_is32   = (op_r == VOP_REQUANT) || (op_r == VOP_DYT);
+    wire dst_is8     = (op_r == VOP_REQUANT) || (op_r == VOP_SM_EXP) ||
+                       (op_r == VOP_DYT);
     wire [ADDR_W-1:0] src0_stride = src0_is32 ? ADDR_W'(LANES*4) : ADDR_W'(LANES);
     wire [ADDR_W-1:0] src1_stride = ADDR_W'(LANES);
     wire [ADDR_W-1:0] dst_stride  = dst_is8   ? ADDR_W'(LANES)   : ADDR_W'(LANES*4);
@@ -378,6 +412,7 @@ module vpu #(
                 VOP_GELU:        res32[l] = ACC_W'(gelu_rom[idx8]);
                 VOP_EXP:         res32[l] = ACC_W'(exp_rom [idx8]);
                 VOP_REQUANT:     res8[l]  = requant8(a32, rq_m0, rq_n);
+                VOP_DYT:         res8[l]  = dyt8(a32, rq_m0, rq_n);
                 // Fused (x - max) -> requant -> exp LUT, stored narrow. The
                 // requant is not decoration: x-max is an int32-valued quantity
                 // and the table is indexed by a byte, so this is what lands the
