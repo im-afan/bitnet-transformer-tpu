@@ -47,5 +47,6 @@ y = torch.tensor(tokens)[:, ans_pos:].to(device)
 pred = model(x, attn_mask)
 
 print("expr: ", batch, len(batch[0]))
+print("expr (readable): ", [numbers_data.unreverse_expression(e) for e in batch])
 print("expected: ", y)
 print("prediction: ", model.sample_pred_best(pred)[:, ans_pos-1:-1])
