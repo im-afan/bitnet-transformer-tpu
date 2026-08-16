@@ -457,7 +457,7 @@ def adder_ternary_vanilla():
         len(numbers_data.VOCAB),
         d=128,
         f=128,
-        layers=4,
+        layers=2,
         q_heads=4,
         kv_heads=4,
         use_ternary=True,
