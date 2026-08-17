@@ -28,7 +28,7 @@ ops to two accelerators, blocking on each until it finishes:
 
 ```
    scalar_unit  ── issue-and-wait ──►  MXU   (ternary matmul: act @ weight)
-        │                          └─►  VPU   (SIMD vectors: add, relu, exp, reductions…)
+        │                          └─►  VPU   (SIMD vectors: add, relu, requant, dyt, vecmatmul)
         │
    scratchpad (on-chip BRAM)  ◄── every unit reads/writes here
         ▲
@@ -204,21 +204,21 @@ The MXU and VPU consume fixed byte layouts. Place your tensors to match (full de
 
 ### 4.5 Bridge scalars between registers and vectors
 
-Reductions (`redmax`, `redsum`, `vecdot`) write a single int32 *into the scratchpad*, not a
-register. To use that value as a scalar in later scalar math, pull it into a register with
-`loads`, and push a register value back with `stores`:
+`vecdot` — the only reduction — writes its single int32 *into the scratchpad*, not into a
+register. To use that value in later scalar math, pull it into a register with `loads`,
+and push a register value back with `stores`:
 
 ```asm
-    redmax  maxa, x         ; scratch[MAXA] = max_i x[i]
-    loads   t, maxa         ; t = that max (register)
-    subs    t, r0, t        ; t = -max
-    stores  nega, t         ; scratch[NEGA] = -max   (now a broadcastable scalar)
-    sadd    shift, x, nega  ; shift[i] = x[i] - max
+    vecdot  dota, x, y      ; scratch[DOTA] = Σ x[i]*y[i]
+    loads   t, dota         ; t = that sum (register)
 ```
 
-`sadd`/`vecmul`/`sdiv`/`requant` take their scalar/param from a *scratchpad* address (the
-third operand's register), so a scalar destined for broadcast must live in the scratchpad —
-hence the `stores`.
+`requant`/`dyt` take their `{m0,n}` word from a *scratchpad* address (the third operand's
+register), so a parameter computed at run time must be `stores`d before the op reads it.
+
+> Before the VPU was cut down to the ops the current model issues, this section was
+> mostly about the broadcast ops (`sadd`, `vecmul`, `sdiv`) that softmax and LayerNorm
+> needed. Those are gone — see [vpu.md §Removed ops](vpu.md#removed-ops).
 
 ### 4.6 Transpose with the DMA, not with a loop
 
@@ -264,14 +264,17 @@ a contraction larger than the array); `.rq` requantizes int32→int8 on store us
 
 ```
 vecadd  d, a, b     d[i]=a[i]+b[i]        relu    d, a    max(a[i],0)
-vecemul d, a, b     d[i]=a[i]*b[i]        gelu    d, a    gelu_lut[a[i]]
-vecmul  d, a, s     d[i]=a[i]*scalar(s)   exp     d, a    exp_lut[a[i]]
-sadd    d, a, s     d[i]=a[i]+scalar(s)   square  d, a    a[i]^2
-sdiv    d, a, s     round(a[i]*2^15/s)    redmax  d, a    max_i a[i]  -> scalar
-vecdot  d, a, b     Σ a[i]*b[i] -> scalar redsum  d, a    Σ a[i]      -> scalar
+vecdot  d, a, b     Σ a[i]*b[i] -> scalar
 requant d, a, p     clip((a[i]*m0+rnd)>>n) int32->int8, {m0,n} at p
 dyt     d, a, p     as requant, clipped to +-127 (DyT / hardtanh)
 ```
+
+That is the whole VPU. `gelu`, `exp`, `square`, `vecemul`, `vecmul`, `sadd`, `sdiv`,
+`redmax`, `redsum` and the `softmax` macro op were **removed** — the current model is
+ReLU attention, DyT and a ReLU feed-forward, so none of them had a caller. Their opcodes
+are retired holes, not reusable encoding space: [vpu.md §Removed ops](vpu.md#removed-ops)
+has the table and the measured area saving. `vecdot` survives despite being unused by any
+shipped kernel, because it is `vecmatmul`'s inner primitive.
 
 `dyt` is `requant` with a symmetric clip. DyT — `hardtanh(alpha*x, -1, 1)`, the
 normalization `model/transformer.py` uses — needs no pass of its own on this
@@ -280,10 +283,7 @@ the saturating narrow the caller already needed *is* the hardtanh. The floor is
 `-127` rather than int8's `-128` because hardtanh is odd. See
 [vpu.md](vpu.md) and `accel/tpulang/adder_kernel.md` §4.
 
-All read `cfg vlen` elements. `gelu`/`exp` use fixed 256-entry LUTs loaded at init
-(`accel/tpulang/luts.py`), which means their operands must **already be at the tables'
-canonical input scale of 1/16** — put a `requant` in front. Nothing checks this; a
-wrongly-scaled operand just reads the wrong table entry. See [vpu.md](vpu.md).
+All read `cfg vlen` elements.
 
 **DMA / comms** (byte length from `cfg len`):
 
@@ -355,30 +355,37 @@ host can restart it.
 
 ---
 
-## 8. Worked example: softmax over a score row
+## 8. Worked example: ReLU attention over a score row
 
-Softmax has no single instruction — you decompose it into VPU primitives, using the
-scalar↔vector bridge from §4.5. From
-[`softmax_row.tpu`](../../tpulang/examples/softmax_row.tpu):
+The model uses **ReLU attention, not softmax** (`model/transformer.py`:
+`P = relu(S + causal_mask)`, with no normalization over the source axis), and the VPU no
+longer has the ops a softmax would need. From
+[`adder_model.tpu`](../../tpulang/examples/adder_model.tpu), one chunk of one head:
 
 ```asm
-    setcfg  vlen, N         ; N-element row
-    ; ... li each address into its register, rdmem the input row X ...
-
-    redmax  maxa, x          ; m       = max_i x[i]
-    loads   t, maxa          ; t       = m
-    subs    t, r0, t         ; t       = -m
-    stores  nega, t          ; scratch = -m   (broadcastable)
-    sadd    shift, x, nega   ; s[i]    = x[i] - m
-    exp     expa, shift      ; e[i]    = exp(s[i])       (LUT)
-    redsum  dena, expa       ; D       = Σ e[i]
-    sdiv    prob, expa, dena ; p[i]    = round(e[i]*2^15 / D)   (Q15)
+    setcfg  vlen, CHUNK
+    li      rq, RQ_S
+    requant s8a, s32,  rq       ; int32 scores -> int8, 1/sqrt(head_dim) folded in
+    li      rq, RQ_ID
+    vecadd  tmp, s8a, mska      ; + causal mask (int8 data: 0 or -128) -> int32
+    requant s8a, tmp, rq        ; -> int8; a masked entry is now <= -1
+    li      rq, RQ_P
+    relu    tmp, s8a            ; masked -> exactly 0
+    requant p8a, tmp, rq        ; -> int8 attention weights
 ```
 
-The pattern to absorb: a reduction lands in the scratchpad → `loads` it → do scalar math →
-`stores` it back → a broadcast op (`sadd`) consumes it. The `x−m` shift is the standard
-numerically-stable softmax, and `sdiv` produces a Q15 fixed-point probability whose scale is
-a compile-time constant even though `D` is runtime.
+The pattern to absorb: **the mask is data, not control flow.** An int8 tensor of `0`
+(allowed) and `-128` (masked) is added, and because `S8` is int8 the masked sum is always
+negative, so the `relu` takes it to exactly zero. That is exact for every score scale
+rather than a tolerance — and it is why ReLU attention needs no reduction at all, where
+softmax needed a max, a sum and a divide.
+
+Five dispatches per chunk and every one is load-bearing: `requant` is the only op that
+narrows int32→int8, and `vecadd`/`relu` read int8.
+
+> This section used to walk through `softmax_row.tpu`, decomposing softmax into
+> `redmax`/`sadd`/`exp`/`redsum`/`sdiv`. That example and those instructions are gone;
+> see [vpu.md §Removed ops](vpu.md#removed-ops).
 
 ---
 
@@ -401,7 +408,7 @@ on the bit-exact [ISS](../../tpulang/iss.py), and emits the three `$readmemh` fi
 
 ```bash
 python gen_vectors.py                        # default: examples/relu_layer.tpu
-python gen_vectors.py -p examples/softmax_row.tpu
+python gen_vectors.py -p examples/adder_model.tpu
 ```
 
 The expected file holds exactly the bytes the program *wrote*, so the testbench checks that
@@ -417,9 +424,9 @@ program's outputs and nothing else — the loop that keeps hardware honest again
   An int32 output buffer needs 4× the bytes of the int8 input — leave room.
 - **Weights are column-major, 2-bit packed** (`00/01/11 → 0/+1/−1`); activations are
   row-major int8. Mixing these up produces a plausible-looking but wrong matmul.
-- **Reductions write to the scratchpad, not a register** — `loads` to get the scalar out.
-- **Broadcast scalars must be in the scratchpad** (`sadd`/`vecmul`/`sdiv`/`requant` read the
-  param from a scratchpad address), so `stores` a computed scalar before broadcasting it.
+- **`vecdot` writes to the scratchpad, not a register** — `loads` to get the scalar out.
+- **Requant params must be in the scratchpad** (`requant`/`dyt` read the `{m0,n}` word
+  from a scratchpad address), so `stores` one computed at run time before the op reads it.
 - **Identical DRAM/scratchpad addresses** per tensor, by convention (§4.3) — except for a
   `.t` transfer, whose source and destination must be *different* regions.
 - **A `.t` transfer needs `tcols`/`tsrow`/`tdrow` set** (§4.6). They default to a plain copy
@@ -505,20 +512,12 @@ int32 is little-endian 4-byte, int8 a single signed byte.
 | ------ | --------- | ------ | ------- | ---------------------------------------------------- |
 | `0x00` | `matmul`  | RRR    | MXU     | `out = act @ ternary-weight`; `.acc`/`.rq` via flags |
 | `0x01` | `vecdot`  | RRR    | VPU     | `dst = Σ src0·src1` (scalar result)                  |
-| `0x02` | `vecmul`  | RRR    | VPU     | `dst[i] = src0[i]·scalar(src1)`                      |
 | `0x03` | `vecadd`  | RRR    | VPU     | `dst[i] = src0[i] + src1[i]`                         |
 | `0x04` | `relu`    | RR     | VPU     | `dst[i] = max(src0[i], 0)`                           |
-| `0x05` | `gelu`    | RR     | VPU     | `dst[i] = gelu_lut[src0[i]]`                         |
 | `0x06` | `wrmem`   | SS     | DMA     | scratch(src0) → DRAM(src1); `.t` transposes (§4.6)   |
 | `0x07` | `rdmem`   | RS     | DMA     | DRAM(src0) → scratch(dst); `.t` transposes (§4.6)    |
 | `0x08` | `wrneigh` | NEIGH  | LINK    | local DRAM(src0) → neighbor DRAM(src1), dir = flags  |
 | `0x09` | `requant` | RRR    | VPU     | `dst[i] = clip((src0·m0 + rnd) >> n)` int32→int8     |
-| `0x0A` | `vecemul` | RRR    | VPU     | `dst[i] = src0[i]·src1[i]` (elementwise)             |
-| `0x0B` | `square`  | RR     | VPU     | `dst[i] = src0[i]²`                                  |
-| `0x0C` | `exp`     | RR     | VPU     | `dst[i] = exp_lut[src0[i]]`                          |
-| `0x0D` | `redmax`  | RR     | VPU     | `dst = max_i src0[i]` (scalar result)               |
-| `0x0E` | `redsum`  | RR     | VPU     | `dst = Σ_i src0[i]` (scalar result)                 |
-| `0x0F` | `sadd`    | RRR    | VPU     | `dst[i] = src0[i] + scalar(src1)` (broadcast)       |
 | `0x10` | `adds`    | RRR    | scalar  | `dst = src0 + src1`                                  |
 | `0x11` | `subs`    | RRR    | scalar  | `dst = src0 − src1`                                  |
 | `0x12` | `muls`    | RRR    | scalar  | `dst = src0 × src1` (low 32 bits)                    |
@@ -530,17 +529,19 @@ int32 is little-endian 4-byte, int8 a single signed byte.
 | `0x18` | `branch`  | BRANCH | control | `if cond(flags): pc = imm16`                         |
 | `0x19` | `jmp`     | JMP    | control | `pc = imm16`                                         |
 | `0x1A` | `wait`    | WAIT   | control | block until `flags`-selected unit is done            |
-| `0x1B` | `sdiv`    | RRR    | VPU     | `dst[i] = round(src0[i]·2¹⁵ / scalar(src1))` (Q15)  |
 | `0x1C` | `setcfgr` | CFGR   | scalar  | `cfg[dst] = r[src0]` (full 32 bits, no extension)   |
 | `0x1D` | `matmul_t`| RRR    | MXU     | as `matmul`, strides from `cfg arow/crow/wcol` (§3)  |
 | `0x1E` | `vecmatmul`| RRR   | VPU     | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]` (macro op)  |
 | `0x1F` | `halt`    | NONE   | control | stop; raise `done`                                   |
-| `0x20` | `softmax` | RRR    | VPU     | row-wise softmax, Q15 result (macro op)             |
 | `0x21` | `dyt`     | RRR    | VPU     | as `requant`, clipped to ±127 — DyT / hardtanh       |
 
-> `sdiv` sits at `0x1B` (added after the `0x00–0x1A` block) — the numeric gap is
-> intentional. The opcode field is 6 bits, so `0x22–0x3E` remain free; `halt` keeps `0x1F`
-> even though allocation has continued past it.
+> **Retired opcodes.** `0x02` (`vecmul`), `0x05` (`gelu`), `0x0A`–`0x0F` (`vecemul`,
+> `square`, `exp`, `redmax`, `redsum`, `sadd`), `0x1B` (`sdiv`) and `0x20` (`softmax`)
+> were removed with the VPU datapath behind them —
+> [vpu.md §Removed ops](vpu.md#removed-ops). They are **not** reallocated: a stale binary
+> should decode to an unknown opcode, not to a different instruction. The opcode field is
+> 6 bits, so `0x22–0x3E` remain free for genuinely new ops; `halt` keeps `0x1F` even
+> though allocation has continued past it.
 
 ## A.4 Instruction forms & selectors
 
@@ -548,8 +549,8 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 
 | Form     | `dst`    | `src0`             | `src1`      | `flags`     | Mnemonics                                     |
 | -------- | -------- | ------------------ | ----------- | ----------- | --------------------------------------------- |
-| `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul[_t], vecdot/mul/add/emul, sadd, sdiv, requant, dyt, vecmatmul, softmax, adds/subs/muls |
-| `RR`     | dst reg  | src0 reg           | —           | —           | relu, gelu, square, exp, redmax, redsum       |
+| `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul[_t], vecdot, vecadd, requant, dyt, vecmatmul, adds/subs/muls |
+| `RR`     | dst reg  | src0 reg           | —           | —           | relu                                          |
 | `RS`     | dst reg  | src0 reg           | —           | `.t` (rdmem)| rdmem, loads                                  |
 | `SS`     | —        | src0 reg           | src1 reg    | `.t` (wrmem)| wrmem, stores, cmps                           |
 | `RIMM`   | dst reg  | ⟵ imm16 ⟶          |             | —           | li                                            |
@@ -587,7 +588,7 @@ Indices `18..31` remain unassigned and can be named `cfg18`…`cfg31`.
 | 6   | `arow`    | MXU activation row stride, bytes (`= K`)                      |
 | 7   | `crow`    | MXU result row stride, bytes (`= N*4`, or `N` requantized)    |
 | 8   | `wcol`    | MXU weight column stride, bytes (`= K*2/8`)                   |
-| 9   | `vscalar` | VPU macro-op `{m0,n}` word address                            |
+| 9   | —         | *retired* (was `vscalar`, read only by `softmax`); index not reused |
 | 10  | `vrows`   | VPU macro-op row count (`vecmatmul`: query rows)              |
 | 11  | `vcols`   | `vecmatmul` key rows                                          |
 | 12  | `vrow0`   | `vecmatmul` `src0` row stride, bytes                          |
@@ -597,8 +598,10 @@ Indices `18..31` remain unassigned and can be named `cfg18`…`cfg31`.
 | 16  | `tsrow`   | `rdmem.t`/`wrmem.t` source row stride, bytes (0 ⇒ `tcols`)    |
 | 17  | `tdrow`   | `rdmem.t`/`wrmem.t` destination row stride, bytes (0 ⇒ 1)     |
 
-`vscalar` is deliberately separate from `scalar`: the MXU's requant word and a VPU
-macro-op's are live at the same time inside a layer.
+Index 9 was `vscalar`, a second `{m0,n}` address kept separate from `scalar` because the
+MXU's requant word and a VPU macro-op's were live at once. Only `softmax` ever read it, so
+it went with that instruction. The **index stays vacant**: renumbering 10–17 would
+silently repoint every `setcfg` in every existing program.
 
 `CFG_AW` is **5**, not 4: the transpose geometry is three registers and only index 15 was
 free. Widening the file cost nothing in the encoding — `dst` is 8 bits — and left 14 spare.
@@ -628,17 +631,6 @@ dst     = clip(shifted, -128, 127)
 `m0` is a positive 12-bit (`M0_W`) multiplier, `n` a 4-bit (`N_W`) shift, packed into one
 int32 (`m0` low, `n` above) at `cfg[scalar]` (matmul) or the `src1` address (`requant`).
 `{m0=1, n=0}` is identity+clip (a plain integer matmul).
-
-**Scalar divide (`sdiv`)** — a runtime divisor reciprocated once, reused per lane (Q15):
-
-```
-R = (d == 0) ? all-ones(2^32−1) : floor(2^31 / |d|)     # RECIP_Q = 31
-q = round( (src0[i]·R) >> (31 − 15) )                    # DIV_Q = 15
-dst[i] = (d < 0) ? −q : q
-```
-
-The result is always Q15, so its scale is a compile-time constant even though `d` is
-runtime. A zero divisor saturates `R` (the compiler guarantees nonzero: `Σexp ≥ 1`).
 
 **VPU datatypes.** Compute ops read int8, accumulate int32, write int32 (4-byte stride).
 `requant` is the sole narrowing op (int32→int8, 1-byte stride). Reductions write one int32.

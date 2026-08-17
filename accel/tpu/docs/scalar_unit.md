@@ -9,12 +9,12 @@ scalar arithmetic on values in memory. See [README](README.md) §5.
 - **Control.** Sequences a transformer layer: projection matmuls → attention → residual
   add → LayerNorm → FFN → residual add → LayerNorm. It expands high-level structure into
   the primitive ops the MXU/VPU understand, including the **tile loops** for matmuls
-  larger than the array (see [mxu.md](mxu.md) §6) and the micro-sequences for softmax /
+  larger than the array (see [mxu.md](mxu.md) §6) and the micro-sequences for attention /
   LayerNorm (see [vpu.md](vpu.md) §4).
 - **Dispatch & sync.** Issues `start` to a unit, waits on its `done`, manages hazards
   between units sharing a scratchpad bank group.
 - **Scalar math.** Add / multiply / compare on single int32 values in memory (loop
-  counters, addresses, requant scales, softmax denominators).
+  counters, addresses, requant scales).
 
 It is a small in-order engine — think microcontroller, not out-of-order core — reading a
 program from a dedicated **instruction memory** (BRAM), separate from the scratchpad.
@@ -56,18 +56,15 @@ where noted. Fixed-size operands are implied by config registers (array size, `d
 | ----------- | --------------------------------- | ------------------------------------------------------ |
 | `Matmul`    | `act_addr, weight_addr, out_addr` | `out = act @ weight` (ternary weight), on the MXU      |
 | `VectorDot` | `vec0, vec1, out`                 | `out = Σ vec0 · vec1`, on the VPU reduction tree       |
-| `VectorMul` | `vec, scalar, out`                | `out = vec × scalar` (broadcast scalar)                |
 | `VectorAdd` | `vec0, vec1, out`                 | `out = vec0 + vec1` (residuals)                        |
 | `ReLU`      | `vec, out`                        | `out = max(vec, 0)`                                    |
-| `GeLU`      | `vec, out`                        | `out = gelu(vec)` (VPU LUT)                            |
-| `VectorEMul`| `vec0, vec1, out`                 | `out[i] = vec0[i]·vec1[i]` (elementwise)              |
-| `Square`    | `vec, out`                        | `out[i] = vec[i]²` (LayerNorm variance)               |
-| `Exp`       | `vec, out`                        | `out = exp(vec)` (VPU LUT; softmax)                   |
-| `ReduceMax` | `vec, out`                        | `out = max_i vec[i]` → scalar                         |
-| `ReduceSum` | `vec, out`                        | `out = Σ_i vec[i]` → scalar                           |
+| `VecMatmul` | `src0, src1, out`                 | `out[t][s] = Σ_d src0[t][d]·src1[s][d]` (macro op)     |
 | `Requant`   | `vec(int32), param, out(int8)`    | `out = clip((vec·m0+rnd)>>n)`, `{n,m0}=param` (VPU)    |
-| `ScalarAdd` | `vec, scalar, out`                | `out[i] = vec[i] + scalar` (broadcast; `x−max`/`x−mean`)|
-| `ScalarDiv` | `vec, scalar, out`                | `out[i] = round(vec[i]·2¹⁵ / scalar)` (Q15; softmax/LN)|
+| `DyT`       | `vec(int32), param, out(int8)`    | as `Requant`, clipped to ±127 — hardtanh               |
+
+> `GeLU`, `Exp`, `Square`, `VectorEMul`, `VectorMul`, `ScalarAdd`, `ScalarDiv`,
+> `ReduceMax`, `ReduceSum` and the `Softmax` macro op used to be in this table. They were
+> removed with the VPU datapath behind them — [vpu.md §Removed ops](vpu.md#removed-ops).
 
 ### Comms / Memory
 
@@ -113,12 +110,11 @@ loop h in 0..q_heads:
   loop i in 0..T:            ; query token
     loop j in 0..i:          ; causal: keys 0..i
       VectorDot @Q[h,i], @K[h,j], @S[i,j]   ; QK^T / sqrt(d) folded into scale
-    ; softmax over row S[i, 0..i]:
-    ;   ReduceMax @S[i] -> m;  ScalarAdd @S[i], -m -> shifted (x-max)
-    ;   Exp (LUT) -> e;  ReduceSum @e -> D;  ScalarDiv @e, D -> @P[i]
-    ScalarDiv  @e[i], @D, @P[i]   ; p = e / Σe, in Q15 (no separate @recip needed)
+    ; ReLU attention over row S[i, 0..i] — no softmax, so no reduction at all:
+    ;   VectorAdd @S[i], @mask -> masked   (mask is int8 data: 0 or -128)
+    ;   Requant -> int8;  ReLU -> @P[i]    (masked entries land at exactly 0)
     loop j in 0..i:
-      VectorMul @P[i,j], @V[h,j], @acc      ; weighted V
+      VectorDot @P[i,j], @V[h,j], @acc      ; weighted V
       VectorAdd @acc, @A[h,i], @A[h,i]
 Matmul  @A, @Wo, @O          ; output projection
 VectorAdd @O, @X, @O         ; residual O + X

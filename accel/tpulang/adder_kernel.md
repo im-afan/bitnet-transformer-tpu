@@ -1,21 +1,25 @@
 # adder_kernel — running `adder_ternary_vanilla` on the TPU
 
 [`examples/adder_model.tpu`](examples/adder_model.tpu) is the whole shipped
-ternary adder model — four transformer layers and the output head — as **one
-program, one run**. This document is the byte-level contract the host has to
-satisfy to drive it.
+ternary adder model — today two transformer layers and the output head — as
+**one program, one run**. This document is the byte-level contract the host has
+to satisfy to drive it.
 
-> **Status: built and verified; the kernel is correct and neither checkpoint is
-> int8-quantizable.** The program assembles to 208 words and runs to completion
-> in the ISS. It matches an independent PyTorch implementation byte-for-byte
-> (24 992 elements), and on both *real* checkpoints the ISS matches the
-> reference logits exactly. But the norm-free model scores **96.09%
-> exact-sequence in float and 0.00% with int8 activations** (§7.6), and the DyT
-> retrain — with `dyt` wired into the kernel — scores **93.36% / 0.00%** (§7.6b).
-> DyT does fix the mechanism §7.6 identified; what it exposes is the *residual
-> addend*, which is a training property and not a kernel one. The RTL matched
-> the ISS on all 26 240 bytes of the 196-word version; that run has not been
-> repeated since the `dyt` op landed. Not yet run on the board.
+> **Status: built and verified, and the model is now int8-quantizable — with
+> quantization-aware training.** The program assembles to 208 words (`LAYERS = 2`,
+> matching `adder_ternary_vanilla`) and runs to completion in the ISS, matching
+> an independent PyTorch implementation byte-for-byte. On the QAT checkpoint
+> `model/saved/ternary_mha.pt` the ISS matches the reference logits exactly and
+> the fully-integer model scores **100.00% exact-sequence / 100.00% token**
+> (§7.6c). That is a training result, not a kernel change: the identical kernel
+> scored 0.00% on the two post-training-quantized checkpoints (§7.6, §7.6b), and
+> those sections' analysis of *why* PTQ fails here still stands.
+>
+> **Not yet run on the board.** `host/run_adder.py` drives the whole
+> per-problem host loop and reproduces the 100.00% against the ISS backend, but
+> no FPGA was attached when it was written (§7.9). The RTL last matched the ISS
+> on the 196-word, four-layer image; that run predates both the `dyt` op and the
+> drop to two layers.
 
 Read [`README.md`](README.md) (the language), [`../tpu/docs/isa.md`](../tpu/docs/isa.md)
 (the target) and [`../tpu/docs/macro_ops.md`](../tpu/docs/macro_ops.md) (the
@@ -29,13 +33,13 @@ model (LayerNorm, GELU, softmax, biases, `f=512`) and an earlier ISA (no
 
 ## 1. The model, exactly as it is today
 
-`model/transformer.py::adder_ternary_vanilla` — `d=128`, `f=128`, `layers=4`,
+`model/transformer.py::adder_ternary_vanilla` — `d=128`, `f=128`, `layers=2`,
 `q_heads=kv_heads=4`, `head_dim=32`, `vocab=13`, `use_ternary=True`,
 `use_bias=False`. Sequence length `T=32` (`train.py --max_tokens`). Inference,
 so dropout is off.
 
 ```
-for L in 0..3:
+for L in 0..1:
     Q, K, V = Wq(X), Wk(X), Wv(X)            # ternary, no bias
     S       = Q @ K^T / sqrt(head_dim)       # per head
     P       = relu(S + causal_mask)          # ReLU attention, NOT softmax
@@ -70,10 +74,11 @@ Everything between those two is the TPU's.
 
 ## 2. One program, and the change that made it one
 
-The four layers' ternary weights are 96 KB packed (`Wq|Wk|Wv` is 128×384 trits
-= 12 KB; `Wo`, `W1`, `W2` are 128×128 = 4 KB each). Until now that was
-unreachable from a program, for a reason that turned out not to be about memory
-at all:
+A layer's ternary weights are 24 KB packed (`Wq|Wk|Wv` is 128×384 trits = 12 KB;
+`Wo`, `W1`, `W2` are 128×128 = 4 KB each), so 48 KB at today's `layers=2` and
+96 KB at the `layers=4` this kernel was first written for. Either way the top of
+the image is past the 64 KB line, and until now that was unreachable from a
+program, for a reason that turned out not to be about memory at all:
 
 | Stage | Address width | Where |
 | --- | --- | --- |
@@ -176,10 +181,10 @@ ISA got stronger.**
 
 ## 3. Memory maps
 
-### DRAM (512 KB available; the top byte used is `0x21FFF`, i.e. 136 KB)
+### DRAM (512 KB available; the top byte used is `0x13FFF`, i.e. 80 KB)
 
-Globals live below `0x5000` so each fits a 16-bit `li`. The four layer blocks
-sit above and are reached through the `wl` base register.
+Globals live below `0x5000` so each fits a 16-bit `li`. The layer blocks sit
+above and are reached through the `wl` base register.
 
 | Addr | Bytes | Tensor | Written by |
 | --- | --- | --- | --- |
@@ -408,12 +413,13 @@ a real checkpoint rather than synthetic weights.
 | 1 | `python torch_ref.py` — every example vs PyTorch | **7/7 pass**, exact |
 | 2 | `tb/` RTL suite, 13 testbenches | **12 pass**; `uart_transmitter_tb` is a pre-existing no-op (its whole body is commented out) |
 | 3 | `make cosim` — host driver vs RTL over a simulated UART | **11/11 pass** |
-| 4 | `assembler.py examples/adder_model.tpu` | **196 words** of 1024 |
-| 5 | Full model, ISS vs PyTorch, exact | **0 of 24 992 elements differ** — 4 layer checkpoints (4096 int8 each), `V^T`, `A`, and 416 int32 logits |
+| 4 | `assembler.py examples/adder_model.tpu` | **208 words** of 1024 (`layers=2`) |
+| 5 | Full model, ISS vs PyTorch, exact | **0 of 16 800 elements differ** — 2 layer checkpoints (4096 int8 each), `V^T`, `A`, and 416 int32 logits |
 | 6 | `highmem_dma` + `vpu_matmul` through the RTL over the UART (`make uart`) | **5446 checks, 0 errors** — this is what covers the widened address and the `0x8000` case in hardware |
 | 7 | Full model through the RTL (`tpu_top_tb`, backdoor DRAM) | **26 240 checks, 0 errors** — halts at pc=195 after 23.58 ms simulated |
 | 8 | Real checkpoint, ISS vs the reference (`adder_export.py --iss-check`) | **0/416 logits differ** |
-| 9 | Real-checkpoint task accuracy | float 96.09% / int8 **0.00%** exact-sequence — see below |
+| 9 | Real-checkpoint task accuracy | int8 **100.00%** exact-sequence on the QAT `layers=2` checkpoint — §7.6c |
+| 10 | Real checkpoint through the host loop, per problem (`host/run_adder.py --dry-run`) | **100.00%** over 32 problems, identical to `quant.int_forward` |
 
 **§7.7 is a long simulation.** The model is ~188 KB of byte-serial DMA at ~14
 clocks/byte plus the MXU/VPU work — 2.36 M clocks, 23.58 ms at 100 MHz, with
@@ -585,6 +591,96 @@ branch rather than to the sum, so `|O|` and `|X|` are comparable; or (b) give
 `vecadd` a per-operand shift so the two sides can arrive at different scales,
 which is a much smaller VPU change than the per-channel requant §7.6 costed and
 is now the specific thing worth costing.
+
+### §7.6c — QAT, `layers=2`: 100.00% exact-sequence, and the reason the earlier rows were the wrong experiment
+
+`python accel/tpulang/adder_export.py -n 256 -c 128 --iss-check --words`, on
+`model/saved/ternary_mha.pt` — the `qat` branch's two-layer retrain, with every
+requant site present *during training* as an `ActQuant` whose scale is learned by
+LSQ ([arxiv 1902.08153](https://arxiv.org/abs/1902.08153)):
+
+| | exact-sequence | token |
+| --- | --- | --- |
+| float, quantizers removed | 0.00% | 29.37% |
+| int8 activations, this kernel | **100.00%** | **100.00%** |
+
+**The ISS cross-check passed: 0 of 416 logits differ.** 208 words, `LAYERS = 2`.
+
+Two things about that table need saying, because read casually it looks like a
+transcription error.
+
+**The float row is not a ceiling and the gap is not a loss.** §7.6 and §7.6b were
+post-training quantization: a float model existed, was good, and quantizing it
+destroyed it — so "float" was the number to recover and 0.00% was a failure. Here
+the quantizers were in the graph while the weights were fitted, so the trained
+function *includes* the clipping. Deleting the quantizers does not reveal the
+model; it produces a network the weights were never trained for, which is why it
+scores 0.00%. `quant.benchmark` now disables the `ActQuant` sites explicitly for
+that row rather than calling `Model.forward` and labelling the result "float" —
+otherwise the baseline silently becomes the fake-quantized model and the
+comparison flatters itself. The honest cross-check is `--fake-quant`, the same
+scheme in float32, which also scores 100.00% / 100.00%.
+
+**The saturation table stopped being a diagnostic.** §7.6b's argument was that
+`RQ_O` clipping 92.3% of `O` was the failure. This checkpoint clips *more*:
+
+| layer | `RQ_O` word | `RQ_O` clip | `RQ_XO` clip | `RQ_X2` clip |
+| --- | --- | --- | --- | --- |
+| 0 | `3838/2^3` = 479.75 | **99.88%** | 50.87% | 0.00% |
+| 1 | `3781/2^12` = 0.923 | 45.12% | 25.06% | 60.61% |
+
+L0's `RQ_O` multiplier is 479.75 — the word is deliberately amplifying `O` by
+480× into a clip that catches essentially every element, i.e. the layer has
+learned to use `RQ_O` as a `sign()`. That is exactly the "change of function, not
+a rounding loss" §7.6b identified, and here it costs nothing, because the
+training saw it. So a high clip rate localizes damage only when the scales were
+fitted after the fact; under QAT it is just where the network put its
+nonlinearity. Keep reading `report_clips` for a PTQ checkpoint; do not read it as
+a health check for this one.
+
+**What this does and does not settle.** It does not refute §7.6/§7.6b — those
+remain correct about PTQ on those checkpoints, and the `vecadd`-single-scale
+constraint they blame is still real and is still what forces `RQ_O` to be pinned.
+What changed is that training through the constraint is a third remedy, and
+unlike the two §7.6b lists (retrain with the addend bounded; give `vecadd` a
+per-operand shift) it needs no VPU change at all. The kernel is byte-identical to
+the one that scored 0.00%.
+
+**Where the scales come from now.** `model/quant.py` grew a `QATCalibration`
+that reads the learned `ActQuant.scale` instead of taking an absmax over a
+calibration set (`--scales qat|calib|auto`, auto-detecting). This is not
+cosmetic: re-deriving the scales by absmax moves every rounding grid the weights
+were fitted against. `.abs()` is applied because LSQ can drive a scale negative
+and `ActQuant.forward` uses the magnitude — layer 1's `q_v` is -0.00405 in this
+checkpoint.
+
+The control makes the point sharply: `--scales calib` on this same checkpoint —
+identical weights, identical kernel, scales re-derived by absmax over a
+calibration set — scores **0.00% exact-sequence / 64.98% token**. So the 100.00%
+is not "QAT produced robust weights"; it is the weights *and* the scales they
+were fitted against, and the scales are part of the checkpoint. Exporting a QAT
+model through a PTQ calibration path silently discards half of it.
+
+### §7.9 — the host loop, per problem
+
+`host/run_adder.py` is the script that scores a real checkpoint one problem at a
+time through the actual host protocol, rather than benchmarking the integer model
+in-process. Weights, mask, `fc` and the requant words (51 952 bytes) are staged
+once; each problem then writes only `D_XIN` (4096 B) and reads back `D_LOG`
+(1664 B). Staging is `adder_export.stage_dram`, shared with §7.8, so the
+simulated and board paths cannot drift apart the way the pipeline has twice
+before.
+
+Against the ISS backend (`--dry-run`), on `ternary_mha.pt`: **100.00%
+exact-sequence over 32 problems, identical to `quant.int_forward`.** That
+validates the split image, the per-problem write/read cycle and the scoring —
+everything the board run needs except the transport.
+
+**Not yet run on hardware.** No board was attached when this was written (no
+serial ports enumerated), so `run_adder.py -p COM5` is the outstanding step. The
+FPGA path is exercised by §7.6 (`make uart`) and §7.7 (`tpu_top_tb`) for a
+196-word, four-layer image; neither has been repeated since `dyt` landed or since
+`LAYERS` dropped to 2.
 
 ---
 

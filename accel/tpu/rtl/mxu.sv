@@ -166,8 +166,8 @@ module mxu #(
     // -------------------------------------------------------------------------
     localparam int ACT_W         = 8;                 // activation element, int8
     localparam int WT_W          = 2;                 // weight element, packed trit
-    localparam int PSUM_W        = 32;                // partial-sum accumulator, int32
-    localparam int TOK_W         = 6;                 // token-id width, matches t_len (<= 63 tokens)
+    localparam int PSUM_W        = 16;                // partial-sum accumulator, int32
+    localparam int TOK_W         = 5;                 // EXPERIMENT: 32 token slots
     localparam int MAX_TOKENS    = (1 << TOK_W);      // result-buffer token depth
     localparam int WGT_COL_BYTES = (ROWS * WT_W) / 8; // bytes per packed weight column
     localparam int RES_ROW_BYTES = COLS * 4;          // bytes per int32 result row

@@ -377,6 +377,60 @@ def calibrate(model: transformer.Model, tokens: torch.Tensor) -> Calibration:
     return cal
 
 
+class QATCalibration(Calibration):
+    """The scales the model was *trained* with, not ones measured after the fact.
+
+    A QAT checkpoint carries an :class:`~model.transformer.ActQuant` per requant
+    site whose scale was learned by LSQ, and the weights were fitted against
+    exactly those scales — so re-deriving them by absmax is not a neutral
+    substitution, it moves every rounding grid the model was trained on. This
+    reads the learned scale out instead and presents it through the same
+    ``scale(layer, site)`` interface, so :func:`derive_layer` is unchanged.
+
+    ``.abs()`` mirrors ``ActQuant.forward``: the scale is a free parameter that
+    LSQ can drive negative (layer 1's ``q_v`` in ``ternary_mha.pt`` is -0.00405),
+    and the forward pass uses its magnitude.
+
+    The absmax statistics are still collected, because :func:`report_clips` and
+    the dynamic-range diagnostic are about the tensors, not the scales.
+    """
+
+    # site -> where the owning ActQuant lives, given (model, li).
+    _SITES = {
+        "q": lambda m, l: m.layers[l].attention.q_q,
+        "k": lambda m, l: m.layers[l].attention.q_k,
+        "v": lambda m, l: m.layers[l].attention.q_v,
+        "p": lambda m, l: m.layers[l].attention.q_p,
+        "a": lambda m, l: m.layers[l].attention.q_a,
+        # q_o / q_xo *are* the residual-stream site (x_quant), shared by
+        # construction in MultiHeadAttention.__init__.
+        "x": lambda m, l: m.layers[l].attention.q_o,
+        "o": lambda m, l: m.layers[l].attention.q_o,
+        "xo": lambda m, l: m.layers[l].attention.q_xo,
+        "x1": lambda m, l: m.layers[l].q_x1,
+        "h": lambda m, l: m.layers[l].q_h,
+        "hr": lambda m, l: m.layers[l].q_hr,
+        "f": lambda m, l: m.layers[l].q_f,
+        "x2": lambda m, l: m.layers[l].q_x2,
+    }
+
+    def __init__(self, model: transformer.Model):
+        super().__init__(len(model.layers))
+        self.learned = [
+            {s: float(get(model, li).scale.detach().abs()) for s, get in self._SITES.items()}
+            for li in range(len(model.layers))
+        ]
+
+    def scale(self, layer: int, site: str) -> float:
+        s = self.learned[layer].get(site)
+        return s if (s is not None and s > 0) else super().scale(layer, site)
+
+
+def has_qat_scales(model: transformer.Model) -> bool:
+    """True if this checkpoint was trained with the ActQuant sites in place."""
+    return any(isinstance(m, transformer.ActQuant) for m in model.modules())
+
+
 # =============================================================================
 # 3. Derive the requant words.
 # =============================================================================
@@ -512,10 +566,22 @@ def derive_layer(model: transformer.Model, li: int, cal: Calibration,
 
 @torch.no_grad()
 def prepare(model: transformer.Model, calib_tokens: torch.Tensor,
-            dyt_fixed: bool = True) -> QuantModel:
-    """Checkpoint + calibration set -> everything the device would be loaded with."""
+            dyt_fixed: bool = True, use_qat: bool | None = None) -> QuantModel:
+    """Checkpoint + calibration set -> everything the device would be loaded with.
+
+    ``use_qat`` picks where the activation scales come from: the checkpoint's
+    learned LSQ scales (the default whenever it has them) or absmax over the
+    calibration set. The calibration forward runs either way — the saturation
+    and dynamic-range diagnostics need the tensors regardless.
+    """
     model.eval()
+    if use_qat is None:
+        use_qat = has_qat_scales(model)
     cal = calibrate(model, calib_tokens)
+    if use_qat:
+        qcal = QATCalibration(model)
+        qcal.m = cal.m                 # keep the measured absmax for the report
+        cal = qcal
     L = len(model.layers)
     s_x_all = residual_scales(model, cal, dyt_fixed)
 
@@ -745,7 +811,8 @@ class Report:
 def benchmark(model: transformer.Model, n_problems: int = 256, n_calib: int = 128,
               max_tokens: int = 32, max_digits: int = 5, dyt_fixed: bool = True,
               eval_seed: int = 1234, calib_seed: int = 99,
-              batch: int = 64, fake_quant: bool = False) -> Report:
+              batch: int = 64, fake_quant: bool = False,
+              use_qat: bool | None = None) -> Report:
     """Float baseline vs the integer pipeline, on the same problems.
 
     The calibration set is drawn from a different seed than the evaluation set,
@@ -758,10 +825,17 @@ def benchmark(model: transformer.Model, n_problems: int = 256, n_calib: int = 12
     _, tok_c, _ = make_batch(n_calib, calib_seed, max_tokens, max_digits)
     tgt = tok_e[:, ANS:]
 
-    pred_f = predictions(model(tok_e, msk_e))
-    seq_f, tok_f = score(pred_f, tgt)
-
-    qm = prepare(model, tok_c, dyt_fixed=dyt_fixed)
+    # The float baseline has to be the *unquantized* network. On a QAT
+    # checkpoint the ActQuant sites are live by default, so calling the model
+    # directly would score the fake-quantized model and call it "float" —
+    # flattering the comparison by moving the baseline, not the result.
+    transformer.set_quant_enabled(model, False)
+    try:
+        pred_f = predictions(model(tok_e, msk_e))
+        seq_f, tok_f = score(pred_f, tgt)
+        qm = prepare(model, tok_c, dyt_fixed=dyt_fixed, use_qat=use_qat)
+    finally:
+        transformer.set_quant_enabled(model, True)
 
     stats: dict = {}
     preds = []
@@ -877,6 +951,10 @@ def main(argv=None) -> int:
                     help="fixed pins a DyT output to 1/127, so the requant's clip IS "
                          "the hardtanh; calibrated uses absmax/127 instead, which gives "
                          "finer resolution when DyT never saturates but can clip early")
+    ap.add_argument("--scales", choices=["auto", "qat", "calib"], default="auto",
+                    help="where activation scales come from: the checkpoint's learned "
+                         "LSQ scales, absmax over the calibration set, or auto (qat "
+                         "whenever the checkpoint has them)")
     ap.add_argument("--words", action="store_true", help="print the requant words")
     ap.add_argument("--dynamic-range", action="store_true",
                     help="print the median/max diagnostic per site")
@@ -904,7 +982,13 @@ def main(argv=None) -> int:
 
     if args.check:
         _, tok, msk = make_batch(8, 7, args.max_tokens, args.max_digits)
-        d = check_instrumented(model, tok, msk)
+        # instrumented_forward is the *float* forward written inline, so the
+        # comparison is only meaningful with the QAT sites off.
+        transformer.set_quant_enabled(model, False)
+        try:
+            d = check_instrumented(model, tok, msk)
+        finally:
+            transformer.set_quant_enabled(model, True)
         print(f"  instrumented forward vs Model.forward: max|diff| = {d:.3e}")
         if d > 1e-3:
             print("  !! they disagree; calibration would describe a different network")
@@ -913,7 +997,8 @@ def main(argv=None) -> int:
     rep = benchmark(model, n_problems=args.problems, n_calib=args.calib,
                     max_tokens=args.max_tokens, max_digits=args.max_digits,
                     dyt_fixed=(args.dyt_scale == "fixed"), batch=args.batch,
-                    fake_quant=args.fake_quant)
+                    fake_quant=args.fake_quant,
+                    use_qat={"auto": None, "qat": True, "calib": False}[args.scales])
 
     if args.words:
         report_words(rep.qm)
@@ -925,8 +1010,16 @@ def main(argv=None) -> int:
     print(f"\naccuracy over {rep.n_problems} problems (T={args.max_tokens}, "
           f"answer region [{ANS}, {args.max_tokens})):")
     print(f"  {'':22s} {'exact-sequence':>15s} {'token':>9s}")
-    print(f"  {'float':22s} {rep.float_seq * 100:14.2f}% {rep.float_tok * 100:8.2f}%")
+    print(f"  {'float (quant off)':22s} {rep.float_seq * 100:14.2f}% {rep.float_tok * 100:8.2f}%")
     print(f"  {'int8 activations':22s} {rep.int_seq * 100:14.2f}% {rep.int_tok * 100:8.2f}%")
+    if has_qat_scales(model):
+        # On a QAT checkpoint the float row is not an upper bound and a drop
+        # from it is not a loss: the quantizers were present during training, so
+        # the clipping is part of the function that was fitted. Removing them
+        # gives a network the weights were never trained for.
+        print("  (QAT checkpoint: the quantizers are part of the trained model, so the "
+              "float\n   row is a different network, not a ceiling — compare against "
+              "the cross-check.)")
     if rep.fq_seq is not None:
         print(f"  {'  same scheme, float':22s} {rep.fq_seq * 100:14.2f}% "
               f"{rep.fq_tok * 100:8.2f}%   <- cross-check")

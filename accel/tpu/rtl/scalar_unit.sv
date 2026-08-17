@@ -148,22 +148,22 @@ module scalar_unit #(
         OP_MATMUL  = 6'h00,  // MXU : act=r[src0], weight=r[src1], out=r[dst];
                              //       flags[0]=accumulate, flags[1]=requant,
                              //       requant {M0,N} word addr from cfg[CFG_SCALAR]
-        OP_VECDOT  = 6'h01,  // VPU : out=r[dst] = Σ r[src0]·r[src1]
-        OP_VECMUL  = 6'h02,  // VPU : r[dst] = r[src0] × scalar r[src1]
+        // 0x02, 0x05, 0x0A-0x0F, 0x1B and 0x20 are **retired**: vecmul, gelu,
+        // vecemul, square, exp, redmax, redsum, sadd, sdiv and softmax were
+        // removed with the VPU datapath that implemented them (see vpu.sv's
+        // header). They are left as holes rather than reused so an old binary
+        // decodes to nothing rather than to a different op.
+        OP_VECDOT  = 6'h01,  // VPU : out=r[dst] = Σ r[src0]·r[src1].
+                             //       The shipped model never issues this, but
+                             //       it is VOP_VECMATMUL's inner primitive, so
+                             //       the datapath is there regardless and the
+                             //       opcode costs one decode arm.
         OP_VECADD  = 6'h03,  // VPU : r[dst] = r[src0] + r[src1]
         OP_RELU    = 6'h04,  // VPU : r[dst] = relu(r[src0])
-        OP_GELU    = 6'h05,  // VPU : r[dst] = gelu(r[src0])
         OP_WRMEM   = 6'h06,  // DMA : scratch r[src0] -> DRAM r[src1]
         OP_RDMEM   = 6'h07,  // DMA : DRAM r[src0] -> scratch r[dst]
         OP_WRNEIGH = 6'h08,  // LINK: DRAM r[src0] -> neighbor DRAM r[src1], dir=flags
         OP_REQUANT = 6'h09,  // VPU : r[dst] = requant(r[src0], {n,m0}=r[src1])
-        OP_VECEMUL = 6'h0A,  // VPU : r[dst] = r[src0] (.) r[src1]   (elementwise mul)
-        OP_SQUARE  = 6'h0B,  // VPU : r[dst] = r[src0]^2             (LayerNorm var)
-        OP_EXP     = 6'h0C,  // VPU : r[dst] = exp_lut(r[src0])      (softmax)
-        OP_REDMAX  = 6'h0D,  // VPU : r[dst] = max_i r[src0][i]      (softmax/stats)
-        OP_REDSUM  = 6'h0E,  // VPU : r[dst] = Σ_i r[src0][i]       (softmax/LN mean)
-        OP_SADD    = 6'h0F,  // VPU : r[dst] = r[src0] + scalar r[src1]  (x-max / x-mean)
-        OP_SDIV    = 6'h1B,  // VPU : r[dst] = r[src0] / scalar r[src1]  (Q15; softmax/LN)
         OP_ADDS    = 6'h10,  // r[dst] = r[src0] + r[src1]
         OP_SUBS    = 6'h11,  // r[dst] = r[src0] - r[src1]   (support op)
         OP_MULS    = 6'h12,  // r[dst] = r[src0] * r[src1]   (low XLEN bits)
@@ -176,14 +176,8 @@ module scalar_unit #(
         OP_JMP     = 6'h19,  // pc = imm16                   (support op)
         OP_WAIT    = 6'h1A,  // block on unit flags{0:MXU,1:VPU,2:DMA,3:LINK}
         OP_SETCFGR = 6'h1C,  // cfg[dst] = r[src0]   (register -> config)
-        // First opcode past the original 0x00-0x1F block. The field is 6 bits,
-        // so 0x20-0x3E are free; HALT keeps 0x1F.
-        OP_SOFTMAX = 6'h20,  // VPU : macro op — row-wise softmax, Q15 result.
-                             //       dst=r[dst], src=r[src0], tmp=r[src1];
-                             //       rows from cfg vrows, row length from vlen,
-                             //       requant {m0,n} from cfg vscalar. The tmp
-                             //       row needs vlen+4 bytes: the trailing int32
-                             //       is where the denominator is parked.
+        // Past the original 0x00-0x1F block. The field is 6 bits, so 0x22-0x3E
+        // are free (0x20 is a retired hole, not reusable); HALT keeps 0x1F.
         OP_DYT     = 6'h21,  // VPU : r[dst] = dyt(r[src0], {n,m0}=r[src1]).
                              //       Same operands and same fixed point as
                              //       REQUANT, symmetric +-127 clip: DyT's
@@ -214,16 +208,14 @@ module scalar_unit #(
     // port; this only muxes its data source.
 
     // VPU op selector values driven on vpu_op (must match vpu.sv VOP_* codes).
-    // 5 bits, not 4: codes 0..12 were already assigned and the macro ops
-    // (docs/macro_ops.md §5) would have landed the field exactly full, leaving
-    // no room to add another. Widening costs three port declarations.
+    // Still 5 bits even though only six codes survive the VPU trim: the values
+    // themselves were left where they were so vpu.sv, iss.py and the assembler
+    // needed no re-synchronization, and VOP_DYT is 16. Compacting the encoding
+    // would save two flops on this bus and cost a four-way rename.
     localparam logic [4:0]
-        VOP_DOT = 5'd0, VOP_ADD = 5'd1, VOP_MUL = 5'd2, VOP_RELU = 5'd3, VOP_GELU = 5'd4,
-        VOP_SQUARE = 5'd5, VOP_EXP = 5'd6, VOP_REDUCEMAX = 5'd7, VOP_REDUCESUM = 5'd8,
-        VOP_ELEMENT_MUL = 5'd9, VOP_REQUANT = 5'd10, VOP_SCALAR_ADD = 5'd11,
-        VOP_SCALAR_DIV = 5'd12, VOP_VECMATMUL = 5'd13,
-        VOP_SOFTMAX = 5'd14,   // VOP_SM_EXP (15) is internal to vpu.sv
-        VOP_DYT = 5'd16;
+        VOP_DOT = 5'd0,        // vpu.sv-internal: vecmatmul's inner primitive
+        VOP_ADD = 5'd1, VOP_RELU = 5'd3, VOP_REQUANT = 5'd10,
+        VOP_VECMATMUL = 5'd13, VOP_DYT = 5'd16;
 
     // Named config registers (host-, SETCFG- or SETCFGR-written; scalar_unit.md
     // §6). 0..3 are the original set; 4..13 carry the macro ops' geometry
@@ -238,8 +230,15 @@ module scalar_unit #(
         CFG_AROW   = 'd6, // MXU activation row stride, bytes (= K)
         CFG_CROW   = 'd7, // MXU result row stride, bytes (= N*4, or N requantized)
         CFG_WCOL   = 'd8, // MXU weight column stride, bytes (= K*2/8)
-        CFG_VSCALAR= 'd9, // VPU macro-op {m0,n} word address (NOT CFG_SCALAR:
-                          //   the MXU's is live at the same time)
+        CFG_VSCALAR= 'd9, // **retired, slot reserved.** Was the VPU macro-op
+                          //   {m0,n} word address, read only by OP_SOFTMAX,
+                          //   which needed it because its three register
+                          //   operands were dst/src/tmp with no slot left over.
+                          //   Nothing reads it now that softmax is gone, so
+                          //   synthesis trims the register — but the *index*
+                          //   stays put, because renumbering 10..19 would
+                          //   silently repoint every `setcfg` in every existing
+                          //   program and in the assembler's cfg table.
         CFG_VROWS  = 'd10,// VPU macro-op row count (vecmatmul: query rows)
         CFG_VCOLS  = 'd11,// vecmatmul key rows — independent of VROWS so decode
                           //   (1 x t+1) and prefill (T x T) are the same op
@@ -388,31 +387,19 @@ module scalar_unit #(
 
     assign vpu_src0   = r_src0[ADDR_W-1:0];
     assign vpu_src1   = r_src1[ADDR_W-1:0];
-    // VECMUL/SADD scalar, SDIV divisor, REQUANT {n,m0} addr — normally the third
-    // register operand. SOFTMAX is the exception: its three registers are
-    // dst/src/tmp, so there is no operand slot left for the requant word and it
-    // comes from cfg vscalar instead (docs/macro_ops.md §5.1).
-    assign vpu_scalar = (opc == OP_SOFTMAX) ? cfg[CFG_VSCALAR][ADDR_W-1:0]
-                                            : r_src1[ADDR_W-1:0];
+    // REQUANT/DYT {n,m0} address — always the third register operand now that
+    // OP_SOFTMAX, the one op that had no free slot for it and read cfg vscalar
+    // instead, is gone.
+    assign vpu_scalar = r_src1[ADDR_W-1:0];
     assign vpu_dst    = r_dst [ADDR_W-1:0];
     always_comb begin
         unique case (opc)
             OP_VECMM:   vpu_op = VOP_VECMATMUL;
-            OP_SOFTMAX: vpu_op = VOP_SOFTMAX;
             OP_VECDOT:  vpu_op = VOP_DOT;
             OP_VECADD:  vpu_op = VOP_ADD;
-            OP_VECMUL:  vpu_op = VOP_MUL;
             OP_RELU:    vpu_op = VOP_RELU;
-            OP_GELU:    vpu_op = VOP_GELU;
-            OP_SQUARE:  vpu_op = VOP_SQUARE;
-            OP_EXP:     vpu_op = VOP_EXP;
-            OP_REDMAX:  vpu_op = VOP_REDUCEMAX;
-            OP_REDSUM:  vpu_op = VOP_REDUCESUM;
-            OP_VECEMUL: vpu_op = VOP_ELEMENT_MUL;
             OP_REQUANT: vpu_op = VOP_REQUANT;   // in=r[src0], {n,m0}=r[src1], out=r[dst]
             OP_DYT:     vpu_op = VOP_DYT;       // same operands, symmetric clip
-            OP_SADD:    vpu_op = VOP_SCALAR_ADD; // in=r[src0], scalar=r[src1], out=r[dst]
-            OP_SDIV:    vpu_op = VOP_SCALAR_DIV; // in=r[src0], divisor=r[src1], out=r[dst]
             default:    vpu_op = VOP_DOT;
         endcase
     end
@@ -445,12 +432,8 @@ module scalar_unit #(
     // Every op that dispatches to the VPU (declared first: is_dispatch and
     // dispatch_unit below both call it).
     function automatic logic is_vpu_op(input logic [5:0] o);
-        return (o == OP_VECDOT)  || (o == OP_VECMUL)  || (o == OP_VECADD)   ||
-               (o == OP_RELU)    || (o == OP_GELU)    || (o == OP_SQUARE)   ||
-               (o == OP_EXP)     || (o == OP_REDMAX)  || (o == OP_REDSUM)   ||
-               (o == OP_VECEMUL) || (o == OP_REQUANT) || (o == OP_SADD)     ||
-               (o == OP_SDIV)    || (o == OP_VECMM)   || (o == OP_SOFTMAX)  ||
-               (o == OP_DYT);
+        return (o == OP_VECDOT) || (o == OP_VECADD) || (o == OP_RELU) ||
+               (o == OP_REQUANT) || (o == OP_VECMM)  || (o == OP_DYT);
     endfunction
 
     // Is this opcode a compute/comms dispatch (assert start, then wait on done)?

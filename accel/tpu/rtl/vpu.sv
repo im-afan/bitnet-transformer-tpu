@@ -4,8 +4,28 @@
 //
 // Implements the block described in accel/tpu/docs/vpu.md: LANES int32 lanes fed
 // from a single wide scratchpad read/modify/write port (V_rw), computing every
-// pointwise / reduction op that is not a ternary-weight matmul (activations,
-// residual adds, vector*scalar, dot products, softmax/LayerNorm reductions).
+// pointwise / reduction op that is not a ternary-weight matmul.
+//
+// SCOPE. This unit implements exactly the six ops
+// accel/tpulang/examples/adder_model.tpu issues, and nothing else:
+//
+//     VOP_DOT  VOP_ADD  VOP_RELU  VOP_REQUANT  VOP_DYT  VOP_VECMATMUL
+//
+// VOP_DOT is the odd one out: no shipped kernel issues `vecdot`, but it is the
+// inner primitive VOP_VECMATMUL runs once per (row, col) pair, so its datapath
+// is not optional and keeping the opcode costs nothing.
+//
+// Everything else was removed deliberately (GELU, EXP, SQUARE, ELEMENT_MUL,
+// SCALAR_MUL/ADD/DIV, REDUCEMAX, REDUCESUM, SOFTMAX and its fused SM_EXP), along
+// with the two 256-entry activation ROMs and the restoring divider that only
+// SCALAR_DIV needed. They existed for a softmax-attention, LayerNorm, GELU-FFN
+// model; model/transformer.py is now ReLU attention, DyT normalization and a
+// ReLU feed-forward, so none of them had a caller. See docs/vpu.md §Removed ops
+// for the list and for what coming back would cost.
+//
+// **The reduction path is now sum-only.** VOP_DOT is the sole reduction, so
+// there is no max fold and `acc` always starts at zero. Restoring REDUCEMAX
+// means restoring both.
 //
 // Dispatched by the scalar unit (scalar_unit.sv) with the issue-and-wait
 // handshake: pulse `vpu_start`, then block on `vpu_done`. The op selector
@@ -17,8 +37,8 @@
 // instruction, VOP_REQUANT, which applies the BitNet fixed-point rescale
 // `clip((acc*m0 + round) >> n)` (the same math as requant.sv) with a per-tensor
 // {m0, n} read from the scalar operand. This lets the scalar unit keep the
-// residual stream / softmax temporaries wide and requantize only where an int8
-// activation is actually needed (e.g. before feeding the MXU).
+// residual stream wide and requantize only where an int8 activation is actually
+// needed (e.g. before feeding the MXU).
 //
 // DyT (VOP_DYT). Dynamic tanh — `hardtanh(alpha*x, -1, 1)`, arxiv 2503.10622 —
 // is the normalization model/transformer.py uses in place of LayerNorm, and on
@@ -33,24 +53,9 @@
 // all is what lets a kernel say "this is a normalization" instead of "this is a
 // rescale that happens to clip". See accel/tpulang/adder_kernel.md §4.
 //
-// Broadcast scalar ops. VOP_SCALAR_ADD / VOP_SCALAR_MUL / VOP_SCALAR_DIV read one
-// int32 word from `vpu_scalar` (once, on the first chunk) and apply it to every
-// lane — the broadcast forms softmax's `x - max` and LayerNorm's `x - mean` need.
-// Dividing by a *runtime* scalar (softmax's Σexp, LayerNorm's variance) cannot be
-// a compile-time {m0, n} like REQUANT, so VOP_SCALAR_DIV reciprocates the divisor
-// once into R = 2**RECIP_Q / |d| using a single shared restoring divider
-// (RECIP_Q+1 cycles, amortized over the whole vector) and then reuses each lane's
-// existing 8x32 multiplier. The result is emitted in a *fixed* Q(DIV_Q) format,
-// `dst[i] = round(src0[i] * 2**DIV_Q / d)`: pinning the format in hardware is what
-// keeps the result's scale known at compile time even though the divisor is not,
-// so the compiler can requantize a division like any other int32 buffer.
-//
-// Activation LUTs. GELU/EXP are 256-entry int8 tables indexed by the signed input
-// byte, generated on the host at a *canonical* input scale (accel/tpulang/luts.py
-// writes rtl/luts/{gelu,exp}_lut.hex) rather than per-program — the table *is* the
-// op's numerics, so it is a fixed hardware artifact and getting an operand into
-// the table's input scale is the compiler's job (an ordinary REQUANT ahead of the
-// op). Both assume in_scale = 1/16. See vpu.md §Activation LUTs.
+// The scalar operand. VOP_REQUANT and VOP_DYT are the only ops left that read
+// `vpu_scalar`, and both read the same thing: one int32 {m0, n} word, loaded once
+// on the first chunk and held for the whole vector.
 //
 // Streaming: a vector of `vpu_vlen` elements is processed LANES elements at a
 // time. Each chunk reads its operand(s), computes all lanes in one cycle, then
@@ -71,18 +76,7 @@ module vpu #(
     parameter int SCRATCHPAD_W = 64,  // scratchpad port width in bytes (512-bit port)
     parameter int ADDR_W       = 16,  // scratchpad byte-address width
     parameter int M0_W         = 12,  // requant fixed-point multiplier width (requant.sv)
-    parameter int N_W          = 4,   // requant shift width
-    // VOP_SCALAR_DIV fixed-point. The divisor is reciprocated to R = 2**RECIP_Q /
-    // |d| (RECIP_Q-bit unsigned) and each quotient is emitted in Q(DIV_Q): dst[i]
-    // = round(src0[i] * 2**DIV_Q / d). DIV_Q pins the result scale at compile time
-    // (see vpu.md §Divide); RECIP_Q carries enough reciprocal precision for it.
-    parameter int RECIP_Q      = 31,  // reciprocal numerator exponent (2**RECIP_Q / |d|)
-    parameter int DIV_Q        = 15,  // quotient fractional bits (Q15 result)
-    // Host-generated activation LUTs (256 x int8), indexed by the signed input
-    // byte. Left empty by default; a top-level with real activations points
-    // these at $readmemh files generated from the reference model.
-    parameter     GELU_INIT    = "",
-    parameter     EXP_INIT     = ""
+    parameter int N_W          = 4    // requant shift width
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -92,7 +86,7 @@ module vpu #(
     input  logic [4:0]           vpu_op,
     input  logic [ADDR_W-1:0]    vpu_src0,
     input  logic [ADDR_W-1:0]    vpu_src1,
-    input  logic [ADDR_W-1:0]    vpu_scalar,   // SCALAR_MUL multiplier / REQUANT {n,m0}
+    input  logic [ADDR_W-1:0]    vpu_scalar,   // REQUANT / DYT {n,m0} word address
     input  logic [ADDR_W-1:0]    vpu_dst,
     input  logic [9:0]           vpu_vlen,     // vector length in elements
     // ---- Macro-op geometry (config registers; docs/macro_ops.md §5) --------
@@ -120,68 +114,40 @@ module vpu #(
     localparam int LANES = SCRATCHPAD_W / 4;   // int32 lanes per access (512b -> 16)
     localparam int ACC_W = 32;
     localparam int RQ_W  = 48;                 // requant intermediate width (headroom)
-    // Reciprocal / divide intermediate width: a8 (int8) * R (RECIP_Q+1 bits),
-    // plus a sign bit and rounding headroom.
-    localparam int DIV_W = RECIP_Q + 12;
 
-    // Op encoding (codes 0..4 match VOP_* in scalar_unit.sv).
+    // Op encoding. The surviving codes keep the values they had before the
+    // unused ops were removed, so vpu.sv, scalar_unit.sv, iss.py and the
+    // assembler need no re-synchronization; the gaps are retired opcodes. The
+    // field stays 5 bits because VOP_DYT is 16 — compacting the encoding would
+    // save two flops on the dispatch bus and cost a four-way rename.
     localparam logic [4:0]
-        VOP_DOT         = 5'd0,
+        VOP_DOT         = 5'd0,   // also VOP_VECMATMUL's inner primitive
         VOP_ADD         = 5'd1,
-        VOP_SCALAR_MUL  = 5'd2,
         VOP_RELU        = 5'd3,
-        VOP_GELU        = 5'd4,
-        VOP_SQUARE      = 5'd5,
-        VOP_EXP         = 5'd6,
-        VOP_REDUCEMAX   = 5'd7,
-        VOP_REDUCESUM   = 5'd8,
-        VOP_ELEMENT_MUL = 5'd9,
         VOP_REQUANT     = 5'd10,
-        VOP_SCALAR_ADD  = 5'd11,   // dst[i] = src0[i] + scalar   (broadcast add)
-        VOP_SCALAR_DIV  = 5'd12,   // dst[i] = round(src0[i] * 2**DIV_Q / scalar)
-        // ---- Macro ops (docs/macro_ops.md §5) -------------------------------
-        // Sequenced internally out of the primitives above. No new datapath: the
-        // wrapper re-runs the existing inner FSM with different operand
-        // addresses, which is why these cost counters rather than lanes.
+        // ---- Macro op (docs/macro_ops.md §5) --------------------------------
+        // Sequenced internally out of VOP_DOT. No new datapath: the wrapper
+        // re-runs the existing inner FSM with different operand addresses,
+        // which is why it costs counters rather than lanes.
         VOP_VECMATMUL   = 5'd13,   // S[t][s] = Σ_d src0[t][d]·src1[s][d]
-        VOP_SOFTMAX     = 5'd14,   // row-wise softmax, Q(DIV_Q) result
-        // Internal only — the fused pass 2 of VOP_SOFTMAX, never dispatched by
-        // the scalar unit. Reads int8, subtracts the row max held in `sm_max`,
-        // requantizes into the exp table's input scale, and stores the table
-        // entry as **int8**. Fusing the three is what makes the intermediate
-        // narrow, which is what makes pass 3's int8 read correct by
-        // construction: writing int32 here and reading int8 there is precisely
-        // the latent stride bug in softmax_row.tpu (its `sadd` writes at
-        // 4-byte stride and its `exp` reads at 1-byte stride).
-        VOP_SM_EXP      = 5'd15,
         // dst[i] = clip_pm127((src0[i]*m0 + round) >> n) — DyT / hardtanh.
         // int32 in, int8 out, {m0,n} from the scalar operand, exactly like
         // VOP_REQUANT; see the header note for why the clip is symmetric.
         VOP_DYT         = 5'd16;
 
     // -------------------------------------------------------------------------
-    // Activation LUTs (256 x int8). Preloaded on the host from the reference.
-    // -------------------------------------------------------------------------
-    logic signed [7:0] gelu_rom [0:255];
-    logic signed [7:0] exp_rom  [0:255];
-    initial begin
-        if (GELU_INIT != "") $readmemh(GELU_INIT, gelu_rom);
-        if (EXP_INIT  != "") $readmemh(EXP_INIT,  exp_rom);
-    end
-
-    // -------------------------------------------------------------------------
     // Op-class helpers.
     // -------------------------------------------------------------------------
     function automatic logic needs_src1(input logic [4:0] o);
-        return (o == VOP_DOT) || (o == VOP_ADD) || (o == VOP_ELEMENT_MUL);
+        return (o == VOP_DOT) || (o == VOP_ADD);
     endfunction
     function automatic logic needs_scalar(input logic [4:0] o);
-        return (o == VOP_SCALAR_MUL) || (o == VOP_REQUANT) ||
-               (o == VOP_SCALAR_ADD) || (o == VOP_SCALAR_DIV) ||
-               (o == VOP_SM_EXP)     || (o == VOP_DYT);
+        return (o == VOP_REQUANT) || (o == VOP_DYT);
     endfunction
+    // Sum-only since REDUCEMAX/REDUCESUM were removed; VOP_DOT is the only
+    // reduction left, so `acc` never needs a most-negative initial value.
     function automatic logic is_reduction(input logic [4:0] o);
-        return (o == VOP_DOT) || (o == VOP_REDUCESUM) || (o == VOP_REDUCEMAX);
+        return (o == VOP_DOT);
     endfunction
 
     // int32 -> int8 requantize: clip((acc*m0 + round) >> n). Mirrors requant.sv,
@@ -218,7 +184,7 @@ module vpu #(
     // FSM.
     // -------------------------------------------------------------------------
     typedef enum logic [3:0] {
-        S_IDLE, S_RD0, S_RD0D, S_RD1, S_RD1D, S_RDS, S_RDSD, S_RECIP, S_EXEC, S_WB, S_DONE
+        S_IDLE, S_RD0, S_RD0D, S_RD1, S_RD1D, S_RDS, S_RDSD, S_EXEC, S_WB, S_DONE
     } state_t;
     state_t state, state_n;
 
@@ -230,34 +196,18 @@ module vpu #(
     logic [10:0]       remaining;               // elements left to process (0..1024)
     logic              scalar_loaded;
 
-    logic [ACC_W-1:0]  scalar_reg;              // SCALAR_MUL multiplier / REQUANT {n,m0}
-    logic signed [ACC_W-1:0] acc;               // reduction accumulator
-
-    // Reciprocal unit (VOP_SCALAR_DIV): one shared restoring divider computing
-    // R = floor(2**RECIP_Q / |scalar|) in RECIP_Q+1 steps after the scalar loads.
-    // A div-by-zero saturates R to all-ones (largest representable reciprocal).
-    logic [RECIP_Q:0]   recip_R;   // reciprocal magnitude, held across all chunks
-    logic               div_neg;   // sign of the divisor (applied per lane in EXEC)
-    logic [RECIP_Q+1:0] div_rem;   // running remainder (headroom for the shift)
-    logic [RECIP_Q:0]   div_quot;  // quotient built MSB-first
-    logic [RECIP_Q:0]   div_n;     // numerator shift register (2**RECIP_Q, then <<1)
-    logic [ACC_W-1:0]   div_d;     // |divisor|
-    logic [5:0]         div_cnt;   // iterations remaining
-
-    // One restoring-division step, shared by every S_RECIP cycle.
-    wire [RECIP_Q+1:0] div_rem_sh = {div_rem[RECIP_Q:0], div_n[RECIP_Q]};
-    wire               div_ge     = (div_rem_sh >= {1'b0, div_d});
+    logic [ACC_W-1:0]  scalar_reg;              // REQUANT / DYT {n,m0}
+    logic signed [ACC_W-1:0] acc;               // reduction accumulator (sum only)
 
     // Requant parameters (valid once scalar_reg is loaded).
     wire [M0_W-1:0] rq_m0 = scalar_reg[M0_W-1:0];
     wire [N_W-1:0]  rq_n  = scalar_reg[M0_W +: N_W];
 
-    // Element widths are per-op, and the two are independent: most compute ops
-    // read int8 and write int32; REQUANT reads int32 and writes int8; SM_EXP
-    // reads int8 and writes int8. src1 is always an int8 vector (binary ops).
+    // Element widths are per-op, and the two are independent: ADD/RELU/DOT read
+    // int8 and write int32; REQUANT and DYT read int32 and write int8. src1 is
+    // always an int8 vector (binary ops).
     wire src0_is32   = (op_r == VOP_REQUANT) || (op_r == VOP_DYT);
-    wire dst_is8     = (op_r == VOP_REQUANT) || (op_r == VOP_SM_EXP) ||
-                       (op_r == VOP_DYT);
+    wire dst_is8     = (op_r == VOP_REQUANT) || (op_r == VOP_DYT);
     wire [ADDR_W-1:0] src0_stride = src0_is32 ? ADDR_W'(LANES*4) : ADDR_W'(LANES);
     wire [ADDR_W-1:0] src1_stride = ADDR_W'(LANES);
     wire [ADDR_W-1:0] dst_stride  = dst_is8   ? ADDR_W'(LANES)   : ADDR_W'(LANES*4);
@@ -300,69 +250,6 @@ module vpu #(
     wire [ADDR_W-1:0] mm_d_next = mm_s_last ? (mm_d_row + mm_crow)
                                             : (mm_d_ptr + ADDR_W'(4));
 
-    // -------------------------------------------------------------------------
-    // softmax macro-op state.
-    //
-    // Four passes over each row, sequenced here rather than by the program:
-    //
-    //   P0  REDUCEMAX  over src row (int8)   -> `sm_max` register (no store)
-    //   P1  SM_EXP     over src row (int8)   -> tmp row (int8), fused
-    //                                           (x-max) -> requant -> exp LUT
-    //   P2  REDUCESUM  over tmp row (int8)   -> tmp row + vlen (int32, stored)
-    //   P3  SCALAR_DIV over tmp row (int8)   -> dst row (int32, Q(DIV_Q))
-    //
-    // Two deliberate choices:
-    //
-    //  * The row max stays in a register. It is needed *inside* P1's datapath
-    //    while `scalar_reg` is already holding the requant {m0,n}, so it cannot
-    //    share that register — and keeping it here is what removes the
-    //    loads/subs/stores scalar bridge the software version needs.
-    //
-    //  * The denominator is stored to scratchpad, at the 4 bytes just past the
-    //    tmp row. That costs one int32 per row and buys P3 the *existing*
-    //    SCALAR_DIV path unchanged — divisor load, shared reciprocal, Q(DIV_Q)
-    //    output — instead of a second way to seed the divider. The caller must
-    //    therefore size each tmp row as vlen bytes + 4.
-    // -------------------------------------------------------------------------
-    logic              sm_active;
-    logic [1:0]        sm_phase;
-    logic [15:0]       sm_rows, sm_t;
-    logic [9:0]        sm_vlen;
-    logic [ADDR_W-1:0] sm_row0, sm_row1, sm_crow;
-    logic [ADDR_W-1:0] sm_src_base, sm_tmp_base, sm_dst_base;  // current row
-    logic [ADDR_W-1:0] sm_scalar_base;                         // cfg vscalar ({m0,n})
-    logic signed [ACC_W-1:0] sm_max;                           // row max, P0 -> P1
-
-    wire sm_last_row  = ((sm_t + 16'd1) == sm_rows);
-    wire sm_last_pass = (sm_phase == 2'd3);
-    // Where P2 parks the denominator: one int32 immediately after the tmp row.
-    wire [ADDR_W-1:0] sm_den_addr = sm_tmp_base + ADDR_W'(sm_vlen);
-
-    // Next pass / next row, combinational so the sequential block can commit the
-    // phase counter and everything derived from it in one cycle.
-    wire [1:0]  sm_phase_next = sm_last_pass ? 2'd0 : (sm_phase + 2'd1);
-    wire [15:0] sm_t_next     = sm_last_pass ? (sm_t + 16'd1) : sm_t;
-    wire [ADDR_W-1:0] sm_src_next = sm_last_pass ? (sm_src_base + sm_row0) : sm_src_base;
-    wire [ADDR_W-1:0] sm_tmp_next = sm_last_pass ? (sm_tmp_base + sm_row1) : sm_tmp_base;
-    wire [ADDR_W-1:0] sm_dst_next = sm_last_pass ? (sm_dst_base + sm_crow) : sm_dst_base;
-    wire [ADDR_W-1:0] sm_den_next = sm_tmp_next + ADDR_W'(sm_vlen);
-
-    wire [4:0] sm_op_next = (sm_phase_next == 2'd0) ? VOP_REDUCEMAX :
-                            (sm_phase_next == 2'd1) ? VOP_SM_EXP    :
-                            (sm_phase_next == 2'd2) ? VOP_REDUCESUM :
-                                                      VOP_SCALAR_DIV;
-    // P0/P1 read the source row; P2/P3 read the exp values in tmp.
-    wire [ADDR_W-1:0] sm_src0_next = (sm_phase_next <= 2'd1) ? sm_src_next : sm_tmp_next;
-    // P0 does not store (its result is captured into sm_max); P1 writes tmp,
-    // P2 the denominator, P3 the final row.
-    wire [ADDR_W-1:0] sm_dst_next_a = (sm_phase_next == 2'd1) ? sm_tmp_next :
-                                      (sm_phase_next == 2'd2) ? sm_den_next :
-                                      (sm_phase_next == 2'd3) ? sm_dst_next :
-                                                                sm_tmp_next;
-    // P1's scalar is the requant {m0,n}; P3's is the denominator P2 just wrote.
-    wire [ADDR_W-1:0] sm_scal_next = (sm_phase_next == 2'd1) ? sm_scalar_base
-                                                             : sm_den_next;
-
     // Operand chunk registers (full port width; interpreted per element size).
     logic [SCRATCHPAD_W*8-1:0] V_data0;
     logic [SCRATCHPAD_W*8-1:0] V_data1;
@@ -375,74 +262,40 @@ module vpu #(
     logic        [7:0]       res8  [0:LANES-1];    // int8 requant result
     logic signed [ACC_W-1:0] red_val [0:LANES-1];  // per-lane value into reduction
 
-    localparam int DIV_SHIFT = RECIP_Q - DIV_Q;   // post-multiply right shift
-
     logic signed [7:0]       a8;
     logic signed [7:0]       b8;
-    logic        [7:0]       idx8;    // unsigned byte for LUT indexing
     logic signed [ACC_W-1:0] a32;
-    logic signed [DIV_W-1:0] div_prod;   // a8 * reciprocal, pre-shift
-    logic signed [DIV_W-1:0] div_q;      // rounded quotient magnitude
     always_comb begin
-        a8 = '0; b8 = '0; idx8 = '0; a32 = '0; div_prod = '0; div_q = '0;
+        a8 = '0; b8 = '0; a32 = '0;
         for (int l = 0; l < LANES; l++) begin
             a8   = V_data0[l*8  +: 8];
             b8   = V_data1[l*8  +: 8];
-            idx8 = V_data0[l*8  +: 8];
             a32  = V_data0[l*32 +: 32];
             lane_active[l] = (l < chunk_active);
             res32[l] = '0;
             res8[l]  = '0;
             red_val[l] = '0;
-            // round(a8 * 2**DIV_Q / |d|) = round((a8 * R) >> (RECIP_Q - DIV_Q)),
-            // then sign-corrected below. R is unsigned, so widen it through 0.
-            div_prod = $signed(a8) * $signed({1'b0, recip_R});
-            // The round term must be *signed*, else the sum goes unsigned and `>>>`
-            // degrades to a logical shift (mirrors requant8's signed `round`).
-            div_q    = (DIV_SHIFT == 0) ? div_prod
-                     : ((div_prod + $signed(DIV_W'(1) <<< (DIV_SHIFT - 1))) >>> DIV_SHIFT);
             unique case (op_r)
                 VOP_ADD:         res32[l] = ACC_W'(a8) + ACC_W'(b8);
-                VOP_ELEMENT_MUL: res32[l] = a8 * b8;
-                VOP_SCALAR_MUL:  res32[l] = a8 * $signed(scalar_reg);
-                VOP_SCALAR_ADD:  res32[l] = ACC_W'(a8) + $signed(scalar_reg);
-                VOP_SCALAR_DIV:  res32[l] = div_neg ? ACC_W'(-div_q) : ACC_W'(div_q);
                 VOP_RELU:        res32[l] = (a8 > 0) ? ACC_W'(a8) : '0;
-                VOP_SQUARE:      res32[l] = a8 * a8;
-                VOP_GELU:        res32[l] = ACC_W'(gelu_rom[idx8]);
-                VOP_EXP:         res32[l] = ACC_W'(exp_rom [idx8]);
                 VOP_REQUANT:     res8[l]  = requant8(a32, rq_m0, rq_n);
                 VOP_DYT:         res8[l]  = dyt8(a32, rq_m0, rq_n);
-                // Fused (x - max) -> requant -> exp LUT, stored narrow. The
-                // requant is not decoration: x-max is an int32-valued quantity
-                // and the table is indexed by a byte, so this is what lands the
-                // operand in the table's canonical 1/16 input scale *and* makes
-                // the index well-defined. `scalar_reg` holds {m0,n} here; the
-                // row max lives in its own register because both are needed at
-                // once.
-                VOP_SM_EXP:      res8[l]  = exp_rom[requant8(ACC_W'(a8) - sm_max,
-                                                             rq_m0, rq_n)];
                 VOP_DOT:         red_val[l] = a8 * b8;
-                VOP_REDUCESUM:   red_val[l] = ACC_W'(a8);
-                VOP_REDUCEMAX:   red_val[l] = ACC_W'(a8);
                 default: ;
             endcase
         end
     end
 
     // Reduction fold across active lanes, then combine with the accumulator.
-    logic signed [ACC_W-1:0] sum_chunk, max_chunk, acc_next;
+    // Sum only: VOP_DOT is the last reduction, so the max fold REDUCEMAX needed
+    // is gone and with it `acc`'s most-negative initial value.
+    logic signed [ACC_W-1:0] sum_chunk, acc_next;
     always_comb begin
         sum_chunk = '0;
-        max_chunk = {1'b1, {(ACC_W-1){1'b0}}};   // most-negative int32
         for (int l = 0; l < LANES; l++) begin
-            if (lane_active[l]) begin
-                sum_chunk += red_val[l];
-                if (red_val[l] > max_chunk) max_chunk = red_val[l];
-            end
+            if (lane_active[l]) sum_chunk += red_val[l];
         end
-        acc_next = (op_r == VOP_REDUCEMAX) ? ((max_chunk > acc) ? max_chunk : acc)
-                                           : (acc + sum_chunk);
+        acc_next = acc + sum_chunk;
     end
 
     // -------------------------------------------------------------------------
@@ -488,10 +341,7 @@ module vpu #(
                 V_wstrb = wb_strb;
             end
             S_WB: begin   // reduction result: one int32 scalar into low 4 bytes
-                // softmax P0 is the exception: its row max goes to `sm_max`, a
-                // register, so nothing is stored and no scratch address is
-                // needed for it.
-                V_we               = !(sm_active && sm_phase == 2'd0);
+                V_we               = 1'b1;
                 V_waddr            = dst_r;
                 V_wdata[ACC_W-1:0] = acc;
                 V_wstrb[3:0]       = 4'b1111;
@@ -519,25 +369,16 @@ module vpu #(
             S_RD1:  state_n = S_RD1D;
             S_RD1D: state_n = S_EXEC;
             S_RDS:  state_n = S_RDSD;
-            S_RDSD: if (op_r == VOP_SCALAR_DIV) state_n = S_RECIP;
-                    else                        state_n = S_EXEC;
-            S_RECIP: if (div_cnt == 6'd1) state_n = S_EXEC;
-                     else                 state_n = S_RECIP;
+            S_RDSD: state_n = S_EXEC;
             S_EXEC: begin
                         if (last_chunk) begin
-                            if (is_reduction(op_r))          state_n = S_WB;
-                            // A softmax pass that stores elementwise (P1, P3):
-                            // more passes or rows left means go round again.
-                            else if (sm_active &&
-                                     !(sm_last_pass && sm_last_row))
-                                                             state_n = S_RD0;
-                            else                             state_n = S_DONE;
+                            if (is_reduction(op_r)) state_n = S_WB;
+                            else                    state_n = S_DONE;
                         end else state_n = S_RD0;
                     end
             // A reduction's scalar store. For a macro op this is one (row,col)
             // pair finished: go straight back for the next one.
             S_WB:   if (mm_active && !mm_last) state_n = S_RD0;
-                    else if (sm_active)        state_n = S_RD0;
                     else                       state_n = S_DONE;
             S_DONE: state_n = S_IDLE;
             default: state_n = S_IDLE;
@@ -552,9 +393,6 @@ module vpu #(
             state         <= S_IDLE;
             op_r          <= '0;
             mm_active     <= 1'b0;
-            sm_active     <= 1'b0;
-            sm_phase      <= 2'd0;
-            sm_max        <= '0;
             dst_r         <= '0;
             p_src0        <= '0;
             p_src1        <= '0;
@@ -566,13 +404,6 @@ module vpu #(
             acc           <= '0;
             V_data0       <= '0;
             V_data1       <= '0;
-            recip_R       <= '0;
-            div_neg       <= 1'b0;
-            div_rem       <= '0;
-            div_quot      <= '0;
-            div_n         <= '0;
-            div_d         <= '0;
-            div_cnt       <= '0;
         end else begin
             state <= state_n;
 
@@ -582,26 +413,11 @@ module vpu #(
                     // only trace of the wrapper. A count of 0 reads as 1 so an
                     // unset config register degrades to a single pair rather
                     // than a dispatch that computes nothing.
-                    // A macro op enters as its first inner pass; `mm_active` /
-                    // `sm_active` are the only trace of the wrapper.
-                    op_r          <= (vpu_op == VOP_VECMATMUL) ? VOP_DOT
-                                   : (vpu_op == VOP_SOFTMAX)   ? VOP_REDUCEMAX
-                                   :                             vpu_op;
+                    // A macro op enters as its inner primitive; `mm_active` is
+                    // the only trace of the wrapper.
+                    op_r          <= (vpu_op == VOP_VECMATMUL) ? VOP_DOT : vpu_op;
                     mm_active     <= (vpu_op == VOP_VECMATMUL);
 
-                    sm_active      <= (vpu_op == VOP_SOFTMAX);
-                    sm_phase       <= 2'd0;
-                    sm_t           <= '0;
-                    sm_rows        <= (vpu_rows == '0) ? 16'd1 : vpu_rows;
-                    sm_vlen        <= vpu_vlen;
-                    sm_row0        <= vpu_row0;
-                    sm_row1        <= vpu_row1;
-                    sm_crow        <= vpu_crow;
-                    sm_src_base    <= vpu_src0;
-                    sm_tmp_base    <= vpu_src1;   // third operand: scratch row
-                    sm_dst_base    <= vpu_dst;
-                    sm_scalar_base <= vpu_scalar; // cfg vscalar: requant {m0,n}
-                    sm_max         <= '0;
                     mm_rows       <= (vpu_rows == '0) ? 16'd1 : vpu_rows;
                     mm_cols       <= (vpu_cols == '0) ? 16'd1 : vpu_cols;
                     mm_t          <= '0;
@@ -623,21 +439,14 @@ module vpu #(
                     scalar_addr_r <= vpu_scalar;
                     remaining     <= {1'b0, vpu_vlen};
                     scalar_loaded <= 1'b0;
-                    // Reduction accumulator init: 0 for sum/dot, most-negative
-                    // for max. Softmax opens on REDUCEMAX, so it inits the same.
-                    acc <= ((vpu_op == VOP_REDUCEMAX) || (vpu_op == VOP_SOFTMAX))
-                           ? {1'b1, {(ACC_W-1){1'b0}}} : '0;
+                    // VOP_DOT is the only reduction left, so the accumulator
+                    // always opens at zero.
+                    acc           <= '0;
                 end
 
-                // softmax P0: the row max is the one reduction result that is
-                // not stored — it is needed inside P1's datapath while
-                // `scalar_reg` holds the requant {m0,n}, so it gets a register.
-                S_WB: if (sm_active && sm_phase == 2'd0) begin
-                    sm_max <= acc;
-                end
                 // One (row,col) pair has just been stored. Advance to the next
                 // and restart the inner dot product over the fresh operands.
-                else if (mm_active && !mm_last) begin
+                S_WB: if (mm_active && !mm_last) begin
                     mm_s      <= mm_s_last ? 16'd0 : (mm_s + 16'd1);
                     mm_t      <= mm_s_last ? (mm_t + 16'd1) : mm_t;
                     mm_a_base <= mm_a_next;
@@ -655,25 +464,8 @@ module vpu #(
                 S_RD0D: V_data0 <= V_rdata;
                 S_RD1D: V_data1 <= V_rdata;
                 S_RDSD: begin
-                    scalar_reg    <= V_rdata[ACC_W-1:0];   // multiplier / {n,m0} / divisor
+                    scalar_reg    <= V_rdata[ACC_W-1:0];   // REQUANT / DYT {n,m0}
                     scalar_loaded <= 1'b1;
-                    // Kick off the reciprocal for SCALAR_DIV: |d|, numerator 2**RECIP_Q.
-                    div_neg  <= V_rdata[ACC_W-1];
-                    div_d    <= V_rdata[ACC_W-1] ? (~V_rdata[ACC_W-1:0] + 1'b1)
-                                                 :   V_rdata[ACC_W-1:0];
-                    div_rem  <= '0;
-                    div_quot <= '0;
-                    div_n    <= {1'b1, {RECIP_Q{1'b0}}};   // 2**RECIP_Q
-                    div_cnt  <= 6'(RECIP_Q + 1);
-                end
-
-                // Restoring division: one quotient bit (MSB-first) per cycle.
-                S_RECIP: begin
-                    div_rem  <= div_ge ? (div_rem_sh - {1'b0, div_d}) : div_rem_sh;
-                    div_quot <= {div_quot[RECIP_Q-1:0], div_ge};
-                    div_n    <= div_n << 1;
-                    div_cnt  <= div_cnt - 1'b1;
-                    if (div_cnt == 6'd1) recip_R <= {div_quot[RECIP_Q-1:0], div_ge};
                 end
 
                 S_EXEC: begin
@@ -688,40 +480,6 @@ module vpu #(
                 default: ;
             endcase
 
-            // ---------------------------------------------------------------
-            // softmax: commit the next pass (or the next row).
-            //
-            // Placed AFTER the case for the same reason as the MXU's per-tile
-            // reset: the S_EXEC arm above still runs on the cycle a pass ends
-            // and advances `p_src0`/`remaining` for a chunk that will never
-            // happen. The later assignment in the same always_ff wins, so this
-            // has to come last or the next pass would start mid-vector.
-            //
-            // A pass ends at S_WB (reductions: P0, P2) or at the last chunk of
-            // an elementwise pass (P1, P3).
-            // ---------------------------------------------------------------
-            if (sm_active && !(sm_last_pass && sm_last_row) &&
-                ((state == S_WB) ||
-                 (state == S_EXEC && last_chunk && !is_reduction(op_r)))) begin
-                sm_phase    <= sm_phase_next;
-                sm_t        <= sm_t_next;
-                sm_src_base <= sm_src_next;
-                sm_tmp_base <= sm_tmp_next;
-                sm_dst_base <= sm_dst_next;
-
-                op_r          <= sm_op_next;
-                p_src0        <= sm_src0_next;
-                p_dst         <= sm_dst_next_a;
-                dst_r         <= sm_dst_next_a;   // reductions store here
-                scalar_addr_r <= sm_scal_next;
-                remaining     <= {1'b0, sm_vlen};
-                // Each pass reloads its own scalar: P1 the requant {m0,n}, P3
-                // the denominator P2 just wrote (which also re-runs the
-                // reciprocal, since the divisor is new).
-                scalar_loaded <= 1'b0;
-                acc <= (sm_op_next == VOP_REDUCEMAX) ? {1'b1, {(ACC_W-1){1'b0}}}
-                                                     : '0;
-            end
         end
     end
 

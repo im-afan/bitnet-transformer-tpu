@@ -26,17 +26,16 @@
 // btn[0] is released at power-up, so without it the core would never see a
 // reset after configuration.
 //
-// String parameters (MEM_STYLE, SPAD_INIT, GELU_INIT, EXP_INIT) are fixed here
-// rather than exposed as build-time generics -- Vivado's `synth_design -generic`
-// does not pass Verilog string parameters cleanly. Edit them here if you need a
-// preloaded scratchpad.
+// String parameters (MEM_STYLE, SPAD_INIT) are fixed here rather than exposed as
+// build-time generics -- Vivado's `synth_design -generic` does not pass Verilog
+// string parameters cleanly. Edit them here if you need a preloaded scratchpad.
 //
-// The two activation-LUT paths are relative to accel/tpu, which build.tcl cds
-// into before reading the design precisely so they resolve the same way whatever
-// directory Vivado was launched from. The files are generated, not written by
-// hand -- `python accel/tpulang/luts.py` -- and their contents are the numerics
-// of the `gelu`/`exp` instructions, so a program's operands must already be at
-// the canonical input scale those tables assume (docs/vpu.md, luts.py).
+// There used to be two more: GELU_INIT / EXP_INIT, pointing at rtl/luts/*.hex.
+// Those tables were the numerics of the `gelu` / `exp` instructions, and both
+// instructions were removed along with the rest of the VPU ops the current
+// model does not issue (vpu.sv header). The design now reads no $readmemh file
+// except an optional scratchpad preload, so nothing here depends on build.tcl's
+// working directory any more.
 // -----------------------------------------------------------------------------
 
 module cmod_a7_top #(
@@ -156,9 +155,7 @@ module cmod_a7_top #(
         .UART_CPB        (UART_CPB),
         .UART_RX_TIMEOUT (UART_RX_TIMEOUT),
         .MEM_STYLE       ("BRAM"),
-        .SPAD_INIT       (""),
-        .GELU_INIT       ("rtl/luts/gelu_lut.hex"),
-        .EXP_INIT        ("rtl/luts/exp_lut.hex")
+        .SPAD_INIT       ("")
     ) u_tpu (
         .clk   (sysclk),
         .rst_n (rst_n),

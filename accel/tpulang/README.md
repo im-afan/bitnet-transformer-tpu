@@ -18,11 +18,10 @@ The toolchain (all in this directory):
 | ----------------------------- | -------------------------------------------------------------------- |
 | [`assembler.py`](assembler.py) | `tpuasm` — assemble `.tpu` → machine words (hex/bin image or `list[int]`) |
 | [`iss.py`](iss.py)            | instruction-set simulator; runs the words, bit-exact with the RTL    |
-| [`luts.py`](luts.py)          | generates the VPU's `gelu`/`exp` activation ROMs (`../tpu/rtl/luts/*.hex`) at their canonical input scale; the ISS imports the same tables |
 | [`gen_vectors.py`](gen_vectors.py) | ties both together: assemble + simulate → golden test vectors for `tpu_top_tb.sv` |
 | [`torch_ref.py`](torch_ref.py) | PyTorch references for the examples — an independent check on the ISS *and* the FPGA |
 | [`adder_export.py`](adder_export.py) | real checkpoint → integers. The calibration, the 14 requant words per layer and the integer pipeline all live in [`model/quant.py`](../../model/quant.py); this script stages them into the kernel's DRAM map and reports task accuracy against the float model. `--iss-check` runs the real weights through `adder_model.tpu` in the ISS to prove the numbers describe the kernel |
-| [`examples/`](examples)       | annotated `.tpu` programs (vector add, relu layer, tiled matmul, VPU matmul, softmax) |
+| [`examples/`](examples)       | annotated `.tpu` programs (vector add, relu layer, tiled matmul, VPU matmul, transposing DMA, and the real model) |
 
 For the machine-level encoding and per-opcode semantics, read the
 [ISA reference](../tpu/docs/isa.md) alongside this — this doc is the *language* (syntax,
@@ -91,19 +90,18 @@ matmul[.acc][.rq] rout, ract, rweight   MXU: out = act @ ternary-weight
                                           (requant {m0,n} word at cfg 'scalar')
 vecdot   rdst, rsrc0, rsrc1              dst = Σ src0·src1        (scalar result)
 vecadd   rdst, rsrc0, rsrc1              dst[i] = src0[i] + src1[i]
-vecemul  rdst, rsrc0, rsrc1              dst[i] = src0[i] * src1[i]
-vecmul   rdst, rsrc0, rscalar           dst[i] = src0[i] * scalar
-sadd     rdst, rsrc0, rscalar           dst[i] = src0[i] + scalar   (broadcast)
-sdiv     rdst, rsrc0, rscalar           dst[i] = round(src0[i]*2^15 / scalar)  (Q15)
 relu     rdst, rsrc0                    dst[i] = max(src0[i], 0)
-gelu     rdst, rsrc0                    dst[i] = gelu_lut[src0[i]]
-square   rdst, rsrc0                    dst[i] = src0[i]^2
-exp      rdst, rsrc0                    dst[i] = exp_lut[src0[i]]
-redmax   rdst, rsrc0                    dst = max_i src0[i]      (scalar result)
-redsum   rdst, rsrc0                    dst = Σ_i src0[i]        (scalar result)
 requant  rdst, rsrc0, rparam            dst[i] = clip((src0*m0+rnd) >> n)  int32→int8
 dyt      rdst, rsrc0, rparam            as requant, clipped to ±127  (DyT / hardtanh)
+vecmatmul rdst, rsrc0, rsrc1            dst[t][s] = Σ_d src0[t][d]*src1[s][d]
 ```
+
+That is the entire VPU instruction set. `vecemul`, `vecmul`, `sadd`, `sdiv`, `gelu`,
+`square`, `exp`, `redmax`, `redsum` and `softmax` were **removed** — they existed for a
+softmax/LayerNorm/GELU model, and this one is ReLU attention + DyT + ReLU feed-forward.
+Their opcodes are retired holes, not free encoding space; see
+[vpu.md §Removed ops](../tpu/docs/vpu.md#removed-ops) for the table and the measured area
+saving. `vecdot` stays only because it is `vecmatmul`'s inner primitive.
 
 VPU vector length comes from `cfg 'vlen'`; MXU token count from `cfg 'tlen'`.
 
@@ -232,49 +230,22 @@ Each stages its own operands over DRAM (§2.2) and ends in `halt`.
 | [`vector_add.tpu`](examples/vector_add.tpu) | smallest VPU program: config + one elementwise op (residual `C=A+B`) |
 | [`relu_layer.tpu`](examples/relu_layer.tpu) | one ternary layer `Y=requant(A@W)` + `relu` — the shape the adder model runs |
 | [`tiled_matmul.tpu`](examples/tiled_matmul.tpu) | streams a big `A@W` tile-by-tile: nested M/N/K loops (`li/muls/adds/cmps/branch/jmp`) `rdmem` each tile into fixed buffers, then `matmul` → `matmul.acc` → `matmul.acc.rq` — scratchpad use is fixed regardless of matrix size |
-| [`vpu_matmul.tpu`](examples/vpu_matmul.tpu) | a matmul with **no** ternary operand, so the MXU cannot help: attention's `S = Q@K^T` as a `T x T` nest of `vecdot`, contracting over the head dim — `K^T` is never materialised — then a per-row `requant` back to int8 for softmax |
-| [`softmax_row.tpu`](examples/softmax_row.tpu) | a multi-op micro-sequence + scalar↔vector interplay (`redmax → sadd → exp → redsum → sdiv`) — illustrative only, see the caveat below |
+| [`vpu_matmul.tpu`](examples/vpu_matmul.tpu) | a matmul with **no** ternary operand, so the MXU cannot help: attention's `S = Q@K^T` as a `T x T` nest of `vecdot`, contracting over the head dim — `K^T` is never materialised — then a per-row `requant` back to int8. Superseded by `vecmatmul.tpu`, which does the same thing as one macro op, and the only remaining user of `vecdot` |
 | [`transpose_dma.tpu`](examples/transpose_dma.tpu) | `Vᵀ` and `Qᵀ` out of a fused `[T][3D]` QKV block in one dispatch each — `wrmem.t` (spill) and `rdmem.t` (fill), with `tsrow` reading a column slice in place |
 | [`highmem_dma.tpu`](examples/highmem_dma.tpu) | DMA above the low 64 KB of DRAM — the only thing here that leaves the first window. Builds a `0x10000` base with `li`+`adds` (no immediate can name it) and spills there linearly and transposed |
-| [`adder_model.tpu`](examples/adder_model.tpu) | **not an example — the real thing.** The entire `adder_ternary_vanilla` model in one program: four layers (3 ternary projections, both attention matmuls, the causal mask, ReLU attention, `Wo`, the feed-forward, both residuals with their `dyt` normalizations) plus the output head. 208 words |
+| [`adder_model.tpu`](examples/adder_model.tpu) | **not an example — the real thing.** The entire `adder_ternary_vanilla` model in one program: every layer (3 ternary projections, both attention matmuls, the causal mask, ReLU attention, `Wo`, the feed-forward, both residuals with their `dyt` normalizations) plus the output head. 208 words |
 
 `adder_model.tpu` is a full forward pass of the shipped adder checkpoint in a
 single run. It was five runs until `scalar_unit.sv` stopped truncating a
 `rdmem`/`wrmem` DRAM address to 16 bits: the SRAM is 512 KB and the UART host
 always reached all of it, but a *program* could only name the low 64 KB, which
-the model's 96 KB of weights do not fit in. With the full `MEM_ADDR_W` visible
+the model's weights do not fit in (96 KB at the four layers it was written for, 48 KB at
+today's two). With the full `MEM_ADDR_W` visible
 the weights are staged once and stay resident, so a forward pass is a 4 KB
 upload rather than a 96 KB one. The byte-level contract the host has to satisfy
 — memory maps, the 14 requant words per layer and where their scales come from,
 the weight packing — is in [`adder_kernel.md`](adder_kernel.md); §2 there has
 the RTL/ISS change and §7 the verification order.
-
-> **`softmax_row.tpu` does not compute a correct softmax.** It is not type-correct:
-> `exp`, `redsum` and `sdiv` read int8 operands at stride 1, but the `sadd` and `exp`
-> feeding them write int32 at stride 4. Two `requant` ops — one to reach the exp table's
-> `1/16` `in_scale`, one after `exp` — are what
-> [vpu.md](../tpu/docs/vpu.md#activation-luts) says belong there. Read it for the op
-> sequence; don't trust its output. It is registered in `torch_ref.UNSUPPORTED` with that
-> reason.
->
-> **The exp LUT is no longer the blocker.** [`luts.py`](luts.py) generates it, the ISS
-> defaults to it, and `cmod_a7_top.sv` loads it into the VPU ROM — so the program now
-> assembles and runs; it just computes the wrong thing.
-
-**Softmax, annotated** — no single instruction; the scalar unit decomposes it into VPU
-primitives, using `loads`/`stores` to bring the reduction result back as a broadcast
-scalar:
-
-```
-    redmax  maxa, x         ; scratch[MAXA] = max_i x[i]
-    loads   t, maxa         ; t = max
-    subs    t, r0, t        ; t = -max
-    stores  nega, t         ; scratch[NEGA] = -max
-    sadd    shift, x, nega  ; shift[i] = x[i] - max
-    exp     expa, shift     ; e[i] = exp(shift[i])
-    redsum  dena, expa      ; scratch[DENA] = Σ e[i]
-    sdiv    prob, expa, dena ; p[i] = round(e[i]*2^15 / D)   (Q15)
-```
 
 ---
 
@@ -310,7 +281,7 @@ tpu.run(words)                                # scratchpad = tpu.mem afterward
 
 ```bash
 python gen_vectors.py                       # default: examples/relu_layer.tpu
-python gen_vectors.py -p examples/softmax_row.tpu
+python gen_vectors.py -p examples/adder_model.tpu
 ```
 
 The expected file contains exactly the bytes the program wrote, so the SystemVerilog
@@ -330,9 +301,10 @@ python torch_ref.py                          # every example with a reference, v
 python torch_ref.py -p examples/relu_layer.tpu
 ```
 
-`relu_layer`, `vector_add`, `tiled_matmul`, `vpu_matmul`, `transpose_dma`,
-`highmem_dma` and `adder_model` have references; `softmax_row` is registered as
-unsupported with the reason in `torch_ref.UNSUPPORTED`.
+`relu_layer`, `vector_add`, `tiled_matmul`, `vpu_matmul`, `vecmatmul`, `strided_matmul`,
+`transpose_dma`, `highmem_dma` and `adder_model` all have references — every example is
+checked. (`torch_ref.UNSUPPORTED` is now empty: its only entry was `softmax_row`, deleted
+with the instructions it used.)
 The same references run against **real hardware** — `accel/tpu/host/run_program.py`
 calls `torch_ref.verify()` on the bytes it reads back off the FPGA, so one command
 checks the device against both the ISS and PyTorch.

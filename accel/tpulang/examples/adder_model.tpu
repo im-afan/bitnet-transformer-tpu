@@ -1,12 +1,12 @@
 ; adder_model.tpu — the entire `adder_ternary_vanilla` model, one program.
 ;
 ; model/transformer.py's whole forward pass for the shipped ternary adder config
-; (d=128, f=128, 4 layers, 4 heads, head_dim=32, T=32, vocab=13), in its
+; (d=128, f=128, 2 layers, 4 heads, head_dim=32, T=32, vocab=13), in its
 ; *current* form: no bias, DyT for normalization, ReLU attention, ReLU
-; feed-forward, dropout off. Four transformer layers and the output head, in one
+; feed-forward, dropout off. Two transformer layers and the output head, in one
 ; run:
 ;
-;     for L in 0..3:
+;     for L in 0..1:
 ;         Q,K,V = Wq(X), Wk(X), Wv(X)          # ternary, no bias
 ;         S     = Q @ K^T / sqrt(head_dim)     # per head
 ;         P     = relu(S + causal_mask)        # NOT softmax
@@ -31,7 +31,7 @@
 ;     symmetric +-127 clip, because hardtanh is odd and int8's -128 is not.
 ;     ../adder_kernel.md §4.
 ;
-; The host supplies the embedded+positionally-encoded X, all four layers'
+; The host supplies the embedded+positionally-encoded X, both layers'
 ; weights, the mask, the requant words and the quantized `fc` weight; it gets
 ; the int32 logits back, plus every layer's X as a checkpoint. Embedding and
 ; argmax stay on the host: the ISA has no gather, and `redmax` returns the max
@@ -40,12 +40,14 @@
 ; ---------------------------------------------------------------------------
 ; Why this is one program
 ; ---------------------------------------------------------------------------
-; The four layers' ternary weights are 96 KB packed. That used to be
-; unreachable: `scalar_unit.sv` truncated a rdmem/wrmem DRAM address to
-; ADDR_W = 16 bits, so a program could only name the low 64 KB of the 512 KB
-; SRAM chip, even though the DMA, the SRAM controller and the UART host all
-; addressed the full 19 bits. The scalar unit now emits MEM_ADDR_W, so the
-; whole chip is program-visible and the model fits with 380 KB to spare.
+; The two layers' ternary weights are 48 KB packed, and the last of them starts
+; at 0xC400 — past the 64 KB line once the checkpoint grows back, and already
+; past it when this was a four-layer model. That used to be unreachable:
+; `scalar_unit.sv` truncated a rdmem/wrmem DRAM address to ADDR_W = 16 bits, so
+; a program could only name the low 64 KB of the 512 KB SRAM chip, even though
+; the DMA, the SRAM controller and the UART host all addressed the full 19 bits.
+; The scalar unit now emits MEM_ADDR_W, so the whole chip is program-visible and
+; the model fits with 432 KB to spare.
 ;
 ; Two consequences shape the code below:
 ;
@@ -53,9 +55,10 @@
 ;     scratchpad and each layer updates it in place. The per-layer `wrmem` near
 ;     the bottom is a *checkpoint* for verification, not a data path.
 ;   * Weights are addressed by a running base register `wl`, advanced one layer
-;     block per iteration. `li` is a 16-bit immediate and layer 3's block starts
-;     at 0x1AC00, so the base is built by `adds` — which is exactly why the
-;     globals sit below 0x5000 where they *are* li-able.
+;     block per iteration. `li` is a 16-bit immediate and a layer block base
+;     leaves it as soon as the model has more than two layers (layer 3's block
+;     started at 0x1AC00), so the base is built by `adds` — which is exactly why
+;     the globals sit below 0x5000 where they *are* li-able.
 ;
 ; ---------------------------------------------------------------------------
 ; The three sharp edges, stated once
@@ -91,7 +94,7 @@
 .equ D3       D * 3         ; fused Q|K|V row: 384 bytes
 .equ F        128           ; feed-forward hidden dim
 .equ VOCAB    13            ; len(numbers_data.VOCAB)
-.equ LAYERS   4
+.equ LAYERS   2
 
 .equ ROWS     8             ; MXU array contraction dim
 .equ COLS     8             ; MXU array output cols
@@ -147,7 +150,7 @@
 .equ RQ_X2    RQW + 52      ; X1 + F   -> X2     `dyt`: carries norm2's alpha
 
 ; ===========================================================================
-; DRAM map (512 KB available; highest byte used is 0x21FFF = 135 KB)
+; DRAM map (512 KB available; highest byte used is 0x13FFF = 80 KB)
 ; ===========================================================================
 ; Globals live below 0x5000 so every one of them fits a 16-bit `li`. The layer
 ; blocks sit above and are reached through the `wl` base register instead.
@@ -249,7 +252,7 @@
     setcfg  len, B_SQ
     rdmem   mska, da
 
-    ; MXU geometry that is the same for all four matmuls of every layer.
+    ; MXU geometry that is the same for every matmul of every layer.
     setcfg  tlen,   T           ; 32 token rows, one MXU pass (TOK_W = 6 bits)
     setcfg  arow,   AROW        ; activations are [T][D] row-major
     setcfg  wcol,   WCOL        ; weight columns are D trits = 32 bytes
@@ -327,7 +330,8 @@ layer:
     rdmem   vt, da              ; plain fill back (the mode is in the instr)
 
 ; ---------------------------------------------------------------------------
-; 3. Attention, one head at a time
+; 3. Attention, one head at a time (HEADS is still 4 — only the layer count
+;    changed)
 ; ---------------------------------------------------------------------------
 ; Head h is a contiguous 32-byte slice of each 384-byte QKV row (kv_heads ==
 ; q_heads, so heads_per_q = 1 and mha_torch's 5-D layout collapses to

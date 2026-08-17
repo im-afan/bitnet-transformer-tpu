@@ -69,15 +69,6 @@
   `define SPAD_EXP2_FILE "vectors_uart2/tpu_spad_exp.hex"
 `endif
 
-// VPU activation LUTs — not vectors but fixed ROM contents, shared by both
-// programs and identical to what the bitstream burns in (accel/tpulang/luts.py).
-`ifndef GELU_LUT_FILE
-  `define GELU_LUT_FILE "../rtl/luts/gelu_lut.hex"
-`endif
-`ifndef EXP_LUT_FILE
-  `define EXP_LUT_FILE "../rtl/luts/exp_lut.hex"
-`endif
-
 module tpu_top_uart_tb;
 
     // ---- Geometry (must match the DUT instance and gen_vectors.py) ----------
@@ -153,8 +144,7 @@ module tpu_top_uart_tb;
         .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W),
         .REG_AW(REG_AW), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
         .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W),
-        .UART_CPB(CPB), .UART_RX_TIMEOUT(0),
-        .GELU_INIT(`GELU_LUT_FILE), .EXP_INIT(`EXP_LUT_FILE)
+        .UART_CPB(CPB), .UART_RX_TIMEOUT(0)
     ) dut (
         .clk(clk), .rst_n(rst_n),
         .host_run(host_run), .boot_pc(boot_pc),
@@ -401,12 +391,12 @@ module tpu_top_uart_tb;
     // MXU with no VPU op at all, so "the VPU counter must be nonzero" is only
     // true of programs that actually dispatch one.
     function automatic bit is_vpu_opcode(input logic [5:0] o);
-        return (o == 6'h01) || (o == 6'h02) || (o == 6'h03) || (o == 6'h04) ||
-               (o == 6'h05) || (o == 6'h09) || (o == 6'h0A) || (o == 6'h0B) ||
-               (o == 6'h0C) || (o == 6'h0D) || (o == 6'h0E) || (o == 6'h0F) ||
-               (o == 6'h1B) ||
+        return (o == 6'h01) ||  // OP_VECDOT
+               (o == 6'h03) ||  // OP_VECADD
+               (o == 6'h04) ||  // OP_RELU
+               (o == 6'h09) ||  // OP_REQUANT
                (o == 6'h1E) ||  // OP_VECMM  (vecmatmul macro op)
-               (o == 6'h20);    // OP_SOFTMAX (softmax macro op)
+               (o == 6'h21);    // OP_DYT
     endfunction
 
     function automatic bit image_has_vpu(input int nwords);

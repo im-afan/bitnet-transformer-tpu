@@ -368,10 +368,11 @@ proc program_device {bitfile} {
 proc read_design {{with_constraints 1}} {
     global PART RTL_SRCS RTL_UNUSED BOARD_SRCS XDC_FILES THREADS TPU_DIR
     set_param general.maxThreads $THREADS
-    # $readmemh paths baked into the RTL (the board wrapper's GELU_INIT /
-    # EXP_INIT, SPAD_INIT) are resolved by Vivado against its *working*
-    # directory, which is wherever the user launched it — synth/ and synth/vivado/
-    # have both been used. Pin it to accel/tpu so those paths mean one thing.
+    # A $readmemh path baked into the RTL (the board wrapper's SPAD_INIT) is
+    # resolved by Vivado against its *working* directory, which is wherever the
+    # user launched it — synth/ and synth/vivado/ have both been used. Pin it to
+    # accel/tpu so such a path means one thing. (GELU_INIT / EXP_INIT used to be
+    # the load-bearing cases here; they are gone with the LUT ROMs.)
     # Everything else this script touches is already an absolute path (OUTDIR and
     # REPDIR are normalized, sources.tcl and board.tcl build theirs from
     # [info script]), so nothing else moves.

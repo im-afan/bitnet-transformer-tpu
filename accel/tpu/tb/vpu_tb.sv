@@ -5,12 +5,18 @@
 // read: data valid the cycle after V_re; byte-strobed single-cycle write) and
 // checks every VPU op against an in-testbench reference:
 //
-//   elementwise (int8 -> int32): ADD, ELEMENT_MUL, SCALAR_MUL, SCALAR_ADD, RELU,
-//                                SQUARE
-//   scalar div  (int8 -> int32): SCALAR_DIV (reciprocate-then-multiply, Q15)
-//   LUT         (int8 -> int32): GELU, EXP
-//   reductions  (int8 -> int32 scalar): DOT, REDUCESUM, REDUCEMAX
+//   elementwise (int8 -> int32): ADD, RELU
+//   reduction   (int8 -> int32 scalar): DOT
 //   narrowing   (int32 -> int8): REQUANT, DYT
+//
+// That is the whole unit now. The ops this TB used to cover as well — GELU,
+// EXP, SQUARE, ELEMENT_MUL, SCALAR_MUL/ADD/DIV, REDUCESUM, REDUCEMAX and the
+// softmax macro op — were removed from vpu.sv because the current model does
+// not issue them (see that file's header), and their tests went with them.
+//
+// DOT is not reachable from the ISA; it is exercised here because it is the
+// inner primitive of VOP_VECMATMUL, whose row/column sequencing is covered at
+// the tpu_top level instead.
 //
 // REQUANT and DYT share a fixed point and differ only in the lower clip (-128
 // vs -127, DyT's hardtanh being odd), so `test_dyt_floor` asserts that one
@@ -20,9 +26,7 @@
 //
 // Coverage includes multi-chunk streaming (vlen > LANES), an exact-boundary
 // vlen, and partial-tail vlen so the lane-active predicate / V_wstrb masking is
-// exercised. The activation LUTs are filled directly through the DUT's ROM
-// arrays (hierarchical reference) so no external $readmemh files are needed;
-// the reference reads the same arrays.
+// exercised.
 //
 // Run:  make sim         (iverilog -g2012 + vvp)
 // -----------------------------------------------------------------------------
@@ -36,18 +40,12 @@ module vpu_tb;
     localparam int ADDR_W       = 16;
     localparam int M0_W         = 12;
     localparam int N_W          = 4;
-    localparam int RECIP_Q      = 31;                 // must match the DUT instance
-    localparam int DIV_Q        = 15;
     localparam int LANES        = SCRATCHPAD_W / 4;   // 16 int32 lanes
 
     // ---- Op encoding (matches vpu.sv) ---------------------------------------
     localparam logic [4:0]
-        VOP_DOT         = 5'd0,  VOP_ADD        = 5'd1,  VOP_SCALAR_MUL = 5'd2,
-        VOP_RELU        = 5'd3,  VOP_GELU       = 5'd4,  VOP_SQUARE     = 5'd5,
-        VOP_EXP         = 5'd6,  VOP_REDUCEMAX  = 5'd7,  VOP_REDUCESUM  = 5'd8,
-        VOP_ELEMENT_MUL = 5'd9,  VOP_REQUANT    = 5'd10, VOP_SCALAR_ADD = 5'd11,
-        VOP_SCALAR_DIV  = 5'd12, VOP_VECMATMUL  = 5'd13, VOP_SOFTMAX    = 5'd14,
-        VOP_DYT         = 5'd16;   // VOP_SM_EXP (15) is internal to vpu.sv
+        VOP_DOT       = 5'd0,  VOP_ADD       = 5'd1,  VOP_RELU = 5'd3,
+        VOP_REQUANT   = 5'd10, VOP_VECMATMUL = 5'd13, VOP_DYT  = 5'd16;
 
     // ---- Scratchpad address map (generous spacing; int8 chunks over-read) ---
     localparam logic [ADDR_W-1:0] A_ADDR  = 16'h1000;  // src0
@@ -86,7 +84,6 @@ module vpu_tb;
     vpu #(
         .SCRATCHPAD_W(SCRATCHPAD_W), .ADDR_W(ADDR_W),
         .M0_W(M0_W), .N_W(N_W)
-        // GELU_INIT / EXP_INIT left empty: LUTs are filled from the TB below.
     ) dut (
         .clk(clk), .rst_n(rst_n),
         .vpu_start(vpu_start), .vpu_op(vpu_op),
@@ -215,27 +212,10 @@ module vpu_tb;
     function automatic int ref_elem(input logic [3:0] op,
                                     input int a, input int b, input int scal);
         case (op)
-            VOP_ADD:         return a + b;
-            VOP_ELEMENT_MUL: return a * b;
-            VOP_SCALAR_MUL:  return a * scal;
-            VOP_SCALAR_ADD:  return a + scal;
-            VOP_RELU:        return (a > 0) ? a : 0;
-            VOP_SQUARE:      return a * a;
-            default:         return 0;
+            VOP_ADD:  return a + b;
+            VOP_RELU: return (a > 0) ? a : 0;
+            default:  return 0;
         endcase
-    endfunction
-
-    // Reference for SCALAR_DIV: round(a * 2**DIV_Q / d), mirroring vpu.sv's
-    // reciprocate-then-multiply — R = floor(2**RECIP_Q / |d|), a*R rounded down by
-    // (RECIP_Q-DIV_Q) with an arithmetic shift, then sign-corrected for d.
-    function automatic int ref_div(input int a, input int d);
-        longint absd, R, prod, rnd, shifted;
-        absd    = (d < 0) ? -longint'(d) : longint'(d);
-        R       = (longint'(1) << RECIP_Q) / absd;           // floor; d != 0 in tests
-        prod    = longint'(a) * R;
-        rnd     = (RECIP_Q == DIV_Q) ? 0 : (longint'(1) << (RECIP_Q - DIV_Q - 1));
-        shifted = (prod + rnd) >>> (RECIP_Q - DIV_Q);
-        return int'((d < 0) ? -shifted : shifted);
     endfunction
 
     // Reference for REQUANT: clip((x*m0 + round) >> n), arithmetic shift.
@@ -280,20 +260,6 @@ module vpu_tb;
         $display("[%s] vlen=%0d  (errors so far: %0d)", tag, vlen, errors);
     endtask
 
-    task automatic test_lut(input logic [3:0] op, input int vlen, input string tag);
-        int idx, exp;
-        gen_i8(vlen);
-        for (int i = 0; i < vlen; i++) put8(A_ADDR + i, tv_a[i]);
-        run_op(op, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
-        for (int i = 0; i < vlen; i++) begin
-            idx = tv_a[i] & 32'hFF;
-            exp = (op == VOP_GELU) ? $signed(dut.gelu_rom[idx])
-                                   : $signed(dut.exp_rom[idx]);
-            exp32(D_ADDR + i*4, exp, tag);
-        end
-        $display("[%s] vlen=%0d  (errors so far: %0d)", tag, vlen, errors);
-    endtask
-
     task automatic test_reduce(input logic [3:0] op, input int vlen, input string tag);
         int exp;
         gen_i8(vlen);
@@ -303,24 +269,11 @@ module vpu_tb;
         end
         run_op(op, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
         case (op)
-            VOP_REDUCESUM: begin exp = 0; for (int i=0;i<vlen;i++) exp += tv_a[i]; end
-            VOP_DOT:       begin exp = 0; for (int i=0;i<vlen;i++) exp += tv_a[i]*tv_b[i]; end
-            VOP_REDUCEMAX: begin exp = -2147483648;
-                                 for (int i=0;i<vlen;i++) if (tv_a[i] > exp) exp = tv_a[i]; end
-            default:       exp = 0;
+            VOP_DOT: begin exp = 0; for (int i=0;i<vlen;i++) exp += tv_a[i]*tv_b[i]; end
+            default: exp = 0;
         endcase
         exp32(D_ADDR, exp, tag);   // single int32 scalar result
         $display("[%s] vlen=%0d  result=%0d  (errors so far: %0d)", tag, vlen, exp, errors);
-    endtask
-
-    task automatic test_div(input int vlen, input int d, input string tag);
-        gen_i8(vlen);
-        for (int i = 0; i < vlen; i++) put8(A_ADDR + i, tv_a[i]);
-        put32(SC_ADDR, d);
-        run_op(VOP_SCALAR_DIV, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
-        for (int i = 0; i < vlen; i++)
-            exp32(D_ADDR + i*4, ref_div(tv_a[i], d), tag);
-        $display("[%s] vlen=%0d d=%0d  (errors so far: %0d)", tag, vlen, d, errors);
     endtask
 
     task automatic test_requant(input int vlen, input int m0, input int n, input string tag);
@@ -365,84 +318,6 @@ module vpu_tb;
                  got_dyt, got_rq, errors);
     endtask
 
-    // Reference for VOP_SCALAR_DIV / softmax's normalize pass: reciprocate the
-    // divisor once, then multiply and round — mirroring vpu.sv's datapath rather
-    // than doing a true division, because the reciprocal's truncation is part of
-    // the result. Widths are 64-bit: a8 * R needs RECIP_Q+8 bits.
-    localparam int RECIP_Q_TB = 31;
-    localparam int DIV_Q_TB   = 15;
-    function automatic int ref_sdiv(input int a8, input int d);
-        longint unsigned R;
-        longint          prod, q;
-        int              shift;
-        if (d == 0) R = (64'd1 << (RECIP_Q_TB + 1)) - 64'd1;   // saturates
-        else        R = (64'd1 << RECIP_Q_TB) / (d < 0 ? -d : d);
-        prod  = longint'(a8) * longint'(R);
-        shift = RECIP_Q_TB - DIV_Q_TB;
-        q     = (shift == 0) ? prod : ((prod + (64'd1 << (shift - 1))) >>> shift);
-        return int'(d < 0 ? -q : q);
-    endfunction
-
-    // -------------------------------------------------------------------------
-    // Macro op: softmax over `rows` rows of `vlen` int8 elements.
-    //
-    // The reference recomputes the hardware's four passes in the same order and
-    // at the same widths — max, then exp_lut[requant(x-max)] stored as int8,
-    // then the int32 sum of those bytes, then the Q(DIV_Q) divide. It is
-    // deliberately NOT a floating-point softmax: the int8 intermediate and the
-    // LUT *are* the numerics, so a float reference would be checking a
-    // different function.
-    // -------------------------------------------------------------------------
-    localparam int SM_SRC = 16'h0000;
-    localparam int SM_TMP = 16'h0400;
-    localparam int SM_DST = 16'h0800;
-    localparam int SM_RQW = 16'h0F00;
-
-    task automatic test_softmax(input int rows, input int vlen,
-                                input int m0, input int n,
-                                input string tag);
-        int srow, trow, drow;
-        int mx, den, idx, ev;
-        srow = vlen;          // int8 source rows, packed
-        trow = vlen + 4;      // int8 exp values + the int32 denominator slot
-        drow = vlen * 4;      // int32 result rows
-
-        // Seed the source rows and the requant word.
-        for (int t = 0; t < rows; t++)
-            for (int i = 0; i < vlen; i++)
-                mem[SM_SRC + t*srow + i] = 8'(((t*11 + i*7) % 41) - 20);
-        put32(SM_RQW, (n << 12) | m0);
-
-        vpu_rows = 16'(rows);
-        vpu_row0 = ADDR_W'(srow);
-        vpu_row1 = ADDR_W'(trow);
-        vpu_crow = ADDR_W'(drow);
-        run_op(VOP_SOFTMAX, ADDR_W'(SM_SRC), ADDR_W'(SM_TMP),
-               ADDR_W'(SM_RQW), ADDR_W'(SM_DST), vlen);
-
-        for (int t = 0; t < rows; t++) begin
-            mx = -128;
-            for (int i = 0; i < vlen; i++)
-                if ($signed(mem[SM_SRC + t*srow + i]) > mx)
-                    mx = $signed(mem[SM_SRC + t*srow + i]);
-            den = 0;
-            for (int i = 0; i < vlen; i++) begin
-                idx = ref_requant($signed(mem[SM_SRC + t*srow + i]) - mx, m0, n);
-                ev  = $signed(dut.exp_rom[idx & 8'hFF]);
-                exp8(SM_TMP + t*trow + i, ev, {tag, "-exp"});
-                den += ev;
-            end
-            exp32(SM_TMP + t*trow + vlen, den, {tag, "-den"});
-            for (int i = 0; i < vlen; i++) begin
-                ev = $signed(mem[SM_TMP + t*trow + i]);
-                exp32(SM_DST + t*drow + i*4, ref_sdiv(ev, den), {tag, "-p"});
-            end
-        end
-        $display("[%s] rows=%0d vlen=%0d m0=%0d n=%0d  (errors so far: %0d)",
-                 tag, rows, vlen, m0, n, errors);
-        vpu_rows = 16'd0;   // leave the primitive-op defaults behind
-    endtask
-
     // -------------------------------------------------------------------------
     // Stimulus.
     // -------------------------------------------------------------------------
@@ -458,12 +333,6 @@ module vpu_tb;
         rst_n = 1'b1;
         @(posedge clk);
 
-        // Fill the activation LUTs (deterministic; reference reads them back).
-        for (int i = 0; i < 256; i++) begin
-            dut.gelu_rom[i] = $signed(8'((i * 3 + 7)));      // arbitrary but fixed
-            dut.exp_rom[i]  = $signed(8'((255 - i) ^ 8'h2A));
-        end
-
         $display("==== VPU testbench ====");
 
         // Elementwise: multi-chunk (40 = 2 full + tail 8), exact boundary (16),
@@ -471,31 +340,13 @@ module vpu_tb;
         test_elem(VOP_ADD,         40, 0,   "ADD");
         test_elem(VOP_ADD,         16, 0,   "ADD-exact");
         test_elem(VOP_ADD,          1, 0,   "ADD-len1");
-        test_elem(VOP_ELEMENT_MUL, 40, 0,   "ELEMENT_MUL");
-        test_elem(VOP_SCALAR_MUL,  40, -7,  "SCALAR_MUL-neg");
-        test_elem(VOP_SCALAR_MUL,  33, 100, "SCALAR_MUL-pos");
-        test_elem(VOP_SCALAR_ADD,  40, -50, "SCALAR_ADD-neg");   // softmax x-max
-        test_elem(VOP_SCALAR_ADD,  33, 64,  "SCALAR_ADD-pos");
         test_elem(VOP_RELU,        40, 0,   "RELU");
-        test_elem(VOP_SQUARE,      40, 0,   "SQUARE");
 
-        // Scalar divide (reciprocate-then-multiply, Q15 result). Positive and
-        // negative divisors, a softmax-sized denominator, and a partial tail.
-        test_div(40, 100,  "SCALAR_DIV-pos");
-        test_div(33, -37,  "SCALAR_DIV-neg");
-        test_div(48, 2039, "SCALAR_DIV-softmax");
-        test_div( 7, 3,    "SCALAR_DIV-tail");
-
-        // LUT activations.
-        test_lut(VOP_GELU, 40, "GELU");
-        test_lut(VOP_EXP,  40, "EXP");
-
-        // Reductions (whole vector -> one int32 scalar).
-        test_reduce(VOP_REDUCESUM, 40, "REDUCESUM");
-        test_reduce(VOP_REDUCESUM, 48, "REDUCESUM-3chunk");
-        test_reduce(VOP_REDUCEMAX, 40, "REDUCEMAX");
-        test_reduce(VOP_DOT,       40, "DOT");
-        test_reduce(VOP_DOT,        7, "DOT-tail");
+        // The one reduction left: DOT, vecmatmul's inner primitive. 48 is three
+        // whole chunks, 7 a partial tail.
+        test_reduce(VOP_DOT, 40, "DOT");
+        test_reduce(VOP_DOT, 48, "DOT-3chunk");
+        test_reduce(VOP_DOT,  7, "DOT-tail");
 
         // Requant (int32 -> int8), including clip + rounding.
         test_requant(40, 1500, 10, "REQUANT");
@@ -507,13 +358,6 @@ module vpu_tb;
         test_dyt(33,  512,  8, "DYT-half");
         test_dyt(20, 4095,  0, "DYT-noshift");
         test_dyt_floor();
-
-        // Macro op: row-wise softmax (docs/macro_ops.md §5.1). Multiple rows,
-        // and a row length that is not a whole number of chunks, so both the
-        // row advance and the partial-tail path are exercised.
-        test_softmax(3, 20, 1, 1, "SOFTMAX");
-        test_softmax(1, 16, 1, 0, "SOFTMAX-1row-exact");
-        test_softmax(2,  5, 2, 2, "SOFTMAX-short");
 
         // Summary.
         $display("==== done: %0d checks, %0d errors ====", checks, errors);

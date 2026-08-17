@@ -178,10 +178,21 @@ PASSED: the device output matches the PyTorch reference
 | `vector_add.tpu`   | `C = A + B`, int8 operands widened to int32                |
 | `tiled_matmul.tpu` | `C = requant(A @ W)`, tiles reassembled into one `[M,K]@[K,N]` |
 | `vpu_matmul.tpu`   | `S32 = Q @ K^T` int32, `S8 = requant(S32)` int8 — attention scores |
-| `softmax_row.tpu`  | none — see the note in `torch_ref.UNSUPPORTED`             |
+| `vecmatmul.tpu`    | the same score block as one `vecmatmul` macro op            |
+| `transpose_dma.tpu`| `Vᵀ` / `Qᵀ` out of a fused `[T][3D]` block                   |
+| `highmem_dma.tpu`  | linear + transposed spills above the low 64 KB of DRAM      |
+| `adder_model.tpu`  | the whole model: per-layer `X`, `Vᵀ`, `A`, and the logits   |
+
+Every example now has a reference — `torch_ref.UNSUPPORTED` is empty. (Its one
+entry was `softmax_row.tpu`, deleted along with the `exp`/`redsum`/`sdiv`
+instructions it was written against; see
+[docs/vpu.md §Removed ops](../docs/vpu.md#removed-ops).)
 
 A program with no reference, or a host without `torch`, prints a `skipped` line
 and leaves the golden-image verdict standing. `--no-torch` turns the stage off.
+
+To score the real checkpoint problem-by-problem rather than check one program's
+bytes, use [`run_adder.py`](run_adder.py) instead.
 
 The same references run without a board, against the ISS instead of the device —
 useful to confirm the reference itself before spending a board run:

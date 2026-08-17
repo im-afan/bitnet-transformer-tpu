@@ -23,7 +23,7 @@ with ``wrmem`` (tracked in ``tpu.dram_written``) — the host-visible outputs.
 The input image is chosen automatically from the program's own ``.equ``
 constants (:func:`program_kind`, dispatched by :func:`build_image`):
 
-  * default (relu_layer, softmax_row): the fixed 8x8 geometry below.
+  * default (relu_layer): the fixed 8x8 geometry below.
   * vector_add (defines ``VEC_BYTES``): two int8 operand spans at A and B.
   * vpu_matmul (defines ``D_HEAD``): int8 Q and K for the attention-score block.
   * tiled matmul (defines ``MTILES``): a general A@W streamed tile-by-tile; the
@@ -110,7 +110,7 @@ def assemble_program(path: str) -> tuple[list, dict]:
 
 
 # =============================================================================
-# Default fixed-geometry programs (relu_layer / vector_add / softmax_row).
+# Default fixed-geometry programs (relu_layer / vector_add).
 # =============================================================================
 def gen_tensors() -> tuple[list, list]:
     """Bounded, deterministic operands (identical to the old in-TB generator)."""
@@ -440,8 +440,6 @@ def build_vecmatmul_image(tpu: TPU, c: dict) -> tuple[dict, dict, dict]:
 
 
 # =============================================================================
-# softmax_rows (examples/softmax_rows.tpu): a block of rows as one macro op.
-# =============================================================================
 def build_softmax_rows_image(tpu: TPU, c: dict) -> dict:
     """Seed the score rows and the requant word. No independent reference here:
     the result is a chain of LUT + fixed-point steps whose *definition* is the
@@ -667,15 +665,13 @@ def program_kind(consts: dict) -> str:
         return "tiled_matmul_hw"
     if "TQ" in consts:              # vecmatmul: attention block as a macro op
         return "vecmatmul"
-    if "TROW" in consts:            # softmax_rows: row block as a macro op
-        return "softmax_rows"
     if "AROW" in consts:            # strided_matmul: config-stride window
         return "strided_matmul"
     if "VEC_BYTES" in consts:
         return "vector_add"
     if "D_HEAD" in consts:
         return "vpu_matmul"
-    return "default"                 # relu_layer, softmax_row: fixed 8x8
+    return "default"                 # relu_layer: fixed 8x8
 
 
 def build_image(tpu: TPU, consts: dict) -> tuple[dict, dict | None, dict | None]:
@@ -698,8 +694,6 @@ def build_image(tpu: TPU, consts: dict) -> tuple[dict, dict | None, dict | None]
         return build_tiled_hw_image(tpu, consts)
     if kind == "vecmatmul":
         return build_vecmatmul_image(tpu, consts)
-    if kind == "softmax_rows":
-        return build_softmax_rows_image(tpu, consts), None, None
     if kind == "strided_matmul":
         return build_strided_image(tpu, consts)
     if kind == "vector_add":

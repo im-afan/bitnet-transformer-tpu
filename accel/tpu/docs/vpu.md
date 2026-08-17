@@ -5,140 +5,91 @@ See [README](README.md) §3 for the high-level role.
 
 ## Scope
 
-The VPU owns:
+The VPU owns every pointwise / reduction op the shipped model needs, and **only** those.
+It was cut down to that set: `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_MUL`,
+`SCALAR_ADD`, `SCALAR_DIV`, `REDUCEMAX`, `REDUCESUM` and the `SOFTMAX` macro op were
+removed, along with the two activation ROMs and the restoring divider. See
+[Removed ops](#removed-ops).
 
-- **Activations:** ReLU, GELU (the FFN uses GELU; see `Expert`/`nn.Sequential` in
-  `model/transformer.py`).
-- **Elementwise arithmetic:** vector add (residuals `O + X`, `X + ff(X)`), vector ×
-  scalar (requant scales), vector dot product.
-- **Reductions:** sum / max over a vector — the primitives for LayerNorm statistics and
-  softmax.
-- **Attention scores.** Because `QK^T` and `AV` multiply *activations by activations*
-  (not ternary weights) with small dims (`head_dim=16`, `T≤32`), they run here as batched
-  int8 dot products rather than on the [MXU](mxu.md). Softmax (the `+mask`, `exp`,
-  normalize of `mha_torch`) is a VPU reduction + activation sequence.
+What is left:
 
-## Microarchitecture
-
-`NLANE` int8/int32 ALU lanes fed from a single wide scratchpad read (the `V_rw` port,
-512 bits ⇒ `NLANE = 16` int32 or 64 int8). One scratchpad access supplies all lanes in
-lockstep — true SIMD, no per-lane addressing.
-
-```
-scratchpad V_rw (512b)
-        │
-   ┌────┴────┬────────┬─── … ──┐
-  lane0    lane1    lane2     laneN
- [add/sub][mul  ][cmp/max][act LUT]   ← each lane: add, sub, mul, compare, shift
-        │
-   reduction tree (sum / max)  ──► scalar out
-        │
-   writeback V_rw
-```
-
-Each lane has: int32 adder, small multiplier (for `×scalar` and dot products — this is
-the one place multipliers are unavoidable), comparator (max), and a shifter for
-requant. A shared **reduction tree** across lanes produces sum/max for dot products,
-softmax denominators, and LayerNorm mean/variance.
+- **Activations:** ReLU. (The FFN is `ReLU`, not GELU — `model/transformer.py`.)
+- **Elementwise arithmetic:** vector add — the residuals `X + O` and `X1 + F`.
+- **Narrowing:** `REQUANT` (int32 → int8) and `DYT` (the same rescale, symmetric clip),
+  which is how DyT normalization costs no pass of its own.
+- **Attention scores.** `QK^T` and `AV` multiply *activations by activations* (not
+  ternary weights), so they run here rather than on the [MXU](mxu.md), as the
+  `VECMATMUL` macro op — a `DOT` per (query, key) pair. There is **no softmax**: the
+  model uses ReLU attention, so the mask-add is a `vecadd` against an int8 mask and the
+  nonlinearity is `RELU`.
 
 ## Operations
 
-The op is selected by the 4-bit `vpu_op` field driven by the scalar unit. Codes 0–4
-match the `VOP_*` values the scalar unit already emits (`scalar_unit.sv`); 5–12 extend
-the set for the softmax / LayerNorm / attention micro-sequences that the ISA builds out
-of these primitives (`SCALAR_ADD`/`SCALAR_DIV` are the broadcast subtract and normalize
-those reductions need).
+The op is selected by the 5-bit `vpu_op` field driven by the scalar unit, matching the
+`VOP_*` values in `scalar_unit.sv` and `vpu.sv`.
 
-| `vpu_op` | Name          | Kind        | Operands used             | Result                                  |
-| -------- | ------------- | ----------- | ------------------------- | --------------------------------------- |
-| `0`      | `DOT`         | reduction   | `src0`, `src1`            | scalar `Σ src0[i]·src1[i]` → `dst`      |
-| `1`      | `ADD`         | elementwise | `src0`, `src1`            | `dst[i] = src0[i] + src1[i]`            |
-| `2`      | `SCALAR_MUL`  | elementwise | `src0`, `scalar`          | `dst[i] = src0[i] × scalar`             |
-| `3`      | `RELU`        | elementwise | `src0`                    | `dst[i] = max(src0[i], 0)`             |
-| `4`      | `GELU`        | elementwise | `src0`                    | `dst[i] = gelu_lut[src0[i]]`           |
-| `5`      | `SQUARE`      | elementwise | `src0`                    | `dst[i] = src0[i]²` (LayerNorm var)     |
-| `6`      | `EXP`         | elementwise | `src0`                    | `dst[i] = exp_lut[src0[i]]` (softmax)  |
-| `7`      | `REDUCEMAX`   | reduction   | `src0`                    | scalar `max_i src0[i]` → `dst`          |
-| `8`      | `REDUCESUM`   | reduction   | `src0`                    | scalar `Σ src0[i]` → `dst`             |
-| `9`      | `ELEMENT_MUL` | elementwise | `src0`, `src1`            | `dst[i] = src0[i] · src1[i]`           |
-| `10`     | `REQUANT`     | requant     | `src0`(int32), `scalar`   | `dst[i] = clip((src0[i]·m0 + rnd) >> n)`|
-| `11`     | `SCALAR_ADD`  | elementwise | `src0`, `scalar`          | `dst[i] = src0[i] + scalar`            |
-| `12`     | `SCALAR_DIV`  | scalar div  | `src0`, `scalar`          | `dst[i] = round(src0[i]·2^15 / scalar)`|
-| `13`     | `VECMATMUL`   | macro op    | `src0`, `src1`, geometry  | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]` |
-| `14`     | `SOFTMAX`     | macro op    | `src0`, `tmp`, `vscalar`  | row-wise softmax, Q15 (four inner passes)|
-| `15`     | `SM_EXP`      | *internal*  | —                         | `SOFTMAX`'s fused pass 2; never dispatched|
-| `16`     | `DYT`         | requant     | `src0`(int32), `scalar`   | `dst[i] = clip±127((src0[i]·m0 + rnd) >> n)`|
+| `vpu_op` | Name        | Kind        | Operands used            | Result                                       |
+| -------- | ----------- | ----------- | ------------------------ | -------------------------------------------- |
+| `0`      | `DOT`       | reduction   | `src0`, `src1`           | scalar `Σ src0[i]·src1[i]` → `dst`           |
+| `1`      | `ADD`       | elementwise | `src0`, `src1`           | `dst[i] = src0[i] + src1[i]`                 |
+| `3`      | `RELU`      | elementwise | `src0`                   | `dst[i] = max(src0[i], 0)`                   |
+| `10`     | `REQUANT`   | requant     | `src0`(int32), `scalar`  | `dst[i] = clip((src0[i]·m0 + rnd) >> n)`     |
+| `13`     | `VECMATMUL` | macro op    | `src0`, `src1`, geometry | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]`      |
+| `16`     | `DYT`       | requant     | `src0`(int32), `scalar`  | `dst[i] = clip±127((src0[i]·m0 + rnd) >> n)` |
 
-`REDUCEMAX`/`REDUCESUM`/`DOT` collapse the whole vector to one int32 scalar; the other
-compute ops produce a same-length vector. `GELU`/`EXP` are 256-entry int8→int8 LUTs
-indexed by the signed input byte, a fixed hardware artifact loaded once (`$readmemh` at
-init) — see [Activation LUTs](#activation-luts).
+The gaps (`2`, `4`–`9`, `11`, `12`, `14`, `15`) are retired codes, not free encoding
+space — see [Removed ops](#removed-ops). They are left vacant so a stale binary decodes
+to an unknown op rather than a different one.
 
-`SCALAR_ADD` broadcasts one int32 word from the `scalar` address over every lane — the
-`x - max` (softmax) and `x - mean` (LayerNorm) subtracts, done by adding a negated
-scalar. `SCALAR_DIV` divides by a **runtime** scalar (softmax's `Σexp`, LayerNorm's
-variance) — see [Divide](#divide).
+`DOT` is the only reduction: it collapses the vector to one int32 scalar at `dst`. Every
+other op produces a same-length vector. `DOT` is also the sole reason `vecdot` still
+exists as an instruction — no shipped kernel issues it, but it is `VECMATMUL`'s inner
+primitive, so the datapath is mandatory and the opcode costs one decode arm.
 
-### Divide
+### Removed ops
 
-A runtime divisor cannot be a compile-time `{m0, n}` like `REQUANT`, so `SCALAR_DIV`
-reciprocates it once and reuses the lanes' multipliers. When the scalar loads, a single
-shared restoring divider computes `R = floor(2^RECIP_Q / |d|)` (`RECIP_Q = 31`, so
-`RECIP_Q + 1 = 32` cycles, amortized over the whole vector). Each lane then forms
+These were implemented and are now gone. They served a softmax-attention, LayerNorm,
+GELU-FFN model; `model/transformer.py` is ReLU attention, DyT normalization and a ReLU
+feed-forward, so by the time the shipped kernel
+([`adder_model.tpu`](../../tpulang/examples/adder_model.tpu)) was written not one of
+them had a caller.
 
-```
-dst[i] = sign(d) · round( (src0[i] · R) >> (RECIP_Q − DIV_Q) )      (DIV_Q = 15)
-       = round( src0[i] · 2^DIV_Q / d )
-```
+| Removed | Was for | Went with it |
+| --- | --- | --- |
+| `GELU` (4), `EXP` (6) | GELU FFN; softmax's `exp` | both 256×int8 ROMs, `rtl/luts/*.hex`, `accel/tpulang/luts.py`, the `GELU_INIT`/`EXP_INIT` parameters through `tpu_top.sv` and the board wrapper |
+| `SQUARE` (5) | LayerNorm variance | — |
+| `ELEMENT_MUL` (9), `SCALAR_MUL` (2), `SCALAR_ADD` (11) | LayerNorm/softmax broadcasts | — |
+| `SCALAR_DIV` (12) | softmax's `Σexp`, LayerNorm variance | the shared restoring divider, `recip_R`/`div_*` state, the `S_RECIP` state, and the `RECIP_Q`/`DIV_Q` parameters |
+| `REDUCEMAX` (7), `REDUCESUM` (8) | softmax/LayerNorm statistics | the **max fold** in the reduction path — `acc` now always opens at zero, since `DOT` is the only reduction left |
+| `SOFTMAX` (14), `SM_EXP` (15) | the fused row-wise softmax macro op | its whole four-pass sequencer (`sm_*`), and `cfg vscalar` (index 9), the config register only it read |
 
-reusing the `SCALAR_MUL` 8×32 multiplier. The result is emitted in a **fixed** Q15
-format, so even though the divisor is only known at run time the result's scale is
-`scale(src0) / scale(d) · 2^−15` — a compile-time constant the compiler requantizes
-like any other int32 buffer. A zero divisor saturates `R` to all-ones (the compiler
-guarantees a nonzero divisor: `Σexp ≥ 1`, `var > 0`).
+Two ISA-level consequences. `cfg vscalar` is **retired but its index is not reused**:
+renumbering `vrows`…`tdrow` would silently repoint every `setcfg` in every existing
+program. And `vpu_scalar` is now unconditionally the third register operand, because
+`SOFTMAX` — the one op whose three registers were `dst`/`src`/`tmp`, leaving no slot for
+the requant word — was the reason that routing had a special case at all.
 
-For softmax this makes the normalize exact-in-format: `p_i = e_i / D` becomes
-`q_i = round(e_i · 2^15 / D)` in Q15, and a following `REQUANT` with `{m0 = 127, n = 15}`
-lands the probabilities on int8's `±127`.
+Measured on the trimmed unit, out-of-context synthesis of `vpu` alone
+(`build.tcl mode=ooc module=vpu`, xc7a35t, ROWS=COLS=8):
 
-### Activation LUTs
+| | LUTs | FFs | DSPs |
+| --- | --- | --- | --- |
+| before | 10012 | 897 | 90 |
+| after | **5162** | **667** | **32** |
+| | −48.4% | −25.6% | −64.4% |
 
-`gelu_rom` / `exp_rom` are the VPU's only activation tables — one each, loaded at init
-from `GELU_INIT` / `EXP_INIT`. Because the table *is* the op's numerics
-(`res32 = gelu_rom[idx8]`), its scales are a **fixed** hardware choice, not per-program;
-[`accel/tpulang/luts.py`](../../tpulang/luts.py) pins them and generates the
-`$readmemh` files:
+The DSP collapse is the headline and is not mysterious: `SCALAR_MUL`, `ELEMENT_MUL`,
+`SQUARE` and `SCALAR_DIV`'s reciprocal multiply each wanted a per-lane multiplier, and
+there are 16 lanes. What remains is `DOT`'s 8×8 product and the two narrowing ops'
+`acc32 × m0`.
 
-| Table  | Input range | `in_scale` | `out_scale` | Notes                                             |
-| ------ | ----------- | ---------- | ----------- | ------------------------------------------------- |
-| `gelu` | `[-8, 8)`   | `1/16`     | `1/16`      | ≈ identity for `x ≳ 2`; keeps the dip near `-0.75` (as `-3`). Same scale in and out, and saturation is unreachable (`|gelu(x)| ≤ |x|`), so the op is scale-preserving |
-| `exp`  | `[-8, 0]`   | `1/16`     | `1/127`     | softmax's `x − max` is ≤ 0; `exp(0) = 1 → 127`, `exp(-8) → 0`. Entries below `x = -5.54` underflow to 0 (< 0.4% of the peak). Positive indices (unreachable after `x − max`) saturate at 127 |
-
-The exact (erf) GELU, matching `nn.GELU()` in `model/transformer.py` — not the tanh
-approximation. Entries round half **up** (`floor(v + 0.5)`), the same direction as
-`requant8`'s shift.
-
-```
-entry[u] = clip_int8(round(f(s8(u) · in_scale) / out_scale))     u = 0..255
-```
-
-Generated files, regenerated by `python accel/tpulang/luts.py` (`--check` verifies the
-checked-in copies are current, `--dump gelu` prints the table):
-
-| File | Loaded by |
-| --- | --- |
-| `rtl/luts/gelu_lut.hex` | `GELU_INIT` |
-| `rtl/luts/exp_lut.hex`  | `EXP_INIT`  |
-
-The same two tables are importable as `luts.GELU_LUT` / `luts.EXP_LUT`; `iss.py`
-defaults to them, which is what keeps the simulator bit-exact with the ROM.
-
-**The input scale is assumed, never checked.** An operand reaches a table in its
-`in_scale` by an ordinary `REQUANT` the compiler inserts ahead of the op — getting into
-the table's scale is the compiler's job, not the hardware's. Feed `exp` a buffer at some
-other scale and nothing errors; it evaluates `exp` of the wrong number. The same is true
-of feeding `exp` a vector the `x − max` subtract never touched: every positive index
-reads back 127.
+**What coming back would cost.** `softmax` is the one to think about before deleting
+anything further: `model/transformer.py` still carries the comment *"revert to softmax
+if training bad"* next to its ReLU attention, and restoring it means restoring `EXP`
+(and so the ROM, `luts.py` and the `$readmemh` plumbing), `REDUCEMAX`, `REDUCESUM`,
+`SCALAR_DIV` with its divider, `SM_EXP`, the four-pass sequencer and `cfg vscalar` —
+i.e. essentially this entire table. It is all recoverable from git history, but it is
+not a one-line revert. LayerNorm would additionally want `SQUARE` back.
 
 ### Datatypes and requant
 
@@ -154,12 +105,13 @@ dst[i] = clip_int8( (src0[i] * m0 + (1 << (n-1))) >> n )
 the same arithmetic as [`requant.sv`](../rtl/requant.sv), with the per-tensor multiplier
 `m0` (`M0_W` bits) and shift `n` (`N_W` bits) packed into the 32-bit word at the
 `scalar` address (`m0` in the low bits, `n` above). Keeping requant a separate op lets
-the scalar unit hold the residual stream and softmax/LayerNorm temporaries at full int32
-precision and requantize **only where an int8 activation is actually consumed** — e.g.
-right before an MXU matmul — instead of clipping after every pointwise op. The result
-scale is chosen entirely by `m0`/`n`, so a producer emits its result already in the
-consumer's scale (this is how residual adds with differing operand scales are
-reconciled: rescale-then-add via `SCALAR_MUL`/`REQUANT`, then `ADD`).
+the scalar unit hold the residual stream at full int32 precision and requantize **only
+where an int8 activation is actually consumed** — e.g. right before an MXU matmul —
+instead of clipping after every pointwise op. The result scale is chosen entirely by
+`m0`/`n`, so a producer emits its result already in the consumer's scale. That is the
+only mechanism left for reconciling a residual add whose operands differ in scale:
+`ADD` takes two int8 operands at one scale, so the producer's `REQUANT` has to land on
+it (`adder_kernel.md` §4 — this is what pins `RQ_O` and `RQ_F`).
 
 ### DyT (`DYT`)
 
@@ -187,7 +139,7 @@ be narrowed from int32 to int8 anyway. See
 
 Nothing checks that the output scale really is `1/127`. A `DYT` whose word
 targets some other scale is a rescale with an odd clip, not a hardtanh — the
-scale contract is the compiler's, exactly as it is for the LUT ops above.
+scale contract is the compiler's.
 
 ## Interface
 
@@ -200,10 +152,10 @@ scratchpad port for the duration of the op.
 | Signal      | Dir | Width     | Meaning                                             |
 | ----------- | --- | --------- | --------------------------------------------------- |
 | `vpu_start` | in  | 1         | pulse: latch operands and begin (ignored if busy)   |
-| `vpu_op`    | in  | 4         | operation selector (table above)                    |
+| `vpu_op`    | in  | 5         | operation selector (table above)                    |
 | `vpu_src0`  | in  | `ADDR_W`  | byte address of source vector 0                     |
 | `vpu_src1`  | in  | `ADDR_W`  | byte address of source vector 1 (binary ops)        |
-| `vpu_scalar`| in  | `ADDR_W`  | byte address of the broadcast scalar (`SCALAR_MUL`) |
+| `vpu_scalar`| in  | `ADDR_W`  | byte address of the `{m0,n}` word (`REQUANT`/`DYT`) |
 | `vpu_dst`   | in  | `ADDR_W`  | byte address of the destination                     |
 | `vpu_vlen`  | in  | 10        | vector length in elements (config reg, ≤ 1023)      |
 | `vpu_busy`  | out | 1         | high from `start` until the op retires              |

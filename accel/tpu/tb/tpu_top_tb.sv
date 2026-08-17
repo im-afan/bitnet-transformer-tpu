@@ -58,17 +58,6 @@
   `define SPAD_EXP_FILE "vectors/tpu_spad_exp.hex"
 `endif
 
-// ---- VPU activation LUTs ----------------------------------------------------
-// Not vectors: these are the fixed ROM contents the bitstream burns in, so the
-// TB loads exactly what the board would (accel/tpulang/luts.py generates both).
-// Passing them makes `gelu`/`exp` mean the same thing here and in the ISS.
-`ifndef GELU_LUT_FILE
-  `define GELU_LUT_FILE "../rtl/luts/gelu_lut.hex"
-`endif
-`ifndef EXP_LUT_FILE
-  `define EXP_LUT_FILE "../rtl/luts/exp_lut.hex"
-`endif
-
 module tpu_top_tb;
 
     // ---- Geometry (must match the DUT instance and gen_vectors.py) ----------
@@ -128,8 +117,7 @@ module tpu_top_tb;
         .ROWS(ROWS), .COLS(COLS), .VPU_BYTES(VPU_BYTES), .ADDR_W(ADDR_W),
         .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W),
         .REG_AW(REG_AW), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
-        .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W),
-        .GELU_INIT(`GELU_LUT_FILE), .EXP_INIT(`EXP_LUT_FILE)
+        .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W)
     ) dut (
         .clk(clk), .rst_n(rst_n),
         .host_run(host_run), .boot_pc(boot_pc),

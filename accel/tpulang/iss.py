@@ -45,20 +45,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import luts
-
 # --- opcode map (must match scalar_unit.sv OP_* and assembler.py SPECS) --------
-OP_MATMUL, OP_VECDOT, OP_VECMUL, OP_VECADD = 0x00, 0x01, 0x02, 0x03
-OP_RELU, OP_GELU, OP_WRMEM, OP_RDMEM = 0x04, 0x05, 0x06, 0x07
-OP_WRNEIGH, OP_REQUANT, OP_VECEMUL, OP_SQUARE = 0x08, 0x09, 0x0A, 0x0B
-OP_EXP, OP_REDMAX, OP_REDSUM, OP_SADD = 0x0C, 0x0D, 0x0E, 0x0F
+# 0x02, 0x05, 0x0A-0x0F, 0x1B and 0x20 are retired holes: vecmul, gelu,
+# vecemul, square, exp, redmax, redsum, sadd, sdiv and softmax went with the VPU
+# datapath that implemented them (rtl/vpu.sv header). They are not reused, so an
+# old binary decodes to an unknown opcode rather than to a different
+# instruction. `vecdot` (0x01) stayed: it is vecmatmul's inner primitive, so its
+# datapath is not optional.
+OP_MATMUL, OP_VECDOT, OP_VECADD = 0x00, 0x01, 0x03
+OP_RELU, OP_WRMEM, OP_RDMEM = 0x04, 0x06, 0x07
+OP_WRNEIGH, OP_REQUANT = 0x08, 0x09
 OP_ADDS, OP_SUBS, OP_MULS, OP_CMPS = 0x10, 0x11, 0x12, 0x13
 OP_LIS, OP_SETCFG, OP_LOADS, OP_STORES = 0x14, 0x15, 0x16, 0x17
-OP_BRANCH, OP_JMP, OP_WAIT, OP_SDIV, OP_HALT = 0x18, 0x19, 0x1A, 0x1B, 0x1F
+OP_BRANCH, OP_JMP, OP_WAIT, OP_HALT = 0x18, 0x19, 0x1A, 0x1F
 OP_SETCFGR = 0x1C
 OP_MATMUL_T = 0x1D
 OP_VECMM = 0x1E
-OP_SOFTMAX = 0x20
 OP_DYT = 0x21
 
 # --- named config registers (scalar_unit.sv CFG_*) ----------------------------
@@ -66,7 +68,9 @@ CFG_TLEN, CFG_VLEN, CFG_LEN, CFG_SCALAR = 0, 1, 2, 3
 # MXU hardware-tiling geometry (docs/macro_ops.md §3)
 CFG_KTILES, CFG_NTILES, CFG_AROW, CFG_CROW, CFG_WCOL = 4, 5, 6, 7, 8
 # VPU macro-op geometry
-CFG_VSCALAR, CFG_VROWS, CFG_VCOLS, CFG_VROW0, CFG_VROW1 = 9, 10, 11, 12, 13
+# CFG_VSCALAR (9) is retired with OP_SOFTMAX, the only op that read it; the
+# index is kept so 10..17 do not shift under every existing program.
+CFG_VROWS, CFG_VCOLS, CFG_VROW0, CFG_VROW1 = 10, 11, 12, 13
 CFG_VCROW = 14   # vecmatmul dst row stride (the MXU owns CFG_CROW)
 # DMA transpose geometry (docs/dma.md §5); read only by rdmem.t / wrmem.t.
 CFG_TCOLS, CFG_TSROW, CFG_TDROW = 15, 16, 17
@@ -110,16 +114,6 @@ class TPU:
     mem_addr_w: int = 19   # external DRAM byte-address width (2**mem_addr_w)
     m0_w: int = 12         # requant fixed-point multiplier width
     n_w: int = 4           # requant shift width
-    recip_q: int = 31      # VOP_SCALAR_DIV reciprocal exponent (vpu.sv)
-    div_q: int = 15        # VOP_SCALAR_DIV quotient fractional bits (Q15)
-    # Activation tables (256 x int8, indexed by the unsigned input byte). These
-    # default to the *same* tables the bitstream burns in (luts.py), because the
-    # ROM contents are a fixed hardware artifact, not a per-program choice — the
-    # ISS is only bit-exact with the RTL if both sides hold the same bytes. The
-    # corollary is that `gelu`/`exp` operands must already be at the tables'
-    # canonical input scale; see luts.py.
-    gelu_lut: list | None = None
-    exp_lut: list | None = None
 
     mem: bytearray = field(init=False)      # on-chip scratchpad
     dram: bytearray = field(init=False)     # external DRAM (DMA source/destination)
@@ -138,10 +132,6 @@ class TPU:
         self.written = set()
         self.dram_written = set()
         self.wcol_bytes = (self.rows * 2) // 8   # packed ternary column bytes
-        if self.gelu_lut is None:
-            self.gelu_lut = luts.GELU_LUT
-        if self.exp_lut is None:
-            self.exp_lut = luts.EXP_LUT
 
     # ---- scratchpad access (addresses wrap mod depth, like the RTL) ----------
     def _a(self, addr: int) -> int:
@@ -320,17 +310,11 @@ class TPU:
                              requant=bool(flags & 0b10),
                              tiled=(opc == OP_MATMUL_T))
 
-            elif opc == OP_SOFTMAX:
-                self._softmax(r_dst & addr_mask, r_src0 & addr_mask,
-                              r_src1 & addr_mask)
-
             elif opc == OP_VECMM:
                 self._vecmatmul(r_dst & addr_mask, r_src0 & addr_mask,
                                 r_src1 & addr_mask)
 
-            elif opc in (OP_VECDOT, OP_VECMUL, OP_VECADD, OP_RELU, OP_GELU,
-                         OP_REQUANT, OP_VECEMUL, OP_SQUARE, OP_EXP, OP_REDMAX,
-                         OP_REDSUM, OP_SADD, OP_SDIV, OP_DYT):
+            elif opc in (OP_VECDOT, OP_VECADD, OP_RELU, OP_REQUANT, OP_DYT):
                 self._vpu(opc, r_dst & addr_mask, r_src0 & addr_mask,
                           r_src1 & addr_mask)
 
@@ -457,64 +441,6 @@ class TPU:
                     else:
                         self.wr_i32(out_n + t * c_row + j * 4, acc)
 
-    # ---- VPU macro op: softmax (vpu.sv VOP_SOFTMAX) --------------------------
-    def _softmax(self, dst: int, src: int, tmp: int) -> None:
-        """Row-wise softmax, Q(div_q) result. Four passes, as the hardware runs it.
-
-        Modelled pass-by-pass rather than as ``exp(x)/sum(exp(x))`` because the
-        intermediate *widths* are the numerics:
-
-          P0  max over the int8 source row            -> held in a register
-          P1  exp_lut[requant(x - max)]               -> int8, into tmp
-          P2  sum over the int8 tmp row               -> int32, at tmp+vlen
-          P3  round(tmp[i] * 2**div_q / sum)          -> int32, into dst
-
-        P1 is the fused pass: subtract, requantize into the exp table's input
-        scale, index the table, store **narrow**. Writing int32 there and reading
-        int8 in P2 is exactly the stride mismatch the hand-written
-        softmax_row.tpu has (its `sadd` writes 4-byte elements, its `exp` reads
-        1-byte ones), and fusing is what makes it unrepresentable.
-
-        The denominator really does round-trip through scratchpad at ``tmp+vlen``
-        — that is not a modelling shortcut, it is how the hardware hands P2's
-        result to P3 so P3 can reuse the ordinary SCALAR_DIV divisor path. Each
-        tmp row therefore needs vlen+4 bytes.
-        """
-        rows = (self.cfg[CFG_VROWS] & 0xFFFF) or 1
-        vlen = self.cfg[CFG_VLEN] & 0x3FF
-        row0 = self.cfg[CFG_VROW0] & 0xFFFF
-        row1 = self.cfg[CFG_VROW1] & 0xFFFF
-        crow = self.cfg[CFG_VCROW] & 0xFFFF
-        if vlen == 0:
-            return
-        rqw = self.rd_u32(self.cfg[CFG_VSCALAR] & (self.depth - 1))
-        m0 = rqw & ((1 << self.m0_w) - 1)
-        n = (rqw >> self.m0_w) & ((1 << self.n_w) - 1)
-
-        for t in range(rows):
-            s_row = src + t * row0
-            t_row = tmp + t * row1
-            d_row = dst + t * crow
-            den_a = t_row + vlen
-
-            # P0: row max (int8 reads), kept as a value, never stored.
-            mx = max(self.rd_i8(s_row + i) for i in range(vlen))
-
-            # P1: fused subtract -> requant -> exp LUT, stored int8.
-            for i in range(vlen):
-                # requant8 returns a signed int8; the ROM is indexed by the raw
-                # unsigned byte, exactly as vpu.sv indexes exp_rom.
-                idx = self.requant8(self.rd_i8(s_row + i) - mx, m0, n)
-                self.wr_i8(t_row + i, s8(self.exp_lut[idx & 0xFF]))
-
-            # P2: denominator over the int8 exp row, stored int32.
-            den = s32(sum(self.rd_i8(t_row + i) for i in range(vlen)))
-            self.wr_i32(den_a, den)
-
-            # P3: Q(div_q) normalize, reusing the ordinary scalar-divide path.
-            for i in range(vlen):
-                self.wr_i32(d_row + i * 4, self._sdiv(self.rd_i8(t_row + i), den))
-
     # ---- VPU macro op: vecmatmul (vpu.sv VOP_VECMATMUL) ----------------------
     def _vecmatmul(self, dst: int, src0: int, src1: int) -> None:
         """S[t][s] = sum_d src0[t][d] * src1[s][d], int8 operands, int32 result.
@@ -549,7 +475,7 @@ class TPU:
         vlen = self.cfg[CFG_VLEN] & 0x3FF
         if vlen == 0:
             return
-        # src1 doubles as the scalar/param address for scalar & requant ops.
+        # src1 doubles as the {m0,n} word address for the two narrowing ops.
         scalar = self.rd_i32(src1)
 
         # The two narrowing ops: int32 in at stride 4, int8 out at stride 1,
@@ -563,21 +489,12 @@ class TPU:
                 self.wr_i8(dst + i, narrow(a32, m0, n))
             return
 
-        if opc in (OP_VECDOT, OP_REDSUM, OP_REDMAX):   # reductions -> one int32
-            acc = None
+        # The one reduction: whole vector -> a single int32 at `dst`.
+        if opc == OP_VECDOT:
+            acc = 0
             for i in range(vlen):
-                a = self.rd_i8(src0 + i)
-                if opc == OP_VECDOT:
-                    v = a * self.rd_i8(src1 + i)
-                elif opc == OP_REDSUM:
-                    v = a
-                else:  # REDMAX (over int32-widened int8 operands)
-                    v = a
-                if opc == OP_REDMAX:
-                    acc = v if acc is None else max(acc, v)
-                else:
-                    acc = v if acc is None else acc + v
-            self.wr_i32(dst, s32(acc if acc is not None else 0))
+                acc += self.rd_i8(src0 + i) * self.rd_i8(src1 + i)
+            self.wr_i32(dst, s32(acc))
             return
 
         # elementwise: int8 source(s) -> int32 dst
@@ -585,40 +502,9 @@ class TPU:
             a = self.rd_i8(src0 + i)
             if opc == OP_VECADD:
                 r = a + self.rd_i8(src1 + i)
-            elif opc == OP_VECEMUL:
-                r = a * self.rd_i8(src1 + i)
-            elif opc == OP_VECMUL:
-                r = a * s32(scalar)
-            elif opc == OP_SADD:
-                r = a + s32(scalar)
-            elif opc == OP_SDIV:
-                r = self._sdiv(a, s32(scalar))
             elif opc == OP_RELU:
                 r = a if a > 0 else 0
-            elif opc == OP_SQUARE:
-                r = a * a
-            elif opc == OP_GELU:
-                r = self._lut(self.gelu_lut, "gelu", src0 + i)
-            elif opc == OP_EXP:
-                r = self._lut(self.exp_lut, "exp", src0 + i)
             else:
                 raise ISSError(f"unhandled VPU opcode 0x{opc:02x}")
             self.wr_i32(dst + i * 4, s32(r))
 
-    def _lut(self, lut, name: str, addr: int) -> int:
-        if lut is None:
-            raise ISSError(f"{name} op needs a {name}_lut (256 x int8) — it "
-                           f"defaults to luts.{name.upper()}_LUT, so this only "
-                           f"happens if something cleared it")
-        return s8(lut[self.mem[self._a(addr)]])   # indexed by unsigned byte
-
-    def _sdiv(self, a8: int, d: int) -> int:
-        """round(a8 * 2**DIV_Q / d), matching vpu.sv's reciprocal datapath."""
-        if d == 0:
-            R = (1 << (self.recip_q + 1)) - 1      # div-by-zero saturates R
-        else:
-            R = (1 << self.recip_q) // abs(d)      # floor(2**RECIP_Q / |d|)
-        prod = a8 * R
-        shift = self.recip_q - self.div_q
-        q = prod if shift == 0 else (prod + (1 << (shift - 1))) >> shift
-        return -q if d < 0 else q

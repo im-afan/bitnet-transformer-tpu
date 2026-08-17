@@ -14,7 +14,7 @@ Detailed per-component design notes (this file is the overview):
 | [scalar_unit.md](scalar_unit.md) | Control processor microarchitecture                   |
 | [scalar_unit_pipeline.md](scalar_unit_pipeline.md) | Plan to pipeline it — **proposal, not built**; the RTL is still the multi-cycle FSM |
 | [isa.md](isa.md)                 | Guide to writing TPU programs in tpulang (+ encoding/opcode appendix) |
-| [macro_ops.md](macro_ops.md)     | Plan to move tiling/softmax/LayerNorm into hardware (CISC macro-ops) — **proposal, not built**; the ISA is still one-pass-per-instruction |
+| [macro_ops.md](macro_ops.md)     | Moving tiling/attention into hardware (CISC macro-ops). Phases 0–4 **are built** (`setcfgr`, MXU strides, `matmul_t`, `vecmatmul`); `softmax` was built then removed and `layernorm` is dropped — see its banner |
 | [uart_host.md](uart_host.md)     | The host link: frame format, the five commands, arbitration |
 | [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image and how to use it |
 | [synth.md](synth.md)             | Vivado build flow, Cmod A7-35T deployment, sizing reality check |
@@ -50,7 +50,7 @@ The MXU output immediately gets written to another address in scratchpad memory.
 
 ### 3. VPU
 
-The VPU performs all other important pointwise vector operations using SIMD, such as activations (relu, gelu, etc), vector add, dot product, and reductions. 
+The VPU performs the remaining pointwise vector operations using SIMD: `relu`, vector add, the `requant`/`dyt` narrows, and the `vecmatmul` macro op (built on a dot-product reduction). It is deliberately no larger than that — the activation LUTs, broadcast/scalar ops, divider, reductions and the softmax macro op were removed once the model stopped needing them ([vpu.md §Removed ops](vpu.md#removed-ops)). 
 It contains multiple ALUs that act on data from a single scratchpad memory access.
 
 ### 4. Communication interface
@@ -78,9 +78,8 @@ how programs are written:
   `setcfg tlen` (MXU token count), `setcfg vlen` (VPU vector length), `setcfg len` (DMA byte
   count). Stale config is the most common silent bug in a tpulang program.
 
-The dispatched ops are `matmul` (with `.acc`/`.rq` flags), `vecdot`, `vecadd`, `vecemul`,
-`vecmul`, `sadd`, `sdiv`, `relu`, `gelu`, `square`, `exp`, `redmax`, `redsum`, and
-`requant`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
+The dispatched ops are `matmul` / `matmul_t` (with `.acc`/`.rq` flags), `vecmatmul`,
+`vecdot`, `vecadd`, `relu`, `requant`, and `dyt`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
 `wrneigh`; control is `adds`, `subs`, `muls`, `cmps`, `li`, `loads`, `stores`, `setcfg`,
 `branch` (and the `beq`/`bne`/`blt`/`bge` forms), `jmp`, `wait`, and `halt`.
 

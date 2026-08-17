@@ -51,7 +51,7 @@ import model.quant as quant                                     # noqa: E402
 import model.transformer as transformer                         # noqa: E402
 
 T = 32                            # train.py --max_tokens; the kernel's cfg tlen
-CKPT = os.path.join(ROOT, "model", "saved", "colab_ternary_mha_small_dyt.pt")
+CKPT = os.path.join(ROOT, "model", "saved", "ternary_mha.pt")
 
 # The requant slots, in the order adder_model.tpu reads them out of its layer
 # block. Taken from quant.py rather than restated so the two cannot disagree
@@ -217,7 +217,7 @@ def main(argv=None) -> int:
 
     print(f"\naccuracy over {rep.n_problems} problems (T={T}):")
     print(f"  {'':22s} {'exact-sequence':>15s} {'token':>9s}")
-    print(f"  {'float':22s} {rep.float_seq * 100:14.2f}% {rep.float_tok * 100:8.2f}%")
+    print(f"  {'float (quant off)':22s} {rep.float_seq * 100:14.2f}% {rep.float_tok * 100:8.2f}%")
     print(f"  {'int8 activations':22s} {rep.int_seq * 100:14.2f}% {rep.int_tok * 100:8.2f}%")
     print(f"  the two agree on {rep.agreement * 100:.2f}% of sequences")
 

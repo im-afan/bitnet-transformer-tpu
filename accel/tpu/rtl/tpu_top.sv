@@ -72,8 +72,9 @@ module tpu_top #(
     // ---- Memory / init ------------------------------------------------------
     parameter     MEM_STYLE = "BRAM",  // top-level working memory primitive
     parameter     SPAD_INIT = "",      // optional scratchpad $readmemh preload
-    parameter     GELU_INIT = "",      // VPU GELU LUT (256 × int8) $readmemh
-    parameter     EXP_INIT  = "",      // VPU EXP  LUT (256 × int8) $readmemh
+    // GELU_INIT / EXP_INIT are gone with the `gelu` / `exp` instructions and
+    // their 256-entry ROMs (vpu.sv header). The VPU now has no $readmemh
+    // artifact at all, so rtl/luts/ and accel/tpulang/luts.py were deleted too.
 
     // ---- Derived scratchpad byte widths (do not override) -------------------
     parameter int A_BYTES   = ROWS,          // A_rd  : ROWS int8 activation column
@@ -413,9 +414,7 @@ module tpu_top #(
         .SCRATCHPAD_W (VPU_BYTES),
         .ADDR_W       (ADDR_W),
         .M0_W         (M0_W),
-        .N_W          (N_W),
-        .GELU_INIT    (GELU_INIT),
-        .EXP_INIT     (EXP_INIT)
+        .N_W          (N_W)
     ) u_vpu (
         .clk   (clk),
         .rst_n (rst_n),

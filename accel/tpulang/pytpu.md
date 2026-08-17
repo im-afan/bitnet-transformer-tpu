@@ -87,8 +87,8 @@ Two semantic traps that cause most tpulang bugs — pytpu does **not** protect y
 by design (it emits, it does not typecheck):
 
 - **VPU ops read int8 at stride 1 and write int32 at stride 4.** `requant` is the only op that
-  narrows back. `softmax_row.tpu` is broken in exactly this way.
-- **Reductions (`redmax`, `redsum`, `vecdot`) write one int32 to the *scratchpad*, not to a
+  narrows back. The deleted `softmax_row.tpu` was broken in exactly this way.
+- **`vecdot` (the only reduction) writes one int32 to the *scratchpad*, not to a
   register.** Getting a reduction into a broadcast scalar is `reduce → loads → scalar math →
   stores`.
 
@@ -159,11 +159,8 @@ One thin wrapper per mnemonic, generated from a table rather than hand-written (
 p.cfg(tlen=T, len=ATILE, vlen=..., scalar=SRQW)     # -> setcfg lines
 
 p.matmul(out, act, wgt, acc=False, rq=False)        # .acc / .rq suffixes
-p.vecadd(dst, a, b);  p.vecemul(dst, a, b);  p.vecdot(dst, a, b)
-p.vecmul(dst, a, s);  p.sadd(dst, a, s);     p.sdiv(dst, a, s)
-p.requant(dst, src, param)
-p.relu(dst, s);  p.gelu(dst, s);  p.exp(dst, s);  p.square(dst, s)
-p.redmax(dst, s);  p.redsum(dst, s)
+p.vecadd(dst, a, b);  p.vecdot(dst, a, b);  p.relu(dst, a)
+p.requant(dst, a, param);  p.dyt(dst, a, param)
 
 p.rdmem(scratch, dram, t=False)                     # length from cfg 'len';
 p.wrmem(scratch, dram, t=False)                     #   t=True -> .t (transpose)

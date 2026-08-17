@@ -1,6 +1,25 @@
 # Macro-op ISA (CISC) — design note
 
-**Status: phases 0–5 built and validated; 6–7 not started.** See §8 for the phase table.
+> ## ⚠️ `softmax` and `layernorm` are out of scope as of the VPU trim
+>
+> This document was written when the model was softmax attention + LayerNorm. It is not.
+> `model/transformer.py` is **ReLU attention, DyT normalization, ReLU feed-forward**, and
+> the VPU was cut down to the ops that model actually issues.
+>
+> - **`softmax` (phase 5) was built, validated, and has now been removed** — with `EXP`,
+>   `REDUCEMAX`, `REDUCESUM`, `SCALAR_DIV`, `SM_EXP`, both activation ROMs and `cfg
+>   vscalar`. §5.1 and everything about it below is history, not the current ISA.
+> - **`layernorm` (phase 6) is not merely unbuilt, it is not planned**, and §5.2's `rsqrt`
+>   LUT with it. DyT replaced LayerNorm in the model, and DyT needs no macro op at all: it
+>   is `requant` with a symmetric clip (opcode `0x21`, `dyt`), fused into the narrow the
+>   residual add already required.
+>
+> Everything else here — `setcfgr`, the MXU config strides, `matmul_t`, `vecmatmul`, the
+> config-register model, the phase/measurement tables — is current and load-bearing.
+> See [vpu.md §Removed ops](vpu.md#removed-ops) for the removal table and measured area.
+
+**Status: phases 0–4 built and validated; 5 built then removed; 6 dropped; 7 not started.**
+See §8 for the phase table.
 
 Built and passing (`tb/` 13/13, `make cosim` 11/11, `torch_ref.py` all kernels):
 
@@ -11,7 +30,7 @@ Built and passing (`tb/` 13/13, `make cosim` 11/11, `torch_ref.py` all kernels):
 | MXU config strides | `mxu.sv` `a_row`/`c_row`/`w_col` | `examples/strided_matmul.tpu` |
 | `matmul_t` hardware tile loop | `mxu.sv` `0x1D` | `examples/tiled_matmul_hw.tpu` |
 | `vecmatmul` | `vpu.sv` `VOP_VECMATMUL`, opcode `0x1E` | `examples/vecmatmul.tpu` |
-| `softmax` | `vpu.sv` `VOP_SOFTMAX`/`VOP_SM_EXP`, opcode `0x20` | `vpu_tb` unit test + `examples/softmax_rows.tpu` |
+| ~~`softmax`~~ | *removed* — was `vpu.sv` `VOP_SOFTMAX`/`VOP_SM_EXP`, opcode `0x20` | *(was `vpu_tb` + `examples/softmax_rows.tpu`; both deleted)* |
 
 Measured instruction counts, same problem in each case:
 
@@ -19,22 +38,22 @@ Measured instruction counts, same problem in each case:
 | --- | --- | --- |
 | 8×32 @ 32×16 tiled matmul | 70 words | **25** words — and that does it *twice* (int32 and requantized) |
 | Attention score block | 44 words (`vpu_matmul.tpu`) | **17** words (`vecmatmul.tpu`) |
-| Softmax over a row block | 8 words **per row**, plus a scalar bridge | **18** words for 5 rows, no bridge |
+| ~~Softmax over a row block~~ | *8 words per row + a scalar bridge* | *18 words for 5 rows* — measured before the op was removed; kept as the record of what a fused macro op bought |
 
-Not built: `layernorm` + the `rsqrt` LUT (§5.2), the full-layer rewrite (§8 phase 7), and
-weight double-buffering (§4.5).
+Not built: the full-layer rewrite (§8 phase 7) and weight double-buffering (§4.5).
+`layernorm` + the `rsqrt` LUT (§5.2) are **dropped**, not pending — see the banner.
 
 ## 1. Why
 
 The ISA today is RISC-shaped: one instruction is one array pass or one vector pass, and
-everything above that — tile loops, softmax, LayerNorm — is expanded in the program. That
-choice has three measured costs:
+everything above that — tile loops, and at the time softmax and LayerNorm — is expanded in
+the program. That choice has three measured costs:
 
 | Symptom | Evidence |
 | --- | --- |
 | Instruction memory is the binding constraint | One quantized layer = **861 of 1024** words (`README.md` roadmap §7); `tiled_matmul.tpu` alone is 191 lines |
-| Programs are not hand-writable at layer scale | `softmax_row.tpu` is 72 lines for **one row**; `vpu_matmul.tpu` is 129 lines for one score block |
-| The datatype contract is hand-enforced and silently breakable | `softmax_row.tpu:64-65` — `sadd` writes int32 (4-byte stride), `exp` reads int8 (1-byte stride). The comment at line 14 concedes the missing `requant`. Nothing checks it |
+| Programs are not hand-writable at layer scale | the since-deleted `softmax_row.tpu` was 72 lines for **one row**; `vpu_matmul.tpu` is 129 lines for one score block |
+| The datatype contract is hand-enforced and silently breakable | `softmax_row.tpu:64-65` — `sadd` wrote int32 (4-byte stride), `exp` read int8 (1-byte stride), with nothing checking it. Still true of any int8/int32 pairing; that example is gone |
 
 The fix is not a different control processor (see the PicoRV32 discussion — it costs LUTs
 we don't have at 92% utilization and replaces the working, bit-exact `iss.py` chain). The
@@ -92,8 +111,8 @@ Both have room; check this before adding anything else.
 | 6 | `arow` | 16 | activation row stride in bytes (`= K`) |
 | 7 | `crow` | 16 | result row stride in bytes (`= N*4`, or `N` when requantizing) |
 | 8 | `wcol` | 16 | weight column stride in bytes (`= K*2/8`) |
-| 9 | `vscalar` | 16 | scratchpad address of the VPU macro-ops' `{m0,n}` word |
-| 10 | `vrows` | 16 | row count (`softmax`/`layernorm` rows; `vecmatmul` **query** rows) |
+| 9 | ~~`vscalar`~~ | — | **retired** with `softmax`, the only op that read it. Index left vacant so 10–17 keep their meaning |
+| 10 | `vrows` | 16 | `vecmatmul` **query** rows |
 | 11 | `vcols` | 16 | `vecmatmul` **key** rows — the second, independent count |
 | 12 | `vrow0` | 16 | `vecmatmul` `src0` row stride in bytes |
 | 13 | `vrow1` | 16 | `vecmatmul` `src1` row stride in bytes |
@@ -224,13 +243,17 @@ roofline result.
 
 ## 5. VPU macro ops
 
-All three are a **wrapper FSM** that issues the existing `VOP_*` passes internally and
-holds the scalar intermediates in registers. The lane datapath, the LUTs, the reciprocal
-divider, and `V_rw` are unchanged. Reduction results stay in internal registers instead of
+All are a **wrapper FSM** that issues the existing `VOP_*` passes internally and holds the
+scalar intermediates in registers. The lane datapath and `V_rw` are unchanged. (The LUTs
+and the reciprocal divider this once also relied on no longer exist — only `vecmatmul`
+survives, and it needs neither.) Reduction results stay in internal registers instead of
 round-tripping through the scratchpad, which is what kills the `loads`/`subs`/`stores`
 bridge idiom (`isa.md` §4.5) from programs.
 
-### 5.1 `softmax dst, src, tmp`
+### 5.1 `softmax dst, src, tmp` — REMOVED
+
+> Built, validated, and then removed along with the VPU ops it was made of. The model uses
+> ReLU attention. Retained below as the design record; **this is not the current ISA.**
 
 Four passes over a row of `cfg vlen` elements, repeated `cfg vrows` times:
 
@@ -243,7 +266,7 @@ Four passes over a row of `cfg vlen` elements, repeated `cfg vrows` times:
 
 Pass 2 is the important one: it **fuses `sadd` + `requant` + `exp` into one pass that
 writes narrow.** That is what makes pass 3's int8 read correct by construction, and it is
-precisely the mismatch `softmax_row.tpu:64-65` gets wrong today. The `{m0,n}` word lands
+precisely the mismatch `softmax_row.tpu:64-65` got wrong. The `{m0,n}` word lands
 the operand in the exp LUT's canonical 1/16 input scale (`vpu.sv` header, §Activation
 LUTs) — an obligation currently on the programmer, with nothing checking it.
 
@@ -252,13 +275,20 @@ otherwise clobber unread data. *Optimization worth noting, not doing first:* wal
 **backwards** makes it safe in place (the int32 write at byte `4i` is above every unread
 int8 at `j < i`), removing the `tmp` operand at the cost of a reverse-order streaming mode.
 
-### 5.2 `layernorm dst, src, tmp`
+### 5.2 `layernorm dst, src, tmp` — DROPPED
 
-The model uses `nn.LayerNorm` (`model/transformer.py:217,226`), which needs
+> Never built, and no longer planned. `model/transformer.py` replaced LayerNorm with DyT
+> (`hardtanh(alpha*x, -1, 1)`), which needs no macro op, no `rsqrt`, no square and no
+> divide: it is `requant` with a symmetric clip (`dyt`, `0x21`), fused into the narrow the
+> residual add already performed. The proposal below is kept for the reasoning about
+> `rsqrt` and about keeping γ/β out of an instruction, which would apply again if a
+> variance-based norm ever came back.
+
+The model *used to use* `nn.LayerNorm`, which needs
 `1/sqrt(var)` — and **the VPU has no square root.** `sdiv` gives `1/d`, not `1/sqrt(d)`.
 
 Recommendation: **add an `rsqrt` LUT** as a third 256-entry int8 ROM, generated by
-`tpulang/luts.py` exactly like `gelu`/`exp`, loaded via a new `RSQRT_INIT` parameter. Same
+a `tpulang/luts.py` exactly like the since-deleted `gelu`/`exp` tables, loaded via a new `RSQRT_INIT` parameter. Same
 pattern, same canonical-input-scale caveat, negligible area (`gelu_rom` and `exp_rom` are
 already there and `vpu` uses 0 BRAM — they infer as LUTROM).
 
@@ -361,8 +391,8 @@ Each phase leaves the tree green.
 | 2 | MXU strides from cfg (§4.1), still single-tile | **done** — `tiled_matmul.tpu` passes unmodified; `strided_matmul.tpu` proves the strides are consulted |
 | 3 | MXU tile loop + `matmul_t` opcode (§4.2) | **done** — `tiled_matmul_hw.tpu`, checked against an independent Python matmul over the full K |
 | 4 | `vecmatmul` | **done** — `vecmatmul.tpu`, deliberately non-square (12×20) |
-| 5 | `softmax` | **done** — `vpu_tb` unit test (3 shapes) + `softmax_rows.tpu` (5 rows) |
-| 6 | `rsqrt` LUT + `layernorm` | not started |
+| 5 | `softmax` | built and validated, then **removed** — the model does not use softmax |
+| 6 | `rsqrt` LUT + `layernorm` | **dropped** — DyT replaced LayerNorm; `dyt` (`0x21`) needs no macro op |
 | 7 | Full layer rewritten; re-measure against the phase-0 baseline | not started |
 | 8 | Optional: MXU weight double-buffering (§4.5) | not started |
 
@@ -382,7 +412,7 @@ geometry is nowhere near the limiter yet. And **26% of MXU time is weight loadin
 having, and it is worth roughly a quarter of MXU time, not more.
 
 **Keep every primitive opcode.** `matmul` and the primitive VPU ops stay in the ISA at
-their current encodings, so `tiled_matmul.tpu`, `softmax_row.tpu`, `vpu_matmul.tpu` and
+their current encodings, so `tiled_matmul.tpu`, `vpu_matmul.tpu` and
 their golden vectors remain a live regression suite the whole way through. That is what
 makes each phase verifiable rather than a rewrite you hope is equivalent.
 

@@ -497,16 +497,10 @@ KERNELS = [
 ]
 
 # Examples that deliberately have no reference, and why — a property of the .tpu
-# source, not of this module.
-UNSUPPORTED = [
-    ("softmax_row", lambda c: "PROB" in c,
-     "softmax_row.tpu does not currently compute softmax: `exp`, `redsum` and "
-     "`sdiv` read int8 operands at stride 1, but the `sadd` and `exp` feeding "
-     "them write int32 at stride 4. Two REQUANT ops (int32 -> int8 at the exp "
-     "table's 1/16 in_scale, and again after exp) are needed first — see "
-     "docs/vpu.md. The exp LUT itself is no longer the blocker: luts.py "
-     "generates it, the ISS defaults to it and cmod_a7_top.sv loads it"),
-]
+# source, not of this module. Empty since softmax_row.tpu was deleted: it was
+# the only entry, and it went with the `exp`/`redsum`/`sdiv` instructions it was
+# written against (rtl/vpu.sv header).
+UNSUPPORTED: list = []
 
 
 def select(consts: dict):

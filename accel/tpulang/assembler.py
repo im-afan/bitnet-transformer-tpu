@@ -133,9 +133,11 @@ CFG_NAMES = {
     "crow": 7,      # result row stride, bytes (= N*4, or N when requantizing)
     "wcol": 8,      # weight column stride, bytes (= K*2/8)
     # VPU macro-op geometry (docs/macro_ops.md §5)
-    "vscalar": 9,   # macro-op {m0,n} word address (distinct from `scalar`:
-                    # the MXU's requant word is live at the same time)
-    "vrows": 10,    # row count (softmax/layernorm rows; vecmatmul query rows)
+    # 9 was `vscalar`, the macro-op {m0,n} word address. Only `softmax` read
+    # it, and that instruction is gone (rtl/vpu.sv header); the name is retired
+    # but the index is left vacant rather than reused, so 10..17 keep meaning
+    # what every existing program already assumes they mean.
+    "vrows": 10,    # vecmatmul query rows
     "vcols": 11,    # vecmatmul key rows — independent of vrows, so decode
                     # (1 x t+1) and prefill (T x T) are the same instruction
     "vrow0": 12,    # vecmatmul src0 row stride, bytes
@@ -221,33 +223,22 @@ SPECS: dict[str, Spec] = {
     # taken, and gating on "the stride registers happen to be nonzero" would let
     # one program's leftover config corrupt the next program's plain matmul.
     "matmul_t": Spec(0x1D, "RRR", {"acc": 0b01, "rq": 0b10}),
+    # The VPU's dot product. Kept although the shipped model never issues it:
+    # it is `vecmatmul`'s inner primitive, so the datapath exists either way and
+    # exposing it costs one decode arm and no hardware.
     "vecdot": Spec(0x01, "RRR", {}),
-    "vecmul": Spec(0x02, "RRR", {}),
     "vecadd": Spec(0x03, "RRR", {}),
     "relu": Spec(0x04, "RR", {}),
-    "gelu": Spec(0x05, "RR", {}),
     "requant": Spec(0x09, "RRR", {}),
     # DyT / hardtanh. Byte-for-byte `requant`'s fixed point with a symmetric
     # +-127 clip, so a normalization costs the same one dispatch a rescale
     # does — see vpu.sv's header and adder_kernel.md §4 for why the clip *is*
     # the hardtanh once the output scale is pinned to 1/127.
     "dyt": Spec(0x21, "RRR", {}),
-    "vecemul": Spec(0x0A, "RRR", {}),
-    "square": Spec(0x0B, "RR", {}),
-    "exp": Spec(0x0C, "RR", {}),
-    "redmax": Spec(0x0D, "RR", {}),
-    "redsum": Spec(0x0E, "RR", {}),
-    "sadd": Spec(0x0F, "RRR", {}),
-    "sdiv": Spec(0x1B, "RRR", {}),
     # VPU macro op: S[t][s] = sum_d src0[t][d]*src1[s][d] over cfg vrows x vcols,
     # contracting cfg vlen. Attention's Q@K^T and P@V — both operands are int8
     # activations, which the ternary-weight MXU cannot multiply at all.
     "vecmatmul": Spec(0x1E, "RRR", {}),
-    # Row-wise softmax: `softmax dst, src, tmp`. Rows from cfg vrows, row length
-    # from cfg vlen, requant {m0,n} from cfg vscalar. The tmp row must be
-    # vlen+4 bytes -- the trailing int32 is where the hardware parks the
-    # denominator between its internal passes.
-    "softmax": Spec(0x20, "RRR", {}),
     # memory / comms
     # `.t` transposes: the source is read row-major (cfg tcols/tsrow) and the
     # destination written transposed (cfg tdrow). Both ops had a spare flags
