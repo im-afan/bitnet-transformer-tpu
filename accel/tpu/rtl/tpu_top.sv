@@ -63,7 +63,7 @@ module tpu_top #(
     // ---- External DRAM (async SRAM chip) ------------------------------------
     parameter int MEM_ADDR_W = 19,   // external SRAM byte address (CMOD A7: 512K×8)
     parameter int MEM_DATA_W = 8,    // external SRAM data width (bits) = 1 byte
-    parameter int SRAM_CPA   = 2,    // sram_controller CLOCKS_PER_ACCESS
+    parameter int SRAM_CPA   = 0,    // sram_controller CLOCKS_PER_ACCESS (extra)
 
     // ---- UART host link (bring-up / debug over serial; docs/uart_host.md) ----
     parameter int UART_CPB        = 104, // UART clocks-per-bit (115200 @ 12 MHz)
@@ -144,6 +144,7 @@ module tpu_top #(
     logic [15:0]         vpu_rows, vpu_cols;
     logic [ADDR_W-1:0]   vpu_row0, vpu_row1, vpu_crow;
     logic                vpu_busy, vpu_done;
+    logic                vpu_mm_busy;   // VPU busy on a vecmatmul (perf only)
 
     // ---- scalar_unit ↔ scratchpad S_rw --------------------------------------
     logic                s_re, s_we;
@@ -200,11 +201,15 @@ module tpu_top #(
     //   controller; `dma_mem_*` / `uart_mem_*` are the two candidate drivers.
     logic                  mem_start, mem_we, mem_busy, mem_done;
     logic [MEM_ADDR_W-1:0] mem_addr;
+    logic [15:0]           mem_len, mem_stride;
     logic [MEM_DATA_W-1:0] mem_din, mem_dout;
+    logic                  mem_din_valid, mem_din_ready, mem_dout_valid;
 
     logic                  dma_mem_start, dma_mem_we;
     logic [MEM_ADDR_W-1:0] dma_mem_addr;
+    logic [15:0]           dma_mem_len, dma_mem_stride;
     logic [MEM_DATA_W-1:0] dma_mem_din;
+    logic                  dma_mem_din_valid;
 
     logic                  uart_mem_start, uart_mem_we;
     logic [MEM_ADDR_W-1:0] uart_mem_addr;
@@ -225,7 +230,7 @@ module tpu_top #(
     // ---- Performance counters → UART 'T' command ----------------------------
     //   NPERF event bits, integrated over one run by perf_counters.sv. See the
     //   PERF_* indices and the wire-order remap where the block is instantiated.
-    localparam int NPERF = 6;
+    localparam int NPERF = 7;
     logic [NPERF-1:0]      perf_ev;
     logic [NPERF*32-1:0]   perf_counts;   // counter i at [i*32 +: 32]
     logic [NPERF*32-1:0]   perf_wire;     // same, reordered for transmission
@@ -250,10 +255,16 @@ module tpu_top #(
     //   While a program runs (`busy`) the DMA engine owns the controller; while
     //   idle the UART host does. The UART FSM independently NAKs any command that
     //   arrives while `busy`, so the two drivers never actually contend.
-    assign mem_start = busy ? dma_mem_start : uart_mem_start;
-    assign mem_we    = busy ? dma_mem_we    : uart_mem_we;
-    assign mem_addr  = busy ? dma_mem_addr  : uart_mem_addr;
-    assign mem_din   = busy ? dma_mem_din   : uart_mem_din;
+    //   The host side moves one byte per command turnaround, so it takes the
+    //   controller's range interface at len = 1 and holds `din` for the whole
+    //   transaction; the DMA drives the range and stream signals for real.
+    assign mem_start     = busy ? dma_mem_start     : uart_mem_start;
+    assign mem_we        = busy ? dma_mem_we        : uart_mem_we;
+    assign mem_addr      = busy ? dma_mem_addr      : uart_mem_addr;
+    assign mem_len       = busy ? dma_mem_len       : 16'd1;
+    assign mem_stride    = busy ? dma_mem_stride    : 16'd0;
+    assign mem_din       = busy ? dma_mem_din       : uart_mem_din;
+    assign mem_din_valid = busy ? dma_mem_din_valid : 1'b1;
 
     // ---- scalar_unit → LINK dispatch (comms left out — stubbed below) -------
     logic                nb_start;
@@ -431,8 +442,9 @@ module tpu_top #(
         .vpu_row0   (vpu_row0),
         .vpu_row1   (vpu_row1),
         .vpu_crow   (vpu_crow),
-        .vpu_busy   (vpu_busy),
-        .vpu_done   (vpu_done),
+        .vpu_busy    (vpu_busy),
+        .vpu_done    (vpu_done),
+        .vpu_mm_busy (vpu_mm_busy),
 
         // V_rw (SIMD read/modify/write)
         .V_re    (V_re),
@@ -523,13 +535,18 @@ module tpu_top #(
         .rst_n (rst_n),
 
         // sram_controller interface (user side) — arbitrated with the UART host
-        .sram_start (dma_mem_start),
-        .sram_we    (dma_mem_we),
-        .sram_addr  (dma_mem_addr),
-        .sram_din   (dma_mem_din),
-        .sram_dout  (mem_dout),
-        .sram_busy  (mem_busy),
-        .sram_done  (mem_done),
+        .sram_start      (dma_mem_start),
+        .sram_we         (dma_mem_we),
+        .sram_addr       (dma_mem_addr),
+        .sram_len        (dma_mem_len),
+        .sram_stride     (dma_mem_stride),
+        .sram_din        (dma_mem_din),
+        .sram_din_valid  (dma_mem_din_valid),
+        .sram_din_ready  (mem_din_ready),
+        .sram_dout       (mem_dout),
+        .sram_dout_valid (mem_dout_valid),
+        .sram_busy       (mem_busy),
+        .sram_done       (mem_done),
 
         // scratchpad DMA port
         .scratchpad_re    (spad_dma_re),
@@ -566,14 +583,22 @@ module tpu_top #(
         .clk   (clk),
         .rst_n (rst_n),
 
-        // user side ← DMA engine
-        .start (mem_start),
-        .we    (mem_we),
-        .addr  (mem_addr),
-        .din   (mem_din),
-        .dout  (mem_dout),
-        .busy  (mem_busy),
-        .done  (mem_done),
+        // user side ← DMA engine (or the UART host while idle)
+        .start  (mem_start),
+        .we     (mem_we),
+        .addr   (mem_addr),
+        .len    (mem_len),
+        .stride (mem_stride),
+
+        .din       (mem_din),
+        .din_valid (mem_din_valid),
+        .din_ready (mem_din_ready),
+
+        .dout       (mem_dout),
+        .dout_valid (mem_dout_valid),
+
+        .busy (mem_busy),
+        .done (mem_done),
 
         // chip side → top-level pins
         .sram_addr (sram_addr),
@@ -584,7 +609,7 @@ module tpu_top #(
     );
 
     // =========================================================================
-    // Performance counters — integrate six event bits over one program run
+    // Performance counters — integrate seven event bits over one program run
     // (from 'G' to HALT), read over UART with the 'T' command. Nothing else in
     // the core observes them.
     //
@@ -597,16 +622,26 @@ module tpu_top #(
     //   0 run    total clocks busy  (denominator; == the old cycle_timer)
     //   1 mxu    MXU busy           (systolic array utilization)
     //   2 mload  MXU in S_LOAD      (weight-load share of MXU time)
-    //   3 vpu    VPU busy           (attention/softmax share vs. GEMM)
+    //   3 vpu    VPU busy           (attention share vs. GEMM)
     //   4 dma    DMA busy           (memory-bound vs. compute-bound)
     //   5 swait  scalar in S_WAIT   (what issue-and-wait costs)
+    //   6 vmm    VPU on a vecmatmul (macro-op share of VPU time)
     //
     // These overlap by construction: under issue-and-wait `swait` covers nearly
-    // all of `mxu`+`vpu`+`dma`, and `mload` is a subset of `mxu`. They are
-    // fractions of a run, not a partition of it.
+    // all of `mxu`+`vpu`+`dma`, `mload` is a subset of `mxu`, and `vmm` is a
+    // subset of `vpu`. They are fractions of a run, not a partition of it.
+    //
+    // Counter 6 exists because `vpu` on its own conflates two very different
+    // costs. The primitive ops (add / relu / requant / dyt) stream LANES
+    // elements per chunk and are cheap per element; `vecmatmul` re-runs the
+    // inner dot product once per (row, col) pair and pays the S_RD0..S_WB round
+    // trip on each one, so a VPU share that looks high may be almost entirely
+    // one macro op. Which of the two it is decides whether the thing worth
+    // optimizing is the pointwise path or `vecmatmul`'s per-pair overhead.
     // =========================================================================
     localparam int PERF_RUN = 0, PERF_MXU  = 1, PERF_MLOAD = 2,
-                   PERF_VPU = 3, PERF_DMA  = 4, PERF_SWAIT = 5;
+                   PERF_VPU = 3, PERF_DMA  = 4, PERF_SWAIT = 5,
+                   PERF_VMM = 6;
 
     always_comb begin
         perf_ev              = '0;
@@ -616,6 +651,7 @@ module tpu_top #(
         perf_ev[PERF_VPU]    = vpu_busy;
         perf_ev[PERF_DMA]    = dma_busy;
         perf_ev[PERF_SWAIT]  = su_wait_active;
+        perf_ev[PERF_VMM]    = vpu_mm_busy;
     end
 
     perf_counters #(

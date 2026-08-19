@@ -9,19 +9,31 @@
 //   dma_write = 0  -> FILL : DRAM  -> scratchpad  (ReadMemory)
 //   dma_write = 1  -> SPILL: scratchpad -> DRAM   (WriteMemory)
 //
-// v1 is deliberately byte-serial: the SRAM is one byte / multi-cycle per access
-// and is the bottleneck, so we move one byte at a time and use only lane 0 of the
-// wide scratchpad port (masked by a one-hot write strobe). Line-buffered/burst
-// mode is a later optimization (docs/dma.md §6).
+// ---- Ranges, not bytes ------------------------------------------------------
+//
+// v1 was byte-serial: one `sram_start` per byte, four DMA states around each,
+// ~8 clocks per byte. The SRAM controller now takes a *range* (start address,
+// byte count, address stride) and streams it at one byte per clock for reads and
+// one per two clocks for writes, so this engine's job changed shape: instead of
+// sequencing an access it now feeds or drains a stream.
+//
+//   FILL   `sram_dout_valid` pulses once per byte; each pulse is written
+//          straight into the scratchpad, which takes a byte-strobed write every
+//          clock. Nothing buffers, and nothing has to be aligned.
+//   SPILL  the scratchpad read is issued one clock ahead of the byte being
+//          offered, which is exactly the one-clock turnaround the controller's
+//          `din_ready` is designed around, so the write stream never starves.
+//
+// The one structural constraint is that a range is contiguous in *address
+// space*, and a transposed transfer is not: it is a set of rows. So the engine
+// issues **one range per source row**, which in linear mode is one range for the
+// whole transfer (`tcols` defaults to `dma_len`). The row loop is the same 2-D
+// walk transpose mode already needed; only the range dispatch is new.
 //
 // Handshake (issue-and-wait, same as MXU/VPU): `dma_start` is a one-cycle pulse
 // and the scalar unit holds the operands stable until `dma_done`, so addresses
-// are generated combinationally from the counter and DONE->IDLE cannot re-trigger.
-//
-// Outputs are decoded combinationally from the (registered) state, giving clean
-// single-cycle `sram_start` pulses with no output-lag. Only `state`, `counter`,
-// and the one-byte holding register `data` are sequential. `sram_busy` is unused:
-// completion is signalled by `sram_done`.
+// are generated combinationally from the counters and DONE->IDLE cannot
+// re-trigger.
 //
 // ---- Transpose mode (`dma_transpose`, docs/dma.md §5) -----------------------
 //
@@ -38,6 +50,15 @@
 // exactly how the instruction reads. One convention covers both, because
 // transposing on the way out of a [R][C] tensor and transposing on the way in to
 // a [C][R] one are the same permutation.
+//
+// That is also what sets the range parameters on the DRAM side:
+//
+//     fill.t   DRAM is the source, read row-major -> stride 1, one range per row
+//     spill.t  DRAM is the destination, written transposed -> the inner counter
+//              steps it by `tdrow`, so the range carries stride = tdrow
+//
+// Either way the DRAM side is one range per row and the scratchpad side takes
+// the scattered access, which costs nothing: it is single-cycle random access.
 //
 // `tsrow` exists so the source can be a column slice of a wider tensor (V is the
 // last d columns of a fused [T][3d] QKV block, and nothing else needs to move to
@@ -66,12 +87,17 @@ module dma #(
     input  logic clk,
     input  logic rst_n,
 
-    // ---- SRAM controller interface (one byte per transaction) ---------------
+    // ---- SRAM controller interface (one range per row) ----------------------
     output logic                    sram_start,
     output logic                    sram_we,
-    output logic [MEM_ADDR_W-1:0]   sram_addr,
+    output logic [MEM_ADDR_W-1:0]   sram_addr,    // first byte of the range
+    output logic [15:0]             sram_len,     // bytes in the range
+    output logic [15:0]             sram_stride,  // address step per byte
     output logic [MEM_DATA_W-1:0]   sram_din,
+    output logic                    sram_din_valid,
+    input  logic                    sram_din_ready,
     input  logic [MEM_DATA_W-1:0]   sram_dout,
+    input  logic                    sram_dout_valid,
     input  logic                    sram_busy,   // unused: we wait on sram_done
     input  logic                    sram_done,
 
@@ -99,23 +125,19 @@ module dma #(
     output logic                          dma_done
 );
 
-    // State encoding (all distinct). Fill path: SRAM read -> scratchpad write.
-    // Spill path: scratchpad read -> SRAM write. STEP advances the byte counter.
-    localparam [3:0]
-        IDLE                 = 4'd0,
-        READ_SRAM            = 4'd1,   // fill : issue SRAM read
-        READ_SRAM_WAIT       = 4'd2,   // fill : wait sram_done, capture byte
-        WRITE_SCRATCHPAD     = 4'd3,   // fill : 1-cycle scratchpad byte write
-        READ_SCRATCHPAD      = 4'd4,   // spill: issue scratchpad read
-        READ_SCRATCHPAD_WAIT = 4'd5,   // spill: capture byte (rdata valid this cycle)
-        WRITE_SRAM           = 4'd6,   // spill: issue SRAM write
-        WRITE_SRAM_WAIT      = 4'd7,   // spill: wait sram_done
-        STEP                 = 4'd8,   // i++ ; loop or finish
-        DONE                 = 4'd9;   // one-cycle dma_done pulse
+    // State encoding. ISSUE hands one row's range to the controller; the stream
+    // states then move that row's bytes, one per handshake.
+    localparam [2:0]
+        IDLE       = 3'd0,
+        ISSUE      = 3'd1,   // one clock: `sram_start` for this row's range
+        FILL       = 3'd2,   // fill : drain sram_dout into the scratchpad
+        SPILL_RD   = 3'd3,   // spill: address the scratchpad for the next byte
+        SPILL_SEND = 3'd4,   // spill: offer that byte to the write stream
+        SPILL_END  = 3'd5,   // spill: wait for the row's last write to commit
+        DONE       = 3'd6;   // one-cycle dma_done pulse
 
-    reg [3:0]                   state, state_n;
+    reg [2:0]                   state, state_n;
     reg [SCRATCHPAD_ADDR_W-1:0] counter;   // index of the byte being moved
-    reg [MEM_DATA_W-1:0]        data;      // one-byte holding register
 
     // Transpose-mode 2-D position. `col`/`row` are the source coordinates;
     // `src_row_off` (= row*tsrow) and `dst_col_off` (= col*tdrow) are carried as
@@ -123,11 +145,21 @@ module dma #(
     reg [15:0]                  col, row;
     reg [SCRATCHPAD_ADDR_W-1:0] src_row_off, dst_col_off;
 
+    // Spill holding register. The scratchpad's contract is that read data is
+    // valid *the cycle after* `re` — it says nothing about the cycle after that,
+    // so a byte the write stream did not take on its first offer is kept here
+    // rather than re-read or assumed still present. With a two-clock write beat
+    // the offer is always taken immediately and this never fills; it does at
+    // CLOCKS_PER_ACCESS > 0, where the beat is longer than the fetch.
+    reg [MEM_DATA_W-1:0]        cap;
+    reg                         have_cap;
+
     // Effective geometry: zero means "not set" (see the header).
     wire [15:0] tcols_eff = (dma_tcols == 16'd0) ? dma_len   : dma_tcols;
     wire [15:0] tsrow_eff = (dma_tsrow == 16'd0) ? tcols_eff : dma_tsrow;
     wire [15:0] tdrow_eff = (dma_tdrow == 16'd0) ? 16'd1     : dma_tdrow;
     wire        row_last  = (col + 16'd1 >= tcols_eff);   // this byte ends a source row
+    wire        all_last  = (counter + 1 >= dma_len);     // ...and this one ends the transfer
 
     // -------------------------------------------------------------------------
     // Address generation. Inputs are held stable by the scalar unit for the whole
@@ -138,6 +170,10 @@ module dma #(
     // Linear mode drives both sides from `counter`. Transpose mode gives the
     // row-major offset to whichever side is the source (`dma_write` == spill ==
     // scratchpad is the source) and the transposed offset to the other.
+    //
+    // The DRAM side is only ever sampled in ISSUE, i.e. at `col == 0`, where it
+    // is this row's base address; the controller generates the rest of the row
+    // itself from `sram_stride`.
     // -------------------------------------------------------------------------
     wire [SCRATCHPAD_ADDR_W-1:0] lin_off = src_row_off + SCRATCHPAD_ADDR_W'(col);
     wire [SCRATCHPAD_ADDR_W-1:0] tr_off  = dst_col_off + SCRATCHPAD_ADDR_W'(row);
@@ -151,6 +187,18 @@ module dma #(
     assign scratchpad_waddr = dma_scratch_addr + scratch_off;
     assign sram_addr        = dma_dram_addr + MEM_ADDR_W'(dram_off);
 
+    // Range geometry. A row is `tcols` bytes, clipped by whatever is left of
+    // `dma_len` — a transfer that is not a whole number of rows stops part-way
+    // through the last one, which is the documented behaviour and is why the
+    // clip is here and not in the caller.
+    wire [15:0] remaining = dma_len - 16'(counter);
+    assign sram_len    = (remaining < tcols_eff) ? remaining : tcols_eff;
+    assign sram_stride = (dma_transpose && dma_write) ? tdrow_eff : 16'd1;
+
+    // A byte moves on either stream's handshake.
+    wire adv = (state == FILL       && sram_dout_valid) ||
+               (state == SPILL_SEND && sram_din_ready);
+
     // -------------------------------------------------------------------------
     // Next-state logic (default: hold).
     // -------------------------------------------------------------------------
@@ -158,23 +206,21 @@ module dma #(
         state_n = state;
         case (state)
             IDLE: if (dma_start) begin
-                if      (dma_len == 16'd0) state_n = DONE;            // empty transfer
-                else if (dma_write)        state_n = READ_SCRATCHPAD; // spill
-                else                       state_n = READ_SRAM;       // fill
+                if (dma_len == 16'd0) state_n = DONE;    // empty transfer
+                else                  state_n = ISSUE;
             end
-            READ_SRAM:            state_n = READ_SRAM_WAIT;
-            READ_SRAM_WAIT:       if (sram_done) state_n = WRITE_SCRATCHPAD;
-            WRITE_SCRATCHPAD:     state_n = STEP;
-            READ_SCRATCHPAD:      state_n = READ_SCRATCHPAD_WAIT;
-            READ_SCRATCHPAD_WAIT: state_n = WRITE_SRAM;
-            WRITE_SRAM:           state_n = WRITE_SRAM_WAIT;
-            WRITE_SRAM_WAIT:      if (sram_done) state_n = STEP;
-            STEP: begin
-                if (counter + 1 >= dma_len) state_n = DONE;
-                else state_n = dma_write ? READ_SCRATCHPAD : READ_SRAM;
-            end
-            DONE:                 state_n = IDLE;
-            default:              state_n = IDLE;
+            ISSUE:  state_n = dma_write ? SPILL_RD : FILL;
+            // `sram_done` lands on the same clock as the range's last
+            // `sram_dout_valid`, so `counter` is still the last byte's index.
+            FILL:   if (sram_done) state_n = all_last ? DONE : ISSUE;
+            SPILL_RD:   state_n = SPILL_SEND;
+            SPILL_SEND: if (sram_din_ready)
+                            state_n = (row_last || all_last) ? SPILL_END : SPILL_RD;
+            // The last byte of the row has been handed over but not committed.
+            SPILL_END:  if (sram_done)
+                            state_n = (counter >= dma_len) ? DONE : ISSUE;
+            DONE:   state_n = IDLE;
+            default: state_n = IDLE;
         endcase
     end
 
@@ -182,66 +228,67 @@ module dma #(
     // Output decode (combinational Moore outputs from the registered state).
     // -------------------------------------------------------------------------
     always_comb begin
-        sram_start       = 1'b0;
-        sram_we          = 1'b0;
-        sram_din         = data;
-        scratchpad_re    = 1'b0;
-        scratchpad_we    = 1'b0;
-        scratchpad_wdata = { {(SCRATCHPAD_BYTES-1){8'b0}}, data };  // byte in lane 0
-        scratchpad_wstrb = '0;
+        sram_start       = (state == ISSUE);
+        sram_we          = dma_write;
+        sram_din         = have_cap ? cap : scratchpad_rdata[MEM_DATA_W-1:0];
+        sram_din_valid   = (state == SPILL_SEND);
+        scratchpad_re    = (state == SPILL_RD);
+        scratchpad_we    = (state == FILL) && sram_dout_valid;
+        scratchpad_wdata = { {(SCRATCHPAD_BYTES-1){8'b0}}, sram_dout };  // byte in lane 0
+        scratchpad_wstrb = scratchpad_we ? SCRATCHPAD_BYTES'(1) : '0;
         dma_busy         = (state != IDLE) && (state != DONE);
         dma_done         = (state == DONE);
-
-        case (state)
-            READ_SRAM:        begin sram_start = 1'b1; sram_we = 1'b0; end
-            WRITE_SCRATCHPAD: begin scratchpad_we = 1'b1; scratchpad_wstrb = SCRATCHPAD_BYTES'(1); end
-            READ_SCRATCHPAD:  begin scratchpad_re = 1'b1; end
-            WRITE_SRAM:       begin sram_start = 1'b1; sram_we = 1'b1; end
-            default: ;
-        endcase
     end
 
     // -------------------------------------------------------------------------
-    // Sequential state: FSM register, byte counter, and the holding register.
+    // Sequential state: FSM register, the 2-D walk, and the spill holding
+    // register.
     // -------------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state       <= IDLE;
             counter     <= '0;
-            data        <= '0;
             col         <= '0;
             row         <= '0;
             src_row_off <= '0;
             dst_col_off <= '0;
+            cap         <= '0;
+            have_cap    <= 1'b0;
         end else begin
             state <= state_n;
-            case (state)
-                IDLE: begin
-                    counter     <= '0;
+
+            if (state == IDLE) begin
+                counter     <= '0;
+                col         <= '0;
+                row         <= '0;
+                src_row_off <= '0;
+                dst_col_off <= '0;
+                have_cap    <= 1'b0;
+            end
+
+            // 2-D walk. Only `counter` decides when the transfer ends, so a
+            // `dma_len` that is not a whole number of rows simply stops part-way
+            // through the last one.
+            if (adv) begin
+                counter <= counter + 1'b1;
+                if (row_last) begin
                     col         <= '0;
-                    row         <= '0;
-                    src_row_off <= '0;
+                    row         <= row + 16'd1;
+                    src_row_off <= src_row_off + SCRATCHPAD_ADDR_W'(tsrow_eff);
                     dst_col_off <= '0;
+                end else begin
+                    col         <= col + 16'd1;
+                    dst_col_off <= dst_col_off + SCRATCHPAD_ADDR_W'(tdrow_eff);
                 end
-                READ_SRAM_WAIT:       if (sram_done) data <= sram_dout;
-                READ_SCRATCHPAD_WAIT: data <= scratchpad_rdata[MEM_DATA_W-1:0];  // lane 0
-                STEP: begin
-                    counter <= counter + 1'b1;
-                    // 2-D walk. Only `counter` decides when the transfer ends, so
-                    // a `dma_len` that is not a whole number of rows simply stops
-                    // part-way through the last one.
-                    if (row_last) begin
-                        col         <= '0;
-                        row         <= row + 16'd1;
-                        src_row_off <= src_row_off + SCRATCHPAD_ADDR_W'(tsrow_eff);
-                        dst_col_off <= '0;
-                    end else begin
-                        col         <= col + 16'd1;
-                        dst_col_off <= dst_col_off + SCRATCHPAD_ADDR_W'(tdrow_eff);
-                    end
+            end
+
+            if (state == SPILL_SEND) begin
+                if (sram_din_ready) have_cap <= 1'b0;
+                else if (!have_cap) begin
+                    cap      <= scratchpad_rdata[MEM_DATA_W-1:0];
+                    have_cap <= 1'b1;
                 end
-                default: ;
-            endcase
+            end
         end
     end
 endmodule

@@ -48,7 +48,7 @@ module uart_memory #(
     // ---- External async SRAM (Cmod A7 cellular RAM: 512K x 8) ----------------
     parameter int MEM_ADDR_W      = 19,
     parameter int MEM_DATA_W      = 8,
-    parameter int SRAM_CPA        = 2,    // sram_controller CLOCKS_PER_ACCESS
+    parameter int SRAM_CPA        = 0,    // sram_controller CLOCKS_PER_ACCESS
 
     // ---- Instruction memory address width -----------------------------------
     //   No IMEM exists in this image; this only has to match what the host's
@@ -123,14 +123,26 @@ module uart_memory #(
         .clk   (clk),
         .rst_n (rst_n),
 
-        // user side ← UART host (sole owner)
-        .start (mem_start),
-        .we    (mem_we),
-        .addr  (mem_addr),
-        .din   (mem_din),
-        .dout  (mem_dout),
-        .busy  (mem_busy),
-        .done  (mem_done),
+        // user side ← UART host (sole owner). The host protocol is one byte
+        // per command turnaround, so it uses the controller's range interface
+        // at len = 1: `din` is held stable across the whole transaction, hence
+        // the permanently-asserted `din_valid`, and the single `dout` is read
+        // on `done` the way it always was.
+        .start  (mem_start),
+        .we     (mem_we),
+        .addr   (mem_addr),
+        .len    (16'd1),
+        .stride (16'd0),
+
+        .din       (mem_din),
+        .din_valid (1'b1),
+        .din_ready (),
+
+        .dout       (mem_dout),
+        .dout_valid (),
+
+        .busy (mem_busy),
+        .done (mem_done),
 
         // chip side → top-level pins
         .sram_addr (sram_addr),

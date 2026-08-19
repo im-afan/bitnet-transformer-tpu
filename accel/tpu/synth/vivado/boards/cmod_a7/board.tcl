@@ -50,7 +50,7 @@ set UART_CPB [expr {int(round(double($CLK_MHZ) * 1.0e6 / $BAUD))}]   ;# 104
 # (see docs/synth.md "Sizing").
 set ROWS       8
 set COLS       8
-set VPU_BYTES  32
+set VPU_BYTES  64
 set ADDR_W     16
 set XLEN       32
 set IMEM_AW    10
@@ -60,7 +60,12 @@ set M0_W       12
 set N_W        4
 set MEM_ADDR_W 19    ;# Cmod A7 cellular SRAM: 512K x 8
 set MEM_DATA_W 8
-set SRAM_CPA   2
+# sram_controller's *extra* clocks per byte, on top of the one the beat always
+# takes. 0 is full rate: one byte per 83.3 ns clock on reads, one per two on
+# writes, against a part rated for a 10 ns access. See rtl/sram.sv's header for
+# the per-parameter timing budget and constraints/cmod_a7.xdc for why these pins
+# are false-pathed.
+set SRAM_CPA   0
 
 # ---- Generics passed to the top level ----------------------------------------
 # Assembled after the argv overrides in build.tcl have been applied, so this

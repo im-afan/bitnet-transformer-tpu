@@ -149,12 +149,18 @@ module uart_interface_tb #(
     int tx_frames = 0;
     always @(posedge clk) if (rst_n && tx_start) tx_frames++;
 
+    // The FSM under test moves one byte per command turnaround, so it drives the
+    // controller's range interface at len = 1 — the same wiring tpu_top and
+    // uart_memory give it.
     sram_controller #(
-        .CLOCKS_PER_ACCESS(2), .ADDR_W(MEM_ADDR_W), .DATA_W(MEM_DATA_W)
+        .CLOCKS_PER_ACCESS(0), .ADDR_W(MEM_ADDR_W), .DATA_W(MEM_DATA_W)
     ) u_sram (
         .clk(clk), .rst_n(rst_n),
         .start(sram_start), .we(sram_we), .addr(sram_addr),
-        .din(sram_din), .dout(sram_dout), .busy(sram_busy), .done(sram_done),
+        .len(16'd1), .stride(16'd0),
+        .din(sram_din), .din_valid(1'b1), .din_ready(),
+        .dout(sram_dout), .dout_valid(),
+        .busy(sram_busy), .done(sram_done),
         .sram_addr(chip_addr), .sram_data(chip_data),
         .sram_we(chip_we), .sram_ce(chip_ce), .sram_oen(chip_oen)
     );

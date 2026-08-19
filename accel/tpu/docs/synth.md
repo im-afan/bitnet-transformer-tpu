@@ -139,36 +139,63 @@ there. At 12 MHz they are safe; at 100 MHz they would be hiding a real violation
 
 ## 5. Sizing: what will and won't fit
 
-> ### ⚠️ It does not currently fit. `mode=bit` fails in DRC before the placer runs.
+> ### It fits again. `make bit` completes, timing met.
 >
-> ```
-> ERROR: [DRC UTLZ-1] LUT as Logic over-utilized in Top Level Design.
-> This design requires 21657 of such cell types but only 20800 ... are available.
-> ```
+> Measured Aug 17 on the tree as it stands, `board=cmod_a7 mode=bit` (8×8,
+> `addr_w=16`, `xc7a35t-cpg236-1`):
 >
-> **857 LUTs over (4.1%)**, at the default `board=cmod_a7 mode=bit`. This is a
-> regression from the work between the post-route numbers below and today —
-> `perf_counters.sv` and macro-op phases 0–5 (`matmul_t`'s hardware tile loop in
-> particular) — not from the VPU trim, which moved it the *other* way:
+> | Resource | Used | Available | % |
+> | --- | --- | --- | --- |
+> | Slice LUTs | **13,342** | 20,800 | 64% |
+> | Slice registers (FF) | 7,543 | 41,600 | 18% |
+> | Block RAM tiles | 33 | 50 | 66% |
+> | DSP48E1 | 31 | 90 | 34% |
+>
+> WNS **+26.2 ns** against the 83.3 ns period, WHS +0.032 ns, 0 DRC errors,
+> `cmod_a7_top.bit` written. The tightest path in the design is
+> `u_sram/we_win_reg → u_sram/sram_we_reg`, the posedge→negedge half-cycle hop that
+> generates the SRAM write pulse (`rtl/sram.sv`): **+40.7 ns of slack on a 41.7 ns
+> budget**, i.e. ~0.9 ns of logic. Everything else has a full period.
+>
+> **This is not a fix — nothing here was done to reduce area.** The over-budget state
+> recorded below stopped reproducing at some point between then and now, and the
+> difference is in the MXU: it was 14476 LUTs post-synth and is 5930 post-route today.
+> Whatever changed it is not in this section's history. Kept below for the record:
 >
 > | `mode=bit` DRC, same board and geometry | LUT as Logic required |
 > | --- | --- |
 > | before the VPU trim | 26032 (5232 over) |
-> | after the VPU trim | **21657** (857 over) |
+> | after the VPU trim | 21657 (857 over) |
+> | today, measured | **13342 (7458 spare)** |
 >
-> So the trim recovered 4375 LUTs and closed 84% of the gap. **The MXU is now where
-> the remaining LUTs are**, not the VPU — post-synth it is 14476 LUTs against the
-> VPU's 5162. `mode=synth` and `mode=ooc` still complete, so the design is
-> measurable; only `impl`/`bit` are blocked.
->
-> Options, cheapest first: build the `xc7a35t` at `rows=4 cols=4` (the geometry is a
-> build argument, but the vectors and programs assume 8×8); revisit `matmul_t`'s tile
-> loop; or move to a larger part (`part=xc7a50t-cpg236-1` is pin-compatible on some
-> boards — unverified here).
+> If it goes over again, the options, cheapest first: build the `xc7a35t` at
+> `rows=4 cols=4` (the geometry is a build argument, but the vectors and programs
+> assume 8×8); revisit `matmul_t`'s tile loop; or move to a larger part
+> (`part=xc7a50t-cpg236-1` is pin-compatible on some boards — unverified here).
 
-**The numbers below are the last post-route measurement (Aug 8), when it did fit and
-routed with timing met.** They are kept as the reference point the regression is measured
-against, not as the current state. Geometry `boards/cmod_a7` (8×8, `addr_w=16`) on the
+### What the range interface cost
+
+`sram.sv` taking whole ranges and `dma.sv` streaming them (`dma.md` §7) is the one
+area change with a clean before/after: same board, same geometry, `mode=synth`, the
+only difference being `rtl/{sram,dma,tpu_top}.sv` swapped for their pre-change
+versions.
+
+| post-synth | before | after | Δ |
+| --- | --- | --- | --- |
+| whole design, LUTs | 13,892 | 13,958 | **+66** |
+| whole design, FFs | 7,507 | 7,541 | +34 |
+| `dma` | 146 | 762 | +616 |
+| `sram_controller` | 9 | 79 | +70 |
+
+The two blocks grew by 686 LUTs between them and the design grew by 66, which is
+cross-hierarchy LUT combining doing its job — the per-byte DRAM address adder the DMA
+used to own moved *into* the controller rather than being added to it, and what the
+whole design pays is the 16-bit range/stride counters and one 19-bit strided address
+adder. 0.3% of the LUT budget for 2.27x on the full model (`dma.md` §7).
+
+**The numbers below are the Aug 8 post-route measurement**, kept because the *reasoning*
+around them is still what you need when you change the geometry. They are not the current
+state — the box above is. Geometry `boards/cmod_a7` (8×8, `addr_w=16`) on the
 `xc7a35t-cpg236-1`:
 
 | Resource | Used | Available | % |
@@ -193,6 +220,20 @@ Per block (`report_utilization -hierarchical`, post-route):
 | `scalar_unit` | 542 | 65 | 1×RAMB36 | 3 |
 | `uart_interface` + rx + tx | 263 | 287 | — | — |
 | `sram_controller` | 16 | 51 | — | — |
+
+Post-route on the current tree, for comparison — `mxu` less than half of what it was,
+`dma`/`sram_controller` carrying the range interface:
+
+| Block | LUTs | FFs | BRAM | DSP |
+| --- | --- | --- | --- | --- |
+| `mxu` | 5,930 | 5,920 | — | 12 |
+| `vpu` | 2,768 | 505 | — | 16 |
+| `scratchpad` | 2,413 | 6 | 64×RAMB18 | — |
+| `scalar_unit` | 1,076 | 257 | 1×RAMB36 | 3 |
+| `dma` | 579 | 92 | — | — |
+| `uart_interface` + rx + tx | 369 | 481 | — | — |
+| `perf_counters` | 147 | 193 | — | — |
+| `sram_controller` | 77 | 78 | — | — |
 
 **`mxu` dominates**, as predicted: 10.8k LUTs and 19k of the design's 19.9k flip-flops —
 not the 8×8 array itself (~2k FFs of partial sums) but `resbuf[0:63][0:7]` of int32, which

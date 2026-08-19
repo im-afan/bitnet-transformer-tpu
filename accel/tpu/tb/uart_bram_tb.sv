@@ -77,7 +77,7 @@ module uart_bram_tb;
         .MEM_ADDR_W      (MEM_ADDR_W),
         .MEM_DATA_W      (MEM_DATA_W),
         .BRAM_AW         (BRAM_AW),
-        .MEM_CPA         (2),               // = uart_memory_tb's SRAM_CPA
+        .MEM_CPA         (0),               // = uart_memory_tb's SRAM_CPA
         .IMEM_AW         (10),
         .ACT_W           (6),               // tiny, so the LED logic still toggles
         .HB_W            (8)

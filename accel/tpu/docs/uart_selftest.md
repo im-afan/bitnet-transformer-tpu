@@ -189,7 +189,8 @@ is the rung that removes only the memory:
 image is the cut between them: `uart_interface` is instantiated unmodified, the
 wire protocol is byte-for-byte identical (same commands, 3-byte addresses, 19-bit
 range checks, same turnaround), and `bram_controller` (`rtl/bram.sv`) reproduces
-`sram_controller`'s handshake **cycle for cycle**, `CLOCKS_PER_ACCESS` included —
+`sram_controller`'s handshake **cycle for cycle**, beat length and
+`CLOCKS_PER_ACCESS` included —
 a faster controller would move every turnaround and the comparison would be
 worthless. What leaves with the SRAM is the bidirectional bus, the OE#/CE#
 timing, the chip, and the 30 switching bank-14 pins.

@@ -84,9 +84,11 @@ module tpu_top_tb;
     // -------------------------------------------------------------------------
     // Clock / reset.
     // -------------------------------------------------------------------------
+    int unsigned cyc = 0, run_clk = 0;
     logic clk = 1'b0;
     logic rst_n = 1'b0;
     always #5 clk = ~clk;   // 100 MHz
+    always @(posedge clk) cyc <= cyc + 1;
 
     // -------------------------------------------------------------------------
     // DUT host interface.
@@ -272,11 +274,20 @@ module tpu_top_tb;
         load_tensors();
 
         @(negedge clk); host_run = 1'b1; boot_pc = '0;
+        run_clk = cyc;
         @(negedge clk); host_run = 1'b0;
 
         // Wait for HALT (watchdog below guards against a hang).
         do @(negedge clk); while (!done);
-        $display("program halted at pc=%0d", pc_dbg);
+        run_clk = cyc - run_clk;
+        $display("program halted at pc=%0d after %0d clocks", pc_dbg, run_clk);
+        // The same six counters the 'T' command reports, read out of the block
+        // directly since this TB has no serial link. `dma` against `run` is the
+        // memory-bound share, which is what the sram.sv range interface moves.
+        $display("  counters: run=%0d mxu=%0d mload=%0d vpu=%0d dma=%0d swait=%0d",
+                 dut.u_perf.counts[0*32 +: 32], dut.u_perf.counts[1*32 +: 32],
+                 dut.u_perf.counts[2*32 +: 32], dut.u_perf.counts[3*32 +: 32],
+                 dut.u_perf.counts[4*32 +: 32], dut.u_perf.counts[5*32 +: 32]);
 
         check_outputs();
 
@@ -288,8 +299,8 @@ module tpu_top_tb;
 
     // Watchdog. Overridable because run length is a property of the *program*,
     // not of this testbench: relu_layer halts in microseconds, but a whole
-    // transformer is ~190 KB of byte-serial DMA at ~14 clocks/byte, i.e. tens of
-    // milliseconds. Default unchanged, so every existing invocation is
+    // transformer is ~190 KB of DMA at 1-2 clocks/byte plus its MXU/VPU work,
+    // i.e. milliseconds. Default unchanged, so every existing invocation is
     // unaffected.
     //   iverilog ... -DWATCHDOG_NS=200000000
     initial begin

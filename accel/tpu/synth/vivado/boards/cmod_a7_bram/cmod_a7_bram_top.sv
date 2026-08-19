@@ -58,7 +58,7 @@ module cmod_a7_bram_top #(
     parameter int MEM_ADDR_W = 19,
     parameter int MEM_DATA_W = 8,
     parameter int BRAM_AW    = 16,   // 2**16 = 64 KiB = 16 RAMB36 of the 35T's 50
-    parameter int MEM_CPA    = 2,    // = boards/cmod_a7_mem's SRAM_CPA
+    parameter int MEM_CPA    = 0,    // = boards/cmod_a7_mem's SRAM_CPA
 
     // Power-on reset length, in core clocks (2**POR_W). 2**8 @ 12 MHz ~= 21 us.
     parameter int POR_W = 8

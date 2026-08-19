@@ -107,7 +107,7 @@ module uart_memory_cosim_tb #(
         .UART_RX_TIMEOUT (RX_TIMEOUT),      // as built: board.tcl sets 0
         .MEM_ADDR_W      (MEM_ADDR_W),
         .MEM_DATA_W      (MEM_DATA_W),
-        .SRAM_CPA        (2),
+        .SRAM_CPA        (0),
         .IMEM_AW         (10),
         .ACT_W           (6),               // tiny, so the LED logic still toggles
         .HB_W            (8)

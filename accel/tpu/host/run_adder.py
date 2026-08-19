@@ -102,7 +102,13 @@ def report_timing(counters: list[dict], clk_mhz: float) -> None:
     time is dominated by the link and says nothing about the design. The other
     counters are printed as a fraction of ``run``; they **overlap** and do not
     partition it (``swait`` covers nearly all of ``mxu``/``vpu``/``dma`` under
-    issue-and-wait, and ``mload`` is a subset of ``mxu``).
+    issue-and-wait, ``mload`` is a subset of ``mxu``, and ``vmm`` is a subset of
+    ``vpu``).
+
+    ``vmm`` gets its own line because it is the one counter whose interesting
+    denominator is not ``run``: it answers "is the VPU's share `vecmatmul`, or
+    is it the pointwise ops?", and that ratio is what says where VPU work is
+    worth optimizing.
     """
     if not counters:
         return
@@ -123,6 +129,13 @@ def report_timing(counters: list[dict], clk_mhz: float) -> None:
         share = "  ".join(f"{k} {100.0 * sum(c[k] for c in counters) / total:.1f}%"
                           for k in units)
         print(f"  unit busy     {share}")
+
+        vpu = sum(c.get("vpu", 0) for c in counters)
+        vmm = sum(c.get("vmm", 0) for c in counters)
+        if vpu:
+            print(f"  vpu split     vecmatmul {100.0 * vmm / total:.1f}% of run "
+                  f"= {100.0 * vmm / vpu:.1f}% of VPU time; "
+                  f"other vpu ops {100.0 * (vpu - vmm) / total:.1f}% of run")
 
 
 def decode_prompt(expr: str) -> str:

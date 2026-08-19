@@ -53,7 +53,7 @@ set UART_CPB [expr {int(round(double($CLK_MHZ) * 1.0e6 / $BAUD))}]   ;# 104
 # identically in both images.
 set MEM_ADDR_W 19
 set MEM_DATA_W 8
-set SRAM_CPA   2
+set SRAM_CPA   0
 
 # ---- Geometry placeholders ----------------------------------------------------
 # There is no TPU core in this image -- no MXU, no VPU, no scratchpad. These

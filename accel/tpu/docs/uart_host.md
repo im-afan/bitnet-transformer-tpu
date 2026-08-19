@@ -14,9 +14,10 @@ Here the host is the master and the FPGA is a pure memory slave.
 - **Two operations only: read and write a byte range of SRAM.** No register access,
   no run/halt control, no scratchpad access. Those can layer on later as extra
   command codes.
-- **Byte-serial**, matching everything downstream: the SRAM is one byte / multi-cycle
-  per access (`sram.sv`), and the DMA engine is already byte-serial (`dma.md`). There
-  is no point buffering wider than the SRAM can drain.
+- **Byte-serial**, because the link is: at 115200 baud a byte takes ~87 µs, which is
+  ~1000 core clocks, so the host protocol drives `sram.sv` at `len = 1` and the memory
+  is idle between every byte. (`sram.sv` takes whole ranges now and the DMA streams
+  them — see `dma.md` §7 — but nothing about that helps a wire this slow.)
 - **Host is the sole master.** The FPGA never initiates a frame; it only answers.
 - Reuses the existing `uart_receiver.sv` and `uart_transmitter.sv` unchanged
   (8N1, 115200 baud, `CLK_PER_BIT = 868` @ 100 MHz).
@@ -107,11 +108,24 @@ go    | 'G' | A2  | A1  | A0  |               timer   | 'T' |
 
 - **`'G'` = 0x47** pulses the scalar unit's run trigger with `run_pc = addr`; no
   length, no payload. Reply is `ACK`/`NAK`.
-- **`'T'` = 0x54** is the whole frame. Reply is **4 bytes, MSB first, no status**:
-  the scalar unit's run-length counter (`rtl/cycle_timer.sv`) in core clocks —
-  reset when `busy` rises, frozen when it falls, so it is the length of the last
-  run, or of the current one so far. It saturates at `0xFFFFFFFF` rather than
-  wrapping (358 s at 12 MHz).
+- **`'T'` = 0x54** is the whole frame. Reply is **`TIMER_WORDS` 32-bit words, MSB
+  first both within and across words, no status byte**: the core's per-run
+  performance counters (`rtl/perf_counters.sv`) in core clocks. Every counter
+  shares one window — reset when `busy` rises, frozen when it falls — so they
+  describe the last run, or the current one so far. Each saturates at
+  `0xFFFFFFFF` rather than wrapping (358 s at 12 MHz).
+
+  **Word 0 is always the run length**, which is what keeps the reply
+  prefix-compatible with the single-word one this command used to give and keeps
+  images with different counter sets mutually intelligible. The length is
+  image-dependent: `uart_interface`'s `TIMER_WORDS` is 1 in the bring-up images
+  (`cmod_a7_mem`, `cmod_a7_bram`, which have no core to measure) and `NPERF` in
+  `tpu_top`, currently **7** — run, mxu, mload, vpu, dma, swait, vmm. The
+  counters overlap rather than partitioning the run: `swait` shadows nearly all
+  of mxu/vpu/dma under issue-and-wait, `mload` is a sub-state of `mxu`, and
+  `vmm` (VPU on a `vecmatmul`) is a sub-state of `vpu`. `tpu_top.sv`'s
+  `PERF_*` indices define the wire order; `host/tpu_uart.py`'s `TIMER_COUNTERS`
+  decodes it.
 
 `'T'` is the only command **not** subject to the arbitration rule in §6: it reads
 a counter, contends over nothing, and cannot corrupt a run, so it is answered
@@ -154,8 +168,9 @@ CMD == 'R':  RD_MEM →  RD_TX   (loop len times)  →  IDLE
   `!busy`, then increments `addr`, decrements `len`.
 - Loop exits when `len` reaches 0.
 
-No pipelining in v1: at 868 clocks/bit a UART byte takes ~8680 clocks while an SRAM
-access takes ~4, so the UART is ~2000× slower and the SRAM is never the bottleneck.
+No pipelining in v1: at 868 clocks/bit a UART byte takes ~8680 clocks while a one-byte
+SRAM range takes 3, so the UART is thousands of times slower and the SRAM is never the
+bottleneck.
 A single holding byte in each direction suffices — no elastic buffering, no FIFO.
 
 ## 6. Integration & SRAM arbitration

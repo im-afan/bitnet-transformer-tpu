@@ -91,6 +91,7 @@ TIMER_COUNTERS = (
     "vpu",    # VPU busy
     "dma",    # DMA busy
     "swait",  # scalar unit blocked in S_WAIT (the cost of issue-and-wait)
+    "vmm",    # VPU running a `vecmatmul` macro op (subset of vpu)
 )
 TIMER_WORDS = len(TIMER_COUNTERS)
 TIMER_BYTES = TIMER_WORDS * 4
@@ -729,7 +730,8 @@ class TPUUart:
         busy interval and therefore the denominator for the others: divide to
         get the fraction of the run each unit was active. They **overlap** and
         do not partition the run — under issue-and-wait ``swait`` covers nearly
-        all of ``mxu``/``vpu``/``dma``, and ``mload`` is a subset of ``mxu``.
+        all of ``mxu``/``vpu``/``dma``, ``mload`` is a subset of ``mxu``, and
+        ``vmm`` is a subset of ``vpu``.
 
         The frame is the single command byte; the reply is fixed-length with no
         status byte, so unlike every other command there is nothing to validate,
@@ -763,14 +765,16 @@ def format_counters(ctr: dict[str, int], indent: str = "  ") -> str:
     Percentages are of ``run``, the total busy interval. They deliberately sum
     to more than 100%: the counters overlap rather than partitioning the run.
     Under issue-and-wait the scalar unit is parked in ``S_WAIT`` for nearly the
-    whole of any dispatch, so ``swait`` shadows ``mxu``/``vpu``/``dma``, and
-    ``mload`` is a sub-phase of ``mxu``. Read each line as "the fraction of the
-    run this unit was active", not as a slice of a pie.
+    whole of any dispatch, so ``swait`` shadows ``mxu``/``vpu``/``dma``,
+    ``mload`` is a sub-phase of ``mxu``, and ``vmm`` is a sub-phase of ``vpu``.
+    Read each line as "the fraction of the run this unit was active", not as a
+    slice of a pie.
     """
     labels = {
         "mxu":   "MXU busy",
         "mload": "  of which weight load",
         "vpu":   "VPU busy",
+        "vmm":   "  of which vecmatmul",
         "dma":   "DMA busy",
         "swait": "scalar stalled (issue-and-wait)",
     }

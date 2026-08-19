@@ -30,11 +30,22 @@ module dma_tb;
     localparam int SCRATCHPAD_ADDR_W = 16;
     localparam int MEM_DATA_W        = 8;
     localparam int SPAD_BYTES        = 64;   // scratchpad DMA port width (bytes)
+`ifndef CPA
+`define CPA 0
+`endif
+    localparam int SRAM_CPA          = `CPA; // sram_controller CLOCKS_PER_ACCESS
+    // The controller's per-byte beat, restated so the rate bounds below are
+    // written against its contract rather than against one configuration.
+    localparam int RD_BEAT = SRAM_CPA + 1;
+    localparam int WR_BEAT = (SRAM_CPA + 1 > 2) ? SRAM_CPA + 1 : 2;
 
     // ---- Clock / reset ------------------------------------------------------
     logic clk = 1'b0;
     logic rst_n = 1'b0;
     always #5 clk = ~clk;   // 100 MHz
+
+    int unsigned cyc = 0;
+    always @(posedge clk) cyc <= cyc + 1;
 
     // ---- Scalar-unit dispatch -----------------------------------------------
     logic                          dma_start, dma_write;
@@ -48,7 +59,9 @@ module dma_tb;
     // ---- DMA <-> sram_controller --------------------------------------------
     logic                    sram_start, sram_we;
     logic [MEM_ADDR_W-1:0]   sram_addr;
+    logic [15:0]             sram_len, sram_stride;
     logic [MEM_DATA_W-1:0]   sram_din, sram_dout;
+    logic                    sram_din_valid, sram_din_ready, sram_dout_valid;
     logic                    sram_busy, sram_done;
 
     // ---- DMA <-> scratchpad DMA port ----------------------------------------
@@ -74,7 +87,10 @@ module dma_tb;
     ) u_dma (
         .clk(clk), .rst_n(rst_n),
         .sram_start(sram_start), .sram_we(sram_we), .sram_addr(sram_addr),
-        .sram_din(sram_din), .sram_dout(sram_dout),
+        .sram_len(sram_len), .sram_stride(sram_stride),
+        .sram_din(sram_din), .sram_din_valid(sram_din_valid),
+        .sram_din_ready(sram_din_ready),
+        .sram_dout(sram_dout), .sram_dout_valid(sram_dout_valid),
         .sram_busy(sram_busy), .sram_done(sram_done),
         .scratchpad_re(spad_re), .scratchpad_raddr(spad_raddr), .scratchpad_rdata(spad_rdata),
         .scratchpad_we(spad_we), .scratchpad_waddr(spad_waddr),
@@ -91,11 +107,14 @@ module dma_tb;
     // Real SRAM controller.
     // =========================================================================
     sram_controller #(
-        .CLOCKS_PER_ACCESS(2), .ADDR_W(MEM_ADDR_W), .DATA_W(MEM_DATA_W)
+        .CLOCKS_PER_ACCESS(SRAM_CPA), .ADDR_W(MEM_ADDR_W), .DATA_W(MEM_DATA_W)
     ) u_sram (
         .clk(clk), .rst_n(rst_n),
         .start(sram_start), .we(sram_we), .addr(sram_addr),
-        .din(sram_din), .dout(sram_dout), .busy(sram_busy), .done(sram_done),
+        .len(sram_len), .stride(sram_stride),
+        .din(sram_din), .din_valid(sram_din_valid), .din_ready(sram_din_ready),
+        .dout(sram_dout), .dout_valid(sram_dout_valid),
+        .busy(sram_busy), .done(sram_done),
         .sram_addr(chip_addr), .sram_data(chip_data),
         .sram_we(chip_we), .sram_ce(chip_ce), .sram_oen(chip_oen)
     );
@@ -128,13 +147,54 @@ module dma_tb;
 
     wire mem_drives = (chip_ce == 1'b0) && (chip_oen == 1'b0) && (chip_we == 1'b1);
     assign #3 chip_data = mem_drives ? sram_mem[chip_addr] : {MEM_DATA_W{1'bz}};
-    always @(posedge chip_we) if (chip_ce == 1'b0) sram_mem[chip_addr] <= chip_data;
+
+    // Latch the pins when WE# falls so the commit can be checked against them:
+    // a controller that moves the address inside the write pulse writes to the
+    // neighbouring cell on hardware while looking perfect in a functional model.
+    logic [MEM_ADDR_W-1:0] we_lo_addr;
+    logic [MEM_DATA_W-1:0] we_lo_data;
+    int                    write_hazards = 0;
+
+    always @(negedge chip_we) begin
+        we_lo_addr <= chip_addr;
+        we_lo_data <= chip_data;
+    end
+
+    always @(posedge chip_we) begin
+        if (chip_ce == 1'b0) begin
+            if (chip_addr !== we_lo_addr || chip_data !== we_lo_data) begin
+                write_hazards++;
+                $display("  FAIL write hazard at t=%0t: addr %05h->%05h data %02h->%02h",
+                         $time, we_lo_addr, chip_addr, we_lo_data, chip_data);
+            end
+            sram_mem[chip_addr] <= chip_data;
+        end
+    end
 
     // -------------------------------------------------------------------------
     // Reference memory (byte model of what each store should contain).
     // -------------------------------------------------------------------------
     int errors = 0;
     int checks = 0;
+
+    // A range is issued with a single-cycle `sram_start`, so the controller has
+    // to be idle when it lands: a pulse into a busy controller is simply lost.
+    always @(posedge clk)
+        if (rst_n && sram_start && sram_busy) begin
+            errors++;
+            $display("  FAIL sram_start while the controller is busy (t=%0t)", $time);
+        end
+
+    // The fill path advances its counters on `sram_dout_valid` and decides
+    // "row finished" on `sram_done`, which is only correct because the
+    // controller raises both on the same clock for a range's last byte. Assert
+    // it here so a change to that contract is caught in this bench and not by
+    // one byte going missing at the end of every row.
+    always @(posedge clk)
+        if (rst_n && dma_busy && !dma_write && sram_done && !sram_dout_valid) begin
+            errors++;
+            $display("  FAIL sram_done without dout_valid on a fill (t=%0t)", $time);
+        end
 
     task automatic chk(input logic cond, input string tag);
         checks++;
@@ -165,6 +225,8 @@ module dma_tb;
     // linear-mode wrapper, which leaves all three stride registers at 0 — so
     // every plain transfer in this bench also proves that a leftover geometry
     // cannot reach an unflagged copy.
+    int unsigned t_start, t_clocks;
+
     task automatic run_dma_t(input logic wr,
                              input [SCRATCHPAD_ADDR_W-1:0] saddr,
                              input [MEM_ADDR_W-1:0] daddr,
@@ -175,6 +237,7 @@ module dma_tb;
                              input [15:0] tdrow);
         int guard;
         @(negedge clk);
+        t_start = cyc;
         dma_write = wr; dma_scratch_addr = saddr; dma_dram_addr = daddr;
         dma_len = len;
         dma_transpose = tr; dma_tcols = tcols; dma_tsrow = tsrow; dma_tdrow = tdrow;
@@ -190,6 +253,7 @@ module dma_tb;
                 errors++; disable run_dma_t;
             end
         end
+        t_clocks = cyc - t_start;
         @(negedge clk);
         chk(!dma_done, "done is single-cycle pulse");
         chk(!dma_busy, "busy low after done");
@@ -219,8 +283,8 @@ module dma_tb;
                 $display("    fill %s[%0d]: exp %02h got %02h", tag, i,
                          8'((daddr+i)^8'h3C), b);
         end
-        $display("[FILL  %-10s] saddr=%05h daddr=%05h len=%0d  (errors: %0d)",
-                 tag, saddr, daddr, len, errors);
+        $display("[FILL  %-10s] saddr=%05h daddr=%05h len=%0d  %0d clk (%.2f/byte)  (errors: %0d)",
+                 tag, saddr, daddr, len, t_clocks, real'(t_clocks)/real'(len), errors);
     endtask
 
     task automatic test_spill(input [SCRATCHPAD_ADDR_W-1:0] saddr,
@@ -237,8 +301,8 @@ module dma_tb;
                 $display("    spill %s[%0d]: exp %02h got %02h", tag, i,
                          8'((i*5+1)), sram_mem[daddr + i]);
         end
-        $display("[SPILL %-10s] saddr=%05h daddr=%05h len=%0d  (errors: %0d)",
-                 tag, saddr, daddr, len, errors);
+        $display("[SPILL %-10s] saddr=%05h daddr=%05h len=%0d  %0d clk (%.2f/byte)  (errors: %0d)",
+                 tag, saddr, daddr, len, t_clocks, real'(t_clocks)/real'(len), errors);
     endtask
 
     // -------------------------------------------------------------------------
@@ -275,8 +339,9 @@ module dma_tb;
                     $display("    fill.t %s src(%0d,%0d)->dst+%0d: exp %02h got %02h",
                              tag, r, c, c*tdrow + r, want, b);
             end
-        $display("[FILL.t  %-8s] %0dx%0d  tsrow=%0d tdrow=%0d  (errors: %0d)",
-                 tag, rows, rlen, tsrow, tdrow, errors);
+        $display("[FILL.t  %-8s] %0dx%0d  tsrow=%0d tdrow=%0d  %0d clk (%.2f/byte)  (errors: %0d)",
+                 tag, rows, rlen, tsrow, tdrow, t_clocks,
+                 real'(t_clocks)/real'(rows*rlen), errors);
     endtask
 
     task automatic test_spill_t(input [SCRATCHPAD_ADDR_W-1:0] saddr,
@@ -302,8 +367,9 @@ module dma_tb;
                     $display("    spill.t %s src(%0d,%0d)->dst+%0d: exp %02h got %02h",
                              tag, r, c, c*tdrow + r, want, sram_mem[daddr + c*tdrow + r]);
             end
-        $display("[SPILL.t %-8s] %0dx%0d  tsrow=%0d tdrow=%0d  (errors: %0d)",
-                 tag, rows, rlen, tsrow, tdrow, errors);
+        $display("[SPILL.t %-8s] %0dx%0d  tsrow=%0d tdrow=%0d  %0d clk (%.2f/byte)  (errors: %0d)",
+                 tag, rows, rlen, tsrow, tdrow, t_clocks,
+                 real'(t_clocks)/real'(rows*rlen), errors);
     endtask
 
     // -------------------------------------------------------------------------
@@ -427,7 +493,34 @@ module dma_tb;
         end
         $display("[ROUNDTRIP.t] 8x6 -> 6x8 -> 8x6  (errors: %0d)", errors);
 
+        // ---- Rate, at the sizes the model actually moves --------------------
+        // adder_model.tpu's per-layer traffic is ~33 KB of linear fills, one
+        // 4 KB linear spill, and two transposing spills (V^T out of the fused
+        // QKV block, and each head's A^T scattered into A). All four shapes are
+        // here, verified byte-for-byte by the same tasks as everything above and
+        // then held to a clocks-per-byte bound: byte-serial v1 ran at ~8, and
+        // the point of the range interface is 1 (read) / 2 (write).
+        $display("---- rate ----");
+        test_fill (16'h0000, 19'h30000, 16'd4096, "linear4k");
+        chk(t_clocks <= 4096*RD_BEAT + 64, "fill 4096: one read beat per byte");
+        test_spill(16'h0000, 19'h32000, 16'd4096, "linear4k");
+        chk(t_clocks <= 4096*(WR_BEAT+1) + 64, "spill 4096: one write beat per byte");
+
+        // V^T: 32 rows of 128 bytes out of a 384-byte-pitch column slice,
+        // scattered into DRAM 32 bytes apart. One range per row, stride 32.
+        test_spill_t(16'h0000, 19'h34000, 32, 128, 16'd384, 16'd32, "VT");
+        chk(t_clocks <= 4096*(WR_BEAT+1) + 32*8, "spill.t V^T: one write beat per byte");
+
+        // A_h^T: 32x32, scattered 128 bytes apart into the [T][D] A buffer.
+        test_spill_t(16'h4000, 19'h36000, 32, 32, 16'd32, 16'd128, "AhT");
+        chk(t_clocks <= 1024*(WR_BEAT+1) + 32*8, "spill.t A^T: one write beat per byte");
+
         // Summary.
+        checks++;
+        if (write_hazards != 0) begin
+            errors++;
+            $display("  FAIL %0d SRAM write hazards seen", write_hazards);
+        end
         $display("==== done: %0d checks, %0d errors ====", checks, errors);
         if (errors == 0) $display("DMA: ALL TESTS PASSED");
         else             $display("DMA: FAILED (%0d errors)", errors);

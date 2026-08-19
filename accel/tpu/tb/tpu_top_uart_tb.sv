@@ -99,9 +99,10 @@ module tpu_top_uart_tb;
 
     // Performance-counter block returned by 'T'. Must match tpu_top.sv's NPERF
     // and PERF_* indices — those define the wire order, this decodes it.
-    localparam int NPERF   = 6;
+    localparam int NPERF   = 7;
     localparam int P_RUN   = 0, P_MXU = 1, P_MLOAD = 2,
-                   P_VPU   = 3, P_DMA = 4, P_SWAIT = 5;
+                   P_VPU   = 3, P_DMA = 4, P_SWAIT = 5,
+                   P_VMM   = 6;
 
     // Word w of a 'T' reply. uart_read_timer() shifts bytes in from the low end,
     // so the first word received (counter 0) ends up in the highest slice.
@@ -446,9 +447,9 @@ module tpu_top_uart_tb;
                 $display("run took %0d core clocks (device timer agrees)",
                          ctr_w(ctr, P_RUN));
             end
-            $display("  counters: mxu=%0d mload=%0d vpu=%0d dma=%0d swait=%0d",
+            $display("  counters: mxu=%0d mload=%0d vpu=%0d (vmm=%0d) dma=%0d swait=%0d",
                      ctr_w(ctr, P_MXU), ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_VPU),
-                     ctr_w(ctr, P_DMA), ctr_w(ctr, P_SWAIT));
+                     ctr_w(ctr, P_VMM), ctr_w(ctr, P_DMA), ctr_w(ctr, P_SWAIT));
 
             // Structural invariants. These hold for *any* program, so they test
             // the counter block rather than this particular pair of programs.
@@ -467,6 +468,14 @@ module tpu_top_uart_tb;
                 errors++;
                 $display("  FAIL: mload=%0d exceeds mxu=%0d (must be a subset)",
                          ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_MXU));
+            end
+            // ...and vecmatmul time is a sub-state of VPU busy, for the same
+            // reason: `vpu_mm_busy` is `vpu_busy` qualified by `mm_active`.
+            checks++;
+            if (ctr_w(ctr, P_VMM) > ctr_w(ctr, P_VPU)) begin
+                errors++;
+                $display("  FAIL: vmm=%0d exceeds vpu=%0d (must be a subset)",
+                         ctr_w(ctr, P_VMM), ctr_w(ctr, P_VPU));
             end
 
             // Every example stages tensors over DMA; VPU use is per-program.

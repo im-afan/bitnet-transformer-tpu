@@ -76,13 +76,16 @@ set_false_path -from [get_ports { uart_txd_in }]
 
 ## External async SRAM. The chip is asynchronous, so there is no I/O clock to
 ## constrain against and set_input_delay/set_output_delay have no meaningful
-## reference. The access timing is instead guaranteed by sram_controller's
-## CLOCKS_PER_ACCESS: at 12 MHz each phase is held 2 x 83.3 ns = 167 ns, against
-## a part rated for 10-55 ns access. That is >3x margin, so declaring these
-## paths unconstrained is safe *at this clock rate*.
+## reference. The access timing is instead guaranteed by sram_controller's beat
+## length: at 12 MHz and SRAM_CPA = 0 a read address is held one clock (83.3 ns)
+## and a write pulse is one clock inside a two-clock beat, against a part rated
+## for a 10 ns access. The full per-parameter budget -- and why the write pulse
+## is generated on the falling edge -- is in rtl/sram.sv's header; every margin
+## there is >4x. So declaring these paths unconstrained is safe *at this clock
+## rate*.
 ##
 ## If you ever add an MMCM and raise the core clock, revisit this: at 100 MHz a
-## 2-cycle access is only 20 ns and these false paths would be hiding a real
+## one-clock beat is only 10 ns and these false paths would be hiding a real
 ## violation. Replace them with set_input_delay/set_output_delay against a
 ## virtual clock, or raise SRAM_CPA.
 set_false_path -to   [get_ports { sram_addr[*] sram_data[*] sram_we sram_ce sram_oen }]

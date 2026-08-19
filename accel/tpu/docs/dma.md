@@ -8,7 +8,10 @@ scalar unit copying each byte itself. It is the hardware behind the `ReadMemory`
 **Status: built.** [`rtl/dma.sv`](../rtl/dma.sv) implements §3–§4 and is wired into
 `tpu_top.sv` between the scalar unit's dispatch, the scratchpad's `dma_*` port and a
 `sram_controller`; [`tb/dma_tb.sv`](../tb/dma_tb.sv) is the §9 bench. §5's **transpose
-mode** is built on top of it. The line-buffered optimization (§7) is not.
+mode** is built on top of it. §7's throughput work is built too, though not as the
+line buffer this document originally planned — the width adapter moved into
+[`sram.sv`](../rtl/sram.sv) as a *range* request and the DMA became a stream client.
+**1 clock/byte on fills, 2 on spills**, against ~8 before.
 
 ---
 
@@ -31,14 +34,18 @@ pulses `done`. That's the whole contract. Everything below is *how* it grinds th
 
 The two memories the DMA bridges have **completely different shapes**:
 
-| Memory                | Width per access | Timing                          | Size (this board)   |
-| --------------------- | ---------------- | ------------------------------- | ------------------- |
-| Scratchpad (BRAM)     | **64 bytes**     | 1 cycle, synchronous read       | 64 KB (`ADDR_W=16`) |
-| DRAM (external SRAM)  | **1 byte**       | ~3 cycles/byte, `start`/`done`  | 512 KB (`ADDR_W=19`)|
+| Memory                | Width per access | Timing                             | Size (this board)   |
+| --------------------- | ---------------- | ---------------------------------- | ------------------- |
+| Scratchpad (BRAM)     | **64 bytes**     | 1 cycle, synchronous read          | 64 KB (`ADDR_W=16`) |
+| DRAM (external SRAM)  | **1 byte**       | 1 clock/byte read, 2/byte written  | 512 KB (`ADDR_W=19`)|
 
 So a DMA transfer is fundamentally a **width + rate adapter**: it takes wide, fast scratchpad
-words and serializes them into narrow, slow byte transactions to the SRAM (and vice-versa).
-That mismatch is the entire reason this is a real block and not a wire.
+words and serializes them into narrow byte streams to the SRAM (and vice-versa). That
+mismatch is the entire reason this is a real block and not a wire.
+
+The rate column used to read *~3 cycles/byte, `start`/`done`*, because the controller took
+one request per byte. It now takes one request per **range** and streams it, which is what
+§7 is about.
 
 ---
 
@@ -49,7 +56,7 @@ That mismatch is the entire reason this is a real block and not a wire.
                                                                                  │   DMA   │
    scratchpad  ◄── dma_* port (64B synchronous read/write, byte-strobed) ──────► │  engine │
                                                                                  │  (FSM)  │
-   sram_ctrl   ◄── start/we/addr/din / dout/busy/done (1 byte per txn) ────────► └─────────┘
+   sram_ctrl   ◄── start/we/addr/len/stride + byte streams / busy/done ────────► └─────────┘
        │
        └── FPGA pins ──► external SRAM chip (constraints/constraings-cmod.xdc)
 ```
@@ -64,9 +71,11 @@ requests):
 - **Scratchpad side** — [`scratchpad.sv`](../rtl/scratchpad.sv) has a dedicated `dma_*` port
   (`DMA_BYTES=64` wide, synchronous read valid next cycle, byte-strobed write), which the
   engine owns; the host reaches memory over the UART instead.
-- **DRAM side** — [`sram_controller`](../rtl/sram.sv): one `start`/`busy`/`done` transaction
-  per byte, `we` selects read vs. write, 19-bit address, 8-bit data. `tpu_top` arbitrates it
-  between the DMA (while a program runs) and the UART host (while idle).
+- **DRAM side** — [`sram_controller`](../rtl/sram.sv): one `start`/`busy`/`done` request per
+  **range** (`addr` + `len` + `stride`), `we` selects read vs. write, 19-bit address, 8-bit
+  data, with a `dout_valid` strobe per byte read and a ready/valid stream for bytes written.
+  `tpu_top` arbitrates it between the DMA (while a program runs) and the UART host (while
+  idle, at `len = 1`).
 
 ---
 
@@ -101,134 +110,147 @@ geometry registers come from the config file. That split is deliberate — see �
 ## 3. Data movement: the two flows
 
 The engine walks a byte counter `i` from `0` to `len-1`. Each byte touches both memories; the
-order depends on direction.
+order depends on direction. The DRAM side is not a per-byte transaction any more — it is a
+**range** (§7), issued once per source row, and the bytes of that range arrive or are asked
+for one per handshake.
 
 ### Fill — DRAM → scratchpad (`dma_write = 0`, `ReadMemory`)
 
-For each byte `i`:
-1. **SRAM read** — `sram.start=1, we=0, addr = dram_addr + i`; wait for `sram.done`; capture
-   `sram.dout`.
-2. **Scratchpad write** — one byte via a one-hot strobe: `dma_waddr = scratch_addr + i`,
-   `dma_wdata[7:0] = byte`, `dma_wstrb = 1` (lane 0 only). Completes in one cycle.
+Per range: `sram.start=1, we=0, addr = this row's DRAM base, len = this row's byte count,
+stride = 1`. Then, for each byte:
+
+1. **Take the byte** — `sram.dout_valid` pulses with `sram.dout` holding it, one byte per
+   clock.
+2. **Scratchpad write** — in that same clock, via a one-hot strobe:
+   `dma_waddr = scratch_addr + off`, `dma_wdata[7:0] = byte`, `dma_wstrb = 1` (lane 0 only).
+
+The scratchpad write port takes one every clock, so nothing buffers and nothing needs to be
+aligned. The range ends with `sram.done`, which the controller raises on the same clock as
+the last `dout_valid`.
 
 ### Spill — scratchpad → DRAM (`dma_write = 1`, `WriteMemory`)
 
-For each byte `i`:
-1. **Scratchpad read** — `dma_re=1, dma_raddr = scratch_addr + i`; `dma_rdata` is valid the
-   *next* cycle (synchronous-read contract); take lane 0.
-2. **SRAM write** — `sram.start=1, we=1, addr = dram_addr + i, din = byte`; wait `sram.done`.
+Per range: `sram.start=1, we=1, addr = this row's DRAM base, len, stride` (`tdrow` in
+transposed mode, else 1). Then, two clocks per byte, pipelined against the controller's
+two-clock write beat:
 
-The SRAM is the bottleneck (~3 cycles/byte vs. 1 for the scratchpad), so v1 deliberately does
-**byte-at-a-time** transfers and doesn't try to batch. It's the simplest thing that's correct;
-§7 covers the line-buffered optimization.
+1. **Scratchpad read** — `dma_re=1, dma_raddr = scratch_addr + off`; `dma_rdata` is valid the
+   *next* cycle (synchronous-read contract); take lane 0.
+2. **Offer it** — `sram.din = byte`, `sram.din_valid = 1`; the controller takes it on
+   `sram.din_ready`, which it raises on the last clock of the beat before. A byte that is
+   *not* taken immediately (only possible at `CLOCKS_PER_ACCESS > 0`) is held in a one-byte
+   register rather than re-read, because the scratchpad only promises its read data for the
+   one cycle after `re`.
+
+The SRAM is still the bottleneck — 1 clock/byte read and 2 written, against the scratchpad's
+1 — but it is now a stream rather than a sequence of transactions, and the engine's own
+sequencing no longer adds to it.
 
 ---
 
 ## 4. FSM
 
-The engine's whole memory is small: one byte counter (`i`), one direction bit (`wr`), the
-latched base addresses (`scratch_addr`, `dram_addr`) and `len`, and a one-byte holding register
-(`byte`). Everything the DMA does is a loop that, once per byte, reads from one memory into
-`byte` and writes `byte` into the other. The states exist because **each memory access takes
-more than one cycle**, so a single "copy one byte" step has to be spread across several states
-that each drive one phase of a handshake.
+The engine's whole memory is small: one byte counter (`i`), the 2-D walk (`col`/`row` and
+their two running offsets), and a one-byte holding register for the spill path. Everything
+the DMA does is a loop that hands the controller one **row** at a time and then moves that
+row's bytes one per handshake. The states exist because the two memories answer on different
+clocks — the scratchpad one cycle after `re`, the SRAM one byte per beat — so a "copy one
+byte" step is still spread over a couple of states on the spill side; on the fill side it
+collapsed to nothing, because a byte arriving and a byte being stored are the same clock.
 
 ```
-IDLE ──dma_start──► (latch wr, scratch_addr, dram_addr, len; i=0; busy=1)
+IDLE ──dma_start──► (i=0; col=row=0; busy=1)
   │
-  ├─ if len == 0 ──────────────────────────────────► DONE      (empty transfer)
+  ├─ if len == 0 ──────────────────────────────────────────────────► DONE
   │
-  ├─ wr == 0  (FILL: DRAM → scratch) ───────────────────────────────┐
-  │     SR_RD   : sram.start=1, we=0, addr=dram_addr+i              │
-  │     SR_WAIT : wait sram.done → byte <= sram.dout                │
-  │     SP_WR   : dma_we=1, waddr=scratch_addr+i, wdata=byte,       │
-  │              wstrb=1                                            │
-  │     STEP    : i++ ; (i < len) ? SR_RD : DONE                    │
-  │                                                                 │
-  ├─ wr == 1  (SPILL: scratch → DRAM) ──────────────────────────────┤
-  │     SP_RD   : dma_re=1, raddr=scratch_addr+i                    │
-  │     SP_WAIT : (rdata valid) byte <= dma_rdata[7:0]              │
-  │     SW_WR   : sram.start=1, we=1, addr=dram_addr+i, din=byte    │
-  │     SW_WAIT : wait sram.done                                    │
-  │     STEP    : i++ ; (i < len) ? SP_RD : DONE                    │
-  │                                                                 │
+  └─► ISSUE : sram.start=1, we=wr, addr=<row base>,                  ◄──┐
+  │           len=min(tcols, len-i), stride=<1 or tdrow>                │
+  │                                                                     │
+  ├─ wr == 0  (FILL: DRAM → scratch) ───────────────────────────────┐   │
+  │     FILL       : on sram.dout_valid — dma_we=1, wstrb=1,        │   │
+  │                  waddr=scratch_addr+off, wdata=sram.dout ; i++  │   │
+  │                  on sram.done — row finished ───────────────────────┤
+  │                                                                 │   │
+  ├─ wr == 1  (SPILL: scratch → DRAM) ──────────────────────────────┤   │
+  │     SPILL_RD   : dma_re=1, raddr=scratch_addr+off               │   │
+  │     SPILL_SEND : din=dma_rdata[7:0], din_valid=1 ;              │   │
+  │                  on sram.din_ready — i++ ; more in this row     │   │
+  │                  ? SPILL_RD : SPILL_END                         │   │
+  │     SPILL_END  : wait sram.done (the last write commits) ───────────┤
+  │                                                                 │   │
+  │                       (i < len) ────────────────────────────────────┘
 DONE : dma_done=1 (one cycle), busy=0 ──► IDLE  ◄──────────────────┘
 ```
+
+In linear mode `tcols` defaults to `dma_len`, so the loop runs exactly once: one range for
+the whole transfer.
 
 ### What each state means
 
 **Shared**
 
 - **`IDLE`** — the resting state. The DMA sits here doing nothing, `busy=0`, waiting for
-  `dma_start`. When it arrives, this is the *only* moment the command inputs are sampled: it
-  copies `dma_write → wr`, the two addresses and `len` into its own registers, zeroes the byte
-  counter `i`, raises `busy`, and jumps into whichever loop `wr` selects. Latching here is what
-  lets the scalar unit drop its inputs after the one-cycle `start` pulse — the DMA no longer
-  depends on them.
+  `dma_start`. The command inputs are *not* copied: the scalar unit holds them stable until
+  `dma_done` (issue-and-wait), so the engine reads them where it needs them and only has to
+  zero its own counters here.
 
-- **`STEP`** — the loop's "bottom". One byte has fully landed in its destination, so this state
-  advances the counter (`i++`) and makes the one branch decision in the whole machine: if there
-  are more bytes (`i < len`) go back to the top of the loop for byte `i`; otherwise the transfer
-  is finished, so go to `DONE`. (In RTL this can be folded into the last write state to save a
-  cycle; it's drawn separately here so the loop is obvious.)
+- **`ISSUE`** — one cycle, once per source row. It pulses `sram.start` with this row's DRAM
+  base address, its byte count (`min(tcols, len - i)` — so a `len` that is not a whole number
+  of rows simply makes the last range short), and its stride. The controller latches all of
+  it on that edge, and is guaranteed to be idle then: the previous range's `done` is what
+  brought us back here.
 
 - **`DONE`** — the finish line. Pulses `dma_done` high for exactly one cycle and drops `busy`,
   which is the signal the scalar unit's `U_DMA` wait state is blocking on. Then it falls back to
   `IDLE`, ready for the next command.
 
-**Fill loop (`wr = 0`, DRAM → scratchpad)** — read a byte *out of* the slow SRAM, then drop it
-into the fast scratchpad:
+**Fill loop (`wr = 0`, DRAM → scratchpad)** — one state, because the two sides run at the
+same rate:
 
-- **`SR_RD`** ("SRAM read, issue") — kick off one SRAM read: drive `sram.start=1`, `we=0`
-  (read), and `addr = dram_addr + i`. This asserts `start` for a *single* cycle; the actual data
-  won't be ready this cycle, so we immediately move on to wait for it.
-- **`SR_WAIT`** ("SRAM read, wait") — the SRAM controller is off doing its own multi-cycle
-  access. The DMA parks here until `sram.done` goes high, then captures the returned byte into
-  its holding register (`byte <= sram.dout`). This state is why the counter isn't just a `for`
-  loop — most of the transfer time is spent sitting in these wait states.
-- **`SP_WR`** ("scratchpad write") — the byte is in hand, so write it into the scratchpad in one
-  cycle: `dma_we=1`, `dma_waddr = scratch_addr + i`, the byte on lane 0 of `dma_wdata`, and a
-  one-hot `dma_wstrb = 1` so *only* that one byte is written and the other 63 lanes of the wide
-  word are left untouched. Then fall through to `STEP`.
+- **`FILL`** — every `sram.dout_valid` is a byte, and it is written into the scratchpad on
+  that same clock: `dma_we=1`, `dma_waddr = scratch_addr + off`, the byte on lane 0 of
+  `dma_wdata`, and a one-hot `dma_wstrb = 1` so *only* that byte is written and the other 63
+  lanes of the wide word are left untouched. The walk advances on the same edge, so the
+  address is always the one belonging to the byte in hand. The row ends on `sram.done`, which
+  lands on the same clock as its last `dout_valid` — `tb/dma_tb.sv` asserts exactly that,
+  because the counter arithmetic here depends on it.
 
-**Spill loop (`wr = 1`, scratchpad → DRAM)** — read a byte *out of* the fast scratchpad, then
-push it into the slow SRAM. Note the read/write order is reversed vs. fill, because now the
-scratchpad is the source:
+**Spill loop (`wr = 1`, scratchpad → DRAM)** — two states, because the scratchpad answers a
+cycle late and that cycle is exactly the controller's turnaround:
 
-- **`SP_RD`** ("scratchpad read, issue") — request the byte: `dma_re=1`,
-  `dma_raddr = scratch_addr + i`. The scratchpad's read is **synchronous** — the data is *not*
-  on `dma_rdata` this cycle, it appears next cycle — so we can't use it yet.
-- **`SP_WAIT`** ("scratchpad read, capture") — exactly one cycle later the data is valid;
-  latch lane 0 into the holding register (`byte <= dma_rdata[7:0]`). This state exists purely to
-  honor that one-cycle read latency; skipping it would capture stale data from the *previous*
-  read.
-- **`SW_WR`** ("SRAM write, issue") — start one SRAM write: `sram.start=1`, `we=1` (write),
-  `addr = dram_addr + i`, `din = byte`. Like `SR_RD`, this only pulses `start` for one cycle.
-- **`SW_WAIT`** ("SRAM write, wait") — park until `sram.done` confirms the byte was committed to
-  the chip, then fall through to `STEP`. The SRAM controller itself ends the write pulse cleanly
-  while the address/data are still held (see `sram.sv`), so the DMA just has to wait for its
-  `done`.
+- **`SPILL_RD`** ("scratchpad read, issue") — request the byte: `dma_re=1`,
+  `dma_raddr = scratch_addr + off`. The scratchpad's read is **synchronous** — the data is
+  *not* on `dma_rdata` this cycle, it appears next cycle.
+- **`SPILL_SEND`** — the data is valid now, so offer it: `sram.din = dma_rdata[7:0]`,
+  `sram.din_valid = 1`. The controller raises `din_ready` on the last clock of the beat
+  before, which is precisely this clock, so the offer is taken with no stall and the pair of
+  states costs two clocks per byte — the write beat's own length. If it is *not* taken (a
+  longer beat, i.e. `CLOCKS_PER_ACCESS > 0`), the byte goes into a one-byte holding register
+  and is re-offered from there; `dma_rdata` is only promised for the one cycle.
+- **`SPILL_END`** — the row's last byte has been handed over but not yet committed. Park
+  until `sram.done`, then issue the next row or finish.
 
-### Why the wait states are unavoidable
+### What is left of the wait states
 
-Two of the DMA's neighbors answer *later* than the cycle you ask them:
+Two of the DMA's neighbors still answer *later* than the cycle you ask them, but only one of
+them now costs anything:
 
-1. **The SRAM controller** takes several cycles per access and reports completion with `done`.
-   The DMA must pulse `start` once and then wait — re-driving `start` while `sram.busy` is high
-   would restart or corrupt the in-flight access.
-2. **The scratchpad read** returns data one cycle after `dma_re` (the synchronous-read contract
-   every other unit relies on). Hence the dedicated `SP_WAIT` capture cycle in the spill loop.
-
-The write side of the scratchpad, by contrast, is single-cycle, which is why fill's `SP_WR` and
-the counter bump can be done immediately with no wait.
+1. **The scratchpad read** returns data one cycle after `dma_re` (the synchronous-read
+   contract every other unit relies on). That cycle is `SPILL_RD`, and it is free: it is
+   spent inside the two-clock write beat rather than in addition to it.
+2. **The SRAM controller** used to take several cycles per *access* and report each one with
+   `done`. It now reports once per *range*, so the per-byte wait is gone entirely on the fill
+   side and hidden on the spill side. `start` still must not be re-pulsed while `sram.busy`
+   is high — the range would be lost — which is why `ISSUE` is only ever entered from `IDLE`
+   or from a completed range.
 
 Two more small points from the diagram:
 
 - **`len == 0`** short-circuits `IDLE → DONE` so an empty transfer still produces a proper
   `done` handshake instead of hanging or underflowing the counter.
 - **Symmetry.** Fill is *(SRAM read → scratch write)* and spill is *(scratch read → SRAM
-  write)* — the same two-access shape with source and destination swapped. Only the counter,
-  the `done` handshake, and `IDLE` are shared between the two loops.
+  write)* — the same two-access shape with source and destination swapped. Only the counters,
+  the range dispatch, the `done` handshake, and `IDLE` are shared between the two loops.
 
 ---
 
@@ -297,8 +319,11 @@ all three registers outright.
 ### 5.4 What it costs, and what it replaces
 
 Two 16-bit counters (`col`, `row`), two running-sum offset registers, and a mux on each
-address — no multipliers, since both offsets accumulate. Cycles per byte are unchanged: the
-SRAM access still dominates, and the permutation is free inside it.
+address — no multipliers, since both offsets accumulate. Clocks per byte are unchanged: the
+SRAM beat still dominates, and the permutation is free inside it. That survived the move to
+ranges only because the controller takes a `stride`; a transposed spill is one range per
+source row, `tcols` bytes at `tdrow` apart, and measures 2.03 clocks/byte at `tcols = 128`
+against the 2.00 a dense spill gets.
 
 What it replaces is `transpose_i8`, the byte-move loop that was the only way to transpose
 before: `rdmem`/`wrmem` with `len = 1` around a two-deep software loop, **two dispatches per
@@ -325,27 +350,52 @@ directions on a fused QKV block.
   while the DMA runs the MXU/VPU are idle and nobody else touches the scratchpad. The
   scratchpad's "DMA fills idle cycles" note ([scratchpad.md](scratchpad.md) §4) is about a
   future overlapped mode; v1 has the memory to itself.
-- **Byte-serial handles any alignment / length.** Because every access is one byte at an
-  absolute address, unaligned bases and a `len` that isn't a multiple of 64 just work — no
-  special first/last-word masking (that complexity only appears in the §7 optimization).
+- **Byte granularity handles any alignment / length.** Every byte still lands at its own
+  absolute address on both sides, so unaligned bases and a `len` that isn't a multiple of 64
+  just work — no first/last-word masking anywhere. That is the property §7 was careful not to
+  give up.
+- **A range is contiguous; a transposed transfer is not.** Ranges are therefore issued one
+  per *source row*, and a row is what `tcols` says it is. In linear mode `tcols` defaults to
+  `dma_len`, so there is exactly one range.
 
 ---
 
-## 7. Later: line-buffered (burst) mode
+## 7. Throughput: ranges, not line buffers
 
-v1 wastes the scratchpad's 64-byte width — it reads/writes one lane at a time. Once correct,
-the throughput win is to **buffer a full 64-byte scratchpad line** and stream it to/from the
-SRAM as 64 back-to-back byte transactions:
+**Built, and not the way this section originally planned it.** The plan was to buffer a
+64-byte scratchpad line and drain it to the SRAM as 64 back-to-back byte transactions. What
+was actually done inverts that: the *controller* learned to take a whole range, and the DMA
+became a stream client. Same goal, less machinery, and none of the alignment bookkeeping the
+line buffer would have needed.
 
-- **Fill:** collect 64 SRAM bytes into a line register, then do **one** 64-byte scratchpad
-  write with a full strobe.
-- **Spill:** do **one** 64-byte scratchpad read, then drain the 64 bytes to the SRAM.
+The reason the line buffer looked necessary was a mis-attribution. The scratchpad was never
+the problem — its port already takes one byte per clock at any alignment. The cost was in
+`sram_controller`, which sequenced IDLE/ACCESS/WAIT per **byte**, and in the four DMA states
+wrapped around each of those: 8 clocks per byte on a fill and 9 on a spill, to move a byte
+the chip itself answers in 10 ns — an eighth of one clock.
 
-This amortizes the scratchpad access and is the natural place to later overlap SRAM traffic
-with compute. It adds alignment bookkeeping (partial head/tail lines when `scratch_addr` or
-`len` isn't 64-aligned), which is exactly why it's **not** in v1. A further step is a
-prefetch/double-buffer so the next line's SRAM reads overlap the current line's scratchpad
-write.
+So [`sram.sv`](../rtl/sram.sv) now takes `addr` + `len` + `stride` and streams:
+
+| | before | after |
+| --- | --- | --- |
+| fill (DRAM → scratchpad) | ~8 clocks/byte | **1** |
+| spill (scratchpad → DRAM) | ~8 clocks/byte | **2** (the write beat; see `sram.sv`) |
+| `wrmem.t` spill | ~8 clocks/byte | **2.03** measured, at `tcols=128` |
+
+Measured end to end on the whole adder model through `tb/tpu_top_tb.sv`, same program and
+same golden vectors, byte-identical results: **1,226,722 → 541,590 clocks (2.27x)**. The
+model is not purely memory-bound, which is why the whole-program figure is smaller than the
+per-byte one.
+
+`stride` is what keeps a transposed spill on the fast path. `wrmem.t` writes its destination
+column-major, so consecutive bytes of a range are `tdrow` apart in DRAM; without a stride
+those would be one range per byte and the mode would have gained nothing.
+
+**What is still open.** The scratchpad's 64-byte width is genuinely unused — a line-buffered
+fill would still cut its access count by 64x, but that access is free today, so it buys
+nothing until something else wants the port. The real next step is **overlap**: prefetch the
+next range while the current one drains, so SRAM traffic hides under compute instead of
+blocking on `dma_done`. That needs the scalar unit to stop blocking, not more DMA states.
 
 ---
 
@@ -385,8 +435,17 @@ behavioral async-SRAM model from [`sram_tb.sv`](../tb/sram_tb.sv):
 5. **Corners.** `len = 0` (immediate `done`, nothing moved), `len = 1`, unaligned bases, a
    `len` that isn't a multiple of 64, and a transfer that reaches a high SRAM address (exercises
    the §8 address-width decision).
-6. **Handshake asserts.** `busy` frames the whole transfer, `done` is a single-cycle pulse, and
-   the DMA never re-pulses `sram.start` while `sram.busy` is high.
+6. **Handshake asserts.** `busy` frames the whole transfer, `done` is a single-cycle pulse,
+   the DMA never pulses `sram.start` while `sram.busy` is high (the range would be lost), and
+   `sram.done` on a fill always lands with a `sram.dout_valid` (the fill loop's byte count
+   depends on it). All three are standing assertions in the bench, not one-off checks.
+8. **Rate.** The four shapes the model actually moves — a 4 KB linear fill, a 4 KB linear
+   spill, and the two transposing spills (`V^T` and a head's `A^T`) — verified byte-for-byte
+   and then held to a clocks-per-byte bound derived from the controller's beat length, so a
+   regression that is merely *slow* fails the bench rather than passing it quietly.
+9. **Both beat lengths.** `make TEST=dma sim` and `make TEST=dma IVFLAGS=-DCPA=2 sim`:
+   `CLOCKS_PER_ACCESS > 0` is the only configuration that exercises the spill path's holding
+   register, because at the default the offer is always taken immediately.
 7. **Transpose (§5).** Both directions against an explicit `[r][c] -> [c][r]` reference written
    as the permutation, not as a second address generator — a shared bug in the two would
    otherwise cancel. Square and non-square; a strided source slice (`tsrow > tcols`, the V case)
@@ -406,6 +465,9 @@ behavioral async-SRAM model from [`sram_tb.sv`](../tb/sram_tb.sv):
 3. ~~**Transpose mode** (§5), with the geometry in `cfg tcols/tsrow/tdrow`.~~ **done**
 4. **Widen the DRAM address** (§8) so the full SRAM is reachable. Not done — the scalar unit
    still emits 16 bits, so a program addresses the low 64 KB.
-5. **Line-buffered mode** (§7) for throughput, then optional prefetch/double-buffer.
+5. ~~**Line-buffered mode** (§7) for throughput~~ — **done as ranges instead** (§7):
+   `sram.sv` takes `addr`/`len`/`stride`, the DMA streams it, 1 clock/byte on fills and 2 on
+   spills. Prefetch/double-buffer is still open and now needs a non-blocking dispatch more
+   than it needs DMA states.
 6. Optional: a **scratchpad-to-scratchpad** path, which would take the DRAM round trip out of
    an on-chip transpose (§5.4).

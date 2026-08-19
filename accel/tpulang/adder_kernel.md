@@ -416,17 +416,21 @@ a real checkpoint rather than synthetic weights.
 | 4 | `assembler.py examples/adder_model.tpu` | **208 words** of 1024 (`layers=2`) |
 | 5 | Full model, ISS vs PyTorch, exact | **0 of 16 800 elements differ** — 2 layer checkpoints (4096 int8 each), `V^T`, `A`, and 416 int32 logits |
 | 6 | `highmem_dma` + `vpu_matmul` through the RTL over the UART (`make uart`) | **5446 checks, 0 errors** — this is what covers the widened address and the `0x8000` case in hardware |
-| 7 | Full model through the RTL (`tpu_top_tb`, backdoor DRAM) | **26 240 checks, 0 errors** — halts at pc=195 after 23.58 ms simulated |
+| 7 | Full model through the RTL (`tpu_top_tb`, backdoor DRAM) | **18 048 checks, 0 errors** — halts at pc=207 after 541 590 clocks (5.42 ms at 100 MHz). Re-measured 2026-08-17 against freshly regenerated vectors, which came out byte-identical to the committed `tb/vectors_model/`; the earlier 26 240 / pc=195 reading was a different revision of the program |
 | 8 | Real checkpoint, ISS vs the reference (`adder_export.py --iss-check`) | **0/416 logits differ** |
 | 9 | Real-checkpoint task accuracy | int8 **100.00%** exact-sequence on the QAT `layers=2` checkpoint — §7.6c |
 | 10 | Real checkpoint through the host loop, per problem (`host/run_adder.py --dry-run`) | **100.00%** over 32 problems, identical to `quant.int_forward` |
 
-**§7.7 is a long simulation.** The model is ~188 KB of byte-serial DMA at ~14
-clocks/byte plus the MXU/VPU work — 2.36 M clocks, 23.58 ms at 100 MHz, with
-every unit busy. That is long enough in Icarus to need the watchdog raised
-(`-DWATCHDOG_NS`) and the waveform dump off (`-DNO_VCD`; without it the run
-writes a 400+ MB VCD before the old 2 ms watchdog even fires). Both are now
-options on `tpu_top_tb.sv`, defaults unchanged:
+**§7.7 is a long simulation**, though less long than it was. At `layers=2` the model
+moves ~96 KB through the DMA, plus the MXU/VPU work. That was 2.36 M clocks (at
+`layers=4`) and 1.23 M at `layers=2`, both at ~8-9 clocks/byte; since
+`sram.sv` became a range engine and the DMA a stream client
+(`accel/tpu/docs/dma.md` §7) the memory runs at 1 clock/byte on fills and 2 on
+spills, and the same program halts in **541 590 clocks, 5.42 ms at 100 MHz** —
+byte-identical output, `2.27x` fewer clocks. Still long enough in Icarus to need
+the watchdog raised (`-DWATCHDOG_NS`) and the waveform dump off (`-DNO_VCD`;
+without it the run writes hundreds of MB of VCD before the old 2 ms watchdog even
+fires). Both are options on `tpu_top_tb.sv`, defaults unchanged:
 
 ```bash
 cd accel/tpu/tb

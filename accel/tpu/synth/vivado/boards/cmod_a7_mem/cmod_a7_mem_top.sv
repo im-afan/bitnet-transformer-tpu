@@ -47,7 +47,7 @@ module cmod_a7_mem_top #(
     // External SRAM (the "DRAM" behind the DMA engine in the full image): 512K x 8.
     parameter int MEM_ADDR_W = 19,
     parameter int MEM_DATA_W = 8,
-    parameter int SRAM_CPA   = 2,
+    parameter int SRAM_CPA   = 0,
 
     // Power-on reset length, in core clocks (2**POR_W). 2**8 @ 12 MHz ~= 21 us.
     parameter int POR_W = 8

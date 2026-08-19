@@ -61,7 +61,11 @@ RTL_dma := ../rtl/dma.sv ../rtl/scratchpad.sv ../rtl/sram.sv
 
 RTL ?= $(if $(RTL_$(TEST)),$(RTL_$(TEST)),../rtl/$(TEST).sv)
 
-IVERILOG := iverilog -g2012 -Wall
+# Extra iverilog flags, for tests that take a -D switch:
+#   make TEST=sram IVFLAGS=-DCPA=2      the SRAM controller's slower beat
+#   make TEST=tpu_top IVFLAGS="-DWATCHDOG_NS=400000000 -DNO_VCD"
+IVFLAGS  ?=
+IVERILOG := iverilog -g2012 -Wall $(IVFLAGS)
 VVP      := vvp
 
 # --- UART end-to-end wiring ---------------------------------------------------

@@ -100,6 +100,12 @@ module vpu #(
     input  logic [ADDR_W-1:0]    vpu_crow,     // dst row stride, bytes (int32)
     output logic                 vpu_busy,
     output logic                 vpu_done,
+    // High on exactly the clocks this unit is executing a VOP_VECMATMUL
+    // dispatch — a strict subset of `vpu_busy`. Purely observational: nothing
+    // in the datapath reads it. tpu_top.sv feeds it to perf_counters.sv so the
+    // macro op's share of VPU time is separable from the primitive ops', which
+    // is the one split `vpu_busy` alone cannot show (docs/macro_ops.md §7).
+    output logic                 vpu_mm_busy,
 
     // ---- Scratchpad V_rw port (single logical read/modify/write, 512-bit) ----
     output logic                      V_re,
@@ -488,5 +494,12 @@ module vpu #(
     // -------------------------------------------------------------------------
     assign vpu_busy = (state != S_IDLE);
     assign vpu_done = (state == S_DONE);
+
+    // `mm_active` is written at dispatch and then *held* until the next
+    // dispatch overwrites it, so on its own it stays high through the following
+    // idle. Qualifying it with `vpu_busy` is what makes this a per-op event;
+    // it also matches `vpu_busy`'s edges exactly, so the vecmatmul counter is a
+    // subset of the VPU counter clock for clock.
+    assign vpu_mm_busy = vpu_busy && mm_active;
 
 endmodule

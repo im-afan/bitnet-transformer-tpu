@@ -54,7 +54,7 @@ module cmod_a7_top #(
     // External SRAM (the "DRAM" behind the DMA engine): 512K x 8.
     parameter int MEM_ADDR_W = 19,
     parameter int MEM_DATA_W = 8,
-    parameter int SRAM_CPA   = 2,
+    parameter int SRAM_CPA   = 0,
 
     // UART: 115200 8N1 off a 12 MHz core clock. 12e6/115200 = 104.17 -> 104,
     // a 0.16% bit-period error, well inside 8N1's ~5% tolerance.

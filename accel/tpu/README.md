@@ -14,12 +14,11 @@ the board: the host loads a program and its data over UART, starts the core, rea
 back, and checks them against both the instruction-set simulator and PyTorch — `python
 host/run_program.py` is the one command that does all of it.
 
-**But it does not currently fit.** `mode=bit` fails DRC at **21657 LUTs against 20800**
-available on the `xc7a35t` — 4.1% over, so no new bitstream can be built until something
-shrinks. This is a regression from `perf_counters.sv` + macro-op phases 0–5, not from the
-recent VPU trim, which cut the requirement from 26032 to 21657. The MXU is now the largest
-block by a wide margin. See [`docs/synth.md`](docs/synth.md) §5 for the numbers and the
-options, and [`host/README.md`](host/README.md) for the link.
+**It fits.** `make bit` completes with timing met: **13342 LUTs of 20800 (64%)**, 7543 FFs,
+33 BRAM tiles, 31 DSPs, WNS +26.2 ns. An earlier note here said it was 857 LUTs over; that
+stopped reproducing (the MXU is less than half the size it was measured at) and it is not
+this section's doing. See [`docs/synth.md`](docs/synth.md) §5 for the current numbers next to
+the historical ones, and [`host/README.md`](host/README.md) for the link.
 
 The software side lives in [`../tpulang`](../tpulang): the assembly language, the assembler,
 the bit-exact ISS, and the golden-vector generator.

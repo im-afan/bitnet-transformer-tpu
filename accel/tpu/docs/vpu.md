@@ -160,6 +160,13 @@ scratchpad port for the duration of the op.
 | `vpu_vlen`  | in  | 10        | vector length in elements (config reg, ≤ 1023)      |
 | `vpu_busy`  | out | 1         | high from `start` until the op retires              |
 | `vpu_done`  | out | 1         | one-cycle pulse when the result is fully written    |
+| `vpu_mm_busy`| out| 1         | `vpu_busy` **and** the op is `VECMATMUL` (perf only)|
+
+`vpu_mm_busy` is not part of the dispatch handshake — the scalar unit never reads it.
+It exists so `perf_counters.sv` can separate the macro op's clocks from the primitive
+ops' (`tpu_top.sv`'s counter 6, `vmm`). `vpu_busy` alone conflates them, and they cost
+very differently: a pointwise op retires `LANES` elements per chunk, while `vecmatmul`
+pays a whole `S_RD0`…`S_WB` round trip per (row, col) pair. See macro_ops.md §7.
 
 All addresses are byte offsets into the scratchpad and are captured on `vpu_start`, so
 the scalar unit may reuse its register file immediately after issue.

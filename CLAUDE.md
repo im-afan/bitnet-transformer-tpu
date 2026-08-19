@@ -177,11 +177,12 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
     primitive, so the datapath is mandatory and the opcode costs one decode arm.
 - **`tpu/`** — a SystemVerilog TPU running on a **Digilent Cmod A7-35T** (see
   `accel/tpu/README.md` and `accel/tpu/docs/`). The array, VPU, banked scratchpad, DMA +
-  external SRAM, scalar unit and UART link are all synthesizable, but the design **no longer
-  fits**: `mode=bit` fails DRC at 21657 LUTs vs 20800 on the xc7a35t (4.1% over). Pre-existing,
-  from `perf_counters.sv` + macro-op phases 0-5 — the VPU trim cut it from 26032. The MXU is
-  now the biggest block (14476 post-synth vs the VPU's 5162), so that is where to look;
-  `accel/tpu/docs/synth.md` §5 has the numbers. `mode=synth`/`mode=ooc` still work.
+  external SRAM, scalar unit and UART link are all synthesizable, and the design **fits**:
+  `make bit` completes at 13342 LUTs of 20800 (64%), 7543 FFs, WNS +26.2 ns, timing met
+  (measured 2026-08-17). The long-standing "857 LUTs over" note stopped reproducing — the
+  MXU is 5930 LUTs post-route against the 14476 post-synth that note was written about, and
+  nothing in the memory-path work touched it. `accel/tpu/docs/synth.md` §5 carries the
+  current numbers beside the historical ones.
   `host/run_program.py`
   loads a program over UART, runs it, and checks the readback against both the ISS and PyTorch.
   Recent RTL work: `perf_counters.sv` (replaces `cycle_timer.sv`) and the **macro-op ISA**
@@ -189,6 +190,18 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   `matmul_t` (hardware tile loop) and `vecmatmul`. Phase 5's hardware `softmax` was built,
   validated, and then **removed** (see the VPU note above); `layernorm` + the `rsqrt` LUT
   are not built and are now dropped — DyT replaced LayerNorm and needs no macro op. Still stubbed: the inter-TPU LINK (`wrneigh` is a completing no-op).
+- **`sram.sv` moves ranges, not bytes.** One request is a start address, a byte count and an
+  address stride; `dma.sv` issues one range per source row (in linear mode, one for the whole
+  transfer) and streams it. **1 clock/byte on fills, 2 on spills**, against ~8 before, and the
+  full adder model through `tb/tpu_top_tb.sv` went **1 226 722 → 541 590 clocks (2.27x)** with
+  byte-identical output — DMA fell from 66% of the run to 24%. Two things to know before
+  touching it: writes are two clocks because **WE# is generated on the falling edge**, so its
+  rising edge lands half a clock clear of the address/data change (the chip's address hold is
+  0 ns, i.e. met by skew alone if you drive it from the rising edge — the failure mode is a
+  byte written to its *neighbour*, and both `sram_tb` and `dma_tb` now check for it); and the
+  `stride` exists for `wrmem.t`, whose destination is column-major and would otherwise be one
+  range per byte. `CLOCKS_PER_ACCESS` is now *extra* clocks per beat and is 0 on every board.
+  `accel/tpu/docs/dma.md` §7 and `rtl/sram.sv`'s header are the full story.
 - **19-bit DRAM addressing from programs.** `scalar_unit.sv` used to truncate a `rdmem`/`wrmem`
   DRAM address to 16 bits, so a *program* could only reach the low 64 KB of the 512 KB SRAM even
   though the host always could. Widening it to `MEM_ADDR_W = 19` is what let the 96 KB of model
@@ -366,9 +379,11 @@ concluding anything from a board run.
 
 ## Long simulations
 
-A full-model `tpu_top_tb` run is ~2.36 M clocks (23.58 ms simulated at 100 MHz) and dumps
-400+ MB of waveform at the defaults, so it needs `-DWATCHDOG_NS=400000000 -DNO_VCD` (both are
-options on `tpu_top_tb.sv`, defaults unchanged). The command line is in `adder_kernel.md` §7.7.
+A full-model `tpu_top_tb` run is ~542 k clocks (5.42 ms simulated at 100 MHz) and dumps
+hundreds of MB of waveform at the defaults, so it needs `-DWATCHDOG_NS=400000000 -DNO_VCD`
+(both are options on `tpu_top_tb.sv`, defaults unchanged). The command line is in
+`adder_kernel.md` §7.7. It was 1.23 M clocks before `sram.sv` became a range engine —
+`accel/tpu/docs/dma.md` §7.
 The ISS runs the same four-layer forward plus the PyTorch reference and the byte comparison in
 ~19 s, so leg-B verification is an edit-run loop, not a batch job.
 

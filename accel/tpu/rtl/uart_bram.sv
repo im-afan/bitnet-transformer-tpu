@@ -67,7 +67,7 @@ module uart_bram #(
     parameter int MEM_ADDR_W      = 19,
     parameter int MEM_DATA_W      = 8,
     parameter int BRAM_AW         = 16,   // 2**16 = 64 KiB = 16 RAMB36 of 50
-    parameter int MEM_CPA         = 2,    // = boards/cmod_a7_mem's SRAM_CPA
+    parameter int MEM_CPA         = 0,    // = boards/cmod_a7_mem's SRAM_CPA
 
     // ---- Instruction memory address width -----------------------------------
     //   No IMEM exists in this image; this only has to match what the host's
@@ -130,14 +130,23 @@ module uart_bram #(
         .clk   (clk),
         .rst_n (rst_n),
 
-        // user side ← UART host (sole owner)
-        .start (mem_start),
-        .we    (mem_we),
-        .addr  (mem_addr),
-        .din   (mem_din),
-        .dout  (mem_dout),
-        .busy  (mem_busy),
-        .done  (mem_done),
+        // user side ← UART host (sole owner), one byte per transaction: the
+        // range interface at len = 1 (see uart_memory.sv for the same wiring).
+        .start  (mem_start),
+        .we     (mem_we),
+        .addr   (mem_addr),
+        .len    (16'd1),
+        .stride (16'd0),
+
+        .din       (mem_din),
+        .din_valid (1'b1),
+        .din_ready (),
+
+        .dout       (mem_dout),
+        .dout_valid (),
+
+        .busy (mem_busy),
+        .done (mem_done),
 
         .aliased (aliased)
     );

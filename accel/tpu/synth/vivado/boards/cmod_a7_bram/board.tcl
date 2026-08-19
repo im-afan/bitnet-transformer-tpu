@@ -76,13 +76,13 @@ set MEM_DATA_W 8
 # which is 128 KiB / 32 tiles: fine on a -35T, over budget on a -15T.
 set BRAM_AW    16
 
-# Clocks per access. Held equal to boards/cmod_a7_mem's SRAM_CPA on purpose --
-# bram_controller does not need the wait states, but if it completed a transfer
-# faster than sram_controller does, every turnaround in uart_interface would
-# shift and the two images would stop being comparable. Named SRAM_CPA here
-# (rather than MEM_CPA) so build.tcl's existing sram_cpa= override reaches it;
-# board_generics below maps it onto the port's actual name.
-set SRAM_CPA   2
+# Extra clocks per access. Held equal to boards/cmod_a7_mem's SRAM_CPA on
+# purpose -- bram_controller does not need any of the SRAM's beat timing, but if
+# it completed a transfer faster than sram_controller does, every turnaround in
+# uart_interface would shift and the two images would stop being comparable.
+# Named SRAM_CPA here (rather than MEM_CPA) so build.tcl's existing sram_cpa=
+# override reaches it; board_generics below maps it onto the port's actual name.
+set SRAM_CPA   0
 
 # ---- Geometry placeholders ----------------------------------------------------
 # There is no TPU core in this image -- no MXU, no VPU, no scratchpad. These

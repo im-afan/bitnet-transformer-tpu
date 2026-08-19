@@ -371,14 +371,45 @@ Add alongside `cycle_timer`, surfaced on the UART `'T'` command:
 | --- | --- | --- |
 | `mxu_busy_cycles` | `mxu.busy` | MXU utilization |
 | `mxu_load_cycles` | `mxu.state == S_LOAD` | weight-load overhead — and the phase-2 double-buffer payoff |
-| `vpu_busy_cycles` | `vpu.busy` | how much of the layer is attention/softmax rather than GEMM |
+| `vpu_busy_cycles` | `vpu.busy` | how much of the layer is attention rather than GEMM |
 | `dma_busy_cycles` | `dma.busy` | memory-bound vs. compute-bound — the roofline's x-axis |
 | `su_wait_cycles` | `scalar_unit.state == S_WAIT` | control overhead, i.e. what issue-and-wait actually costs |
+| `vpu_mm_cycles` | `vpu.vpu_mm_busy` | of the VPU's share, how much is `vecmatmul` |
 
-Five 32-bit counters and their UART readback: ~200 FFs, ~150 LUTs. This is the cheapest
+Six 32-bit counters and their UART readback: ~200 FFs, ~150 LUTs. This is the cheapest
 work in this document and the only item that directly produces the analysis the project
 exists for. **Build it first** — it also gives you honest before/after numbers for
 everything else here.
+
+**On the last row.** It was added after the fact, for a concrete reason. On the full
+adder model the VPU counter reads **41.2% of the run** — implausibly high for a unit whose
+surviving ops are pointwise over vectors of at most 128 elements, and `vpu_busy` alone
+cannot say which op it is. `vecmatmul` was the suspect because it is the only VPU op whose
+cost is quadratic in sequence length: it re-enters the inner dot product once per
+(row, col) pair, and each entry pays the whole `S_RD0`/`S_RD0D`/`S_RD1`/`S_RD1D`/`S_EXEC`/
+`S_WB` round trip around a contraction only `head_dim = 32` long. Counter 6
+(`vmm`, `vpu_mm_busy = vpu_busy && mm_active`) settles that by measurement rather than by
+argument, and being a strict subset of counter 3 it subtracts to give the pointwise share
+for free.
+
+Measured on the board (`host/run_adder.py -p COM6 -n 64`, Cmod A7 @ 12 MHz, 2 layers,
+542 656 clocks/problem, mean over 64 runs):
+
+| counter | % of run |
+| --- | --- |
+| mxu | 34.0 |
+|  of which mload | 5.7 |
+| vpu | 41.2 |
+|  of which **vmm** | **36.4** |
+| dma | 24.2 |
+| swait | 99.5 |
+
+So **`vecmatmul` is 88.3% of all VPU time** and the other five ops together are 4.8% of the
+run. The VPU's share is not the pointwise datapath at all — it is the macro op's per-pair
+sequencing overhead, and it is now the single largest non-`swait` counter after the MXU.
+Any attempt to bring the VPU's 41% down has to attack `vecmatmul`'s inner loop (the six
+states per pair, over a 32-element contraction that occupies only two of the sixteen lanes'
+worth of chunks); tuning the pointwise path can recover at most 4.8%.
 
 ## 8. Migration plan
 
@@ -386,7 +417,7 @@ Each phase leaves the tree green.
 
 | Phase | Work | Status |
 | --- | --- | --- |
-| 0 | Cycle counters (§7) + `'T'` command extension | **done** — six counters, `'T'` returns a 6-word block, word 0 still the run length |
+| 0 | Cycle counters (§7) + `'T'` command extension | **done** — seven counters, `'T'` returns a 7-word block, word 0 still the run length |
 | 1 | `vpu_op` widened to 5 bits; new cfg registers + `setcfgr` (§3) wired through `scalar_unit`/`tpu_top`; assembler + ISS know the names | **done** — no behavior change; whole suite still green |
 | 2 | MXU strides from cfg (§4.1), still single-tile | **done** — `tiled_matmul.tpu` passes unmodified; `strided_matmul.tpu` proves the strides are consulted |
 | 3 | MXU tile loop + `matmul_t` opcode (§4.2) | **done** — `tiled_matmul_hw.tpu`, checked against an independent Python matmul over the full K |
