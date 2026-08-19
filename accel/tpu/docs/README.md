@@ -50,7 +50,7 @@ The MXU output immediately gets written to another address in scratchpad memory.
 
 ### 3. VPU
 
-The VPU performs the remaining pointwise vector operations using SIMD: `relu`, vector add, the `requant`/`dyt` narrows, and the `vecmatmul` macro op (built on a dot-product reduction). It is deliberately no larger than that — the activation LUTs, broadcast/scalar ops, divider, reductions and the softmax macro op were removed once the model stopped needing them ([vpu.md §Removed ops](vpu.md#removed-ops)). 
+The VPU performs the remaining pointwise vector operations using SIMD: `relu`, vector add, the `requant`/`dyt`/`tquant` narrows, and the `vecmatmul` macro op (built on a dot-product reduction). `tquant` is the one that narrows to a *trit* rather than to int8, packed 2 bits wide in the MXU's weight layout — it is what makes K and V ternary and therefore what moved both attention matmuls onto the array. The output head went with them once `Model.fc` became ternary, so `vecmatmul` has no caller in the shipped kernel at all — it is kept for the model shape that needs an int8 × int8 matmul. It is deliberately no larger than that — the activation LUTs, broadcast/scalar ops, divider, reductions and the softmax macro op were removed once the model stopped needing them ([vpu.md §Removed ops](vpu.md#removed-ops)). 
 It contains multiple ALUs that act on data from a single scratchpad memory access.
 
 ### 4. Communication interface
@@ -79,7 +79,7 @@ how programs are written:
   count). Stale config is the most common silent bug in a tpulang program.
 
 The dispatched ops are `matmul` / `matmul_t` (with `.acc`/`.rq` flags), `vecmatmul`,
-`vecdot`, `vecadd`, `relu`, `requant`, and `dyt`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
+`vecdot`, `vecadd`, `relu`, `requant`, `dyt`, and `tquant`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
 `wrneigh`; control is `adds`, `subs`, `muls`, `cmps`, `li`, `loads`, `stores`, `setcfg`,
 `branch` (and the `beq`/`bne`/`blt`/`bge` forms), `jmp`, `wait`, and `halt`.
 

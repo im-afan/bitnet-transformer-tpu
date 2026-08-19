@@ -165,6 +165,20 @@ def dyt8(acc: torch.Tensor, m0: int, n: int) -> torch.Tensor:
     return shifted.clamp(-127, 127)
 
 
+def tquant8(acc: torch.Tensor, m0: int, n: int) -> torch.Tensor:
+    """``clip_pm1((acc * m0 + (1 << (n-1))) >> n)`` — vpu.sv's ``tquant2``.
+
+    The narrow that turns an int8 activation into a *ternary* one, i.e. into
+    something the MXU will accept as a weight. On the device the result is 2
+    bits wide and lands in the array's packed weight layout; here it is a plain
+    {-1, 0, 1} matrix, which is the point — the packing is the kernel's business
+    and this file's job is to not know about it.
+    """
+    rnd = 0 if n == 0 else (1 << (n - 1))
+    shifted = torch.div(acc * m0 + rnd, 1 << n, rounding_mode="floor")
+    return shifted.clamp(-1, 1)
+
+
 # ---- results ----------------------------------------------------------------
 
 @dataclass
@@ -343,38 +357,46 @@ def adder_model(c: dict, get_in, get_out) -> list:
     """The whole `adder_ternary_vanilla` forward pass — examples/adder_model.tpu.
 
     Written from the *model* (model/transformer.py) rather than from the
-    kernel's instruction order: four layers of ternary projections, ReLU
+    kernel's instruction order: ternary projections, ternary K and V, ReLU
     attention with a causal mask, `Wo`, a ReLU feed-forward, both residuals with
     their DyT normalizations, and an int8 output head. It shares no address
     arithmetic and no loop structure with the program — only the DRAM layout,
     which comes from the program's own `.equ` table above.
 
-    Three places where the kernel does something non-obvious and this does the
+    Four places where the kernel does something non-obvious and this does the
     plain thing instead, which is the point of checking:
 
-    * The kernel computes ``A^T`` (swapping vecmatmul's operands) so one `.t`
-      DMA can scatter each head into A's columns. Here it is
-      ``V_h^T @ P_h^T`` written out and transposed back, so a mistake in that
-      trick shows up rather than being mirrored.
+    * The kernel never materializes ``K^T``: it ternarizes K row-major, and a
+      packed row *is* a weight column of ``K^T``, so the transpose is the
+      layout. Here it is a literal ``.t()``.
+    * The kernel ternarizes V only after transposing it through DRAM, because
+      the DMA moves bytes and not trits. Ternarizing is elementwise, so the two
+      orders agree — this does it in the other order, which is what makes that
+      an assertion rather than an assumption.
     * The kernel applies the causal mask as ``requant(S8 + mask)`` with a
       ``{1,0}`` word, relying on ``S8 - 128 <= -1`` to make every masked entry
       negative before the ReLU. Here that is the same two operations, so the
       *claim* is tested; ``relu`` is a plain ``clamp(min=0)``.
-    * The kernel writes ``XO`` on top of ``O`` in the same buffer and updates
-      ``X`` in place, so an aliasing mistake would be invisible to it. Here
-      every intermediate is a fresh tensor, which is what makes the in-place
-      trick a checked claim rather than an assumption.
+    * The kernel writes each head's ``A`` block straight into a strided slice of
+      one buffer, writes ``XO`` on top of ``O``, and updates ``X`` in place, so
+      an aliasing mistake would be invisible to it. Here every intermediate is a
+      fresh tensor, which is what makes the in-place trick a checked claim.
 
     Every layer's `X` is checked (the program spills one per layer block), plus
     the final layer's `V^T` and `A` scratch tensors and the int32 logits.
     """
     T, D, D3 = c["T"], c["D"], c["D3"]
     HEADS, DH, VOCAB, LAYERS = c["HEADS"], c["DH"], c["VOCAB"], c["LAYERS"]
-    WCOL, NRQ = c["WCOL"], 14
+    WCOL, NRQ, VPAD = c["WCOL"], 16, c["VPAD"]
 
     X = i8_tensor(get_in, c["D_XIN"], (T, D))
     mask = i8_tensor(get_in, c["D_MASK"], (T, T))
-    Wfc = i8_tensor(get_in, c["D_WFC"], (VOCAB, D))
+    # The head is a TernaryLinear too, so `fc.weight` is an MXU weight block —
+    # [D][VPAD] trits, column-major — not the int8 [VOCAB][D] a `vecmatmul`
+    # wanted. VPAD is VOCAB rounded up to the array's output tile; the columns
+    # above VOCAB are padding, and checking them is what would catch a second
+    # output tile written at the wrong stride.
+    Wfc = ternary_tensor(get_in, c["D_WFC"], D, VPAD, WCOL)
 
     checks = []
     V = A = None
@@ -391,28 +413,31 @@ def adder_model(c: dict, get_in, get_out) -> list:
         rq = [requant_params(get_in, base + c["O_RQW"] + 4 * k) for k in range(NRQ)]
 
         Q = requant8(int_matmul(X, wq), *rq[0])
-        K = requant8(int_matmul(X, wk), *rq[1])
-        V = requant8(int_matmul(X, wv), *rq[2])
+        V = requant8(int_matmul(X, wv), *rq[3])         # int8 V: the D_VT check
+        # K and V are ternary *activations* — that is what puts both attention
+        # matmuls on the MXU, which multiplies an int8 activation by a ternary
+        # weight and cannot multiply two int8 tensors at all.
+        Kt = tquant8(requant8(int_matmul(X, wk), *rq[1]), *rq[2])
+        Vt = tquant8(V, *rq[4])
 
         A = torch.zeros((T, D), dtype=torch.int64)
         for h in range(HEADS):
             sl = slice(h * DH, (h + 1) * DH)
-            S8 = requant8(int_matmul(Q[:, sl], K[:, sl].t()), *rq[3])
-            S8 = requant8(S8 + mask, *rq[4])            # mask, then narrow+clip
-            P8 = requant8(S8.clamp(min=0), *rq[5])      # ReLU attention
-            AhT = requant8(int_matmul(V[:, sl].t(), P8.t()), *rq[6])
-            A[:, sl] = AhT.t()
+            S8 = requant8(int_matmul(Q[:, sl], Kt[:, sl].t()), *rq[5])
+            S8 = requant8(S8 + mask, *rq[6])            # mask, then narrow+clip
+            P8 = requant8(S8.clamp(min=0), *rq[7])      # ReLU attention
+            A[:, sl] = requant8(int_matmul(P8, Vt[:, sl]), *rq[8])
 
-        O = requant8(int_matmul(A, wo), *rq[7])
+        O = requant8(int_matmul(A, wo), *rq[9])
         # MultiHeadAttention returns `O + X` and Transformer adds `X` again, so
         # the attention residual is 2X + O — two int8 adds with a {1,0} narrow
         # between them — and `norm1` is the DyT on the result.
-        XO = requant8(X + O, *rq[8])
-        X1 = dyt8(XO + X, *rq[9])                       # attention residual
-        H = requant8(int_matmul(X1, w1), *rq[10])
-        HR = requant8(H.clamp(min=0), *rq[11])
-        F = requant8(int_matmul(HR, w2), *rq[12])
-        X = dyt8(X1 + F, *rq[13])                       # feed-forward residual
+        XO = requant8(X + O, *rq[10])
+        X1 = dyt8(XO + X, *rq[11])                      # attention residual
+        H = requant8(int_matmul(X1, w1), *rq[12])
+        HR = requant8(H.clamp(min=0), *rq[13])
+        F = requant8(int_matmul(HR, w2), *rq[14])
+        X = dyt8(X1 + F, *rq[15])                       # feed-forward residual
 
         checks.append(Check(f"layer {L}: X out          [{T}x{D}] int8",
                             X, i8_tensor(get_out, base + c["O_XOUT"], (T, D))))
@@ -424,9 +449,10 @@ def adder_model(c: dict, get_in, get_out) -> list:
                         V.t(), i8_tensor(get_out, c["D_VT"], (D, T))))
     checks.append(Check(f"final layer: A          [{T}x{D}] int8",
                         A, i8_tensor(get_out, c["D_A8"], (T, D))))
-    checks.append(Check(f"logits = X @ fc^T       [{T}x{VOCAB}] int32",
-                        int_matmul(X, Wfc.t()),
-                        i32_tensor(get_out, c["D_LOG"], (T, VOCAB))))
+    checks.append(Check(f"logits = X @ fc         [{T}x{VPAD}] int32 "
+                        f"(VOCAB={VOCAB} + {VPAD - VOCAB} pad cols)",
+                        int_matmul(X, Wfc),
+                        i32_tensor(get_out, c["D_LOG"], (T, VPAD))))
     return checks
 
 

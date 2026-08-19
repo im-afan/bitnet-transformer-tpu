@@ -28,7 +28,7 @@ ops to two accelerators, blocking on each until it finishes:
 
 ```
    scalar_unit  ── issue-and-wait ──►  MXU   (ternary matmul: act @ weight)
-        │                          └─►  VPU   (SIMD vectors: add, relu, requant, dyt, vecmatmul)
+        │                          └─►  VPU   (SIMD vectors: add, relu, requant, dyt, tquant, vecmatmul)
         │
    scratchpad (on-chip BRAM)  ◄── every unit reads/writes here
         ▲
@@ -213,7 +213,7 @@ and push a register value back with `stores`:
     loads   t, dota         ; t = that sum (register)
 ```
 
-`requant`/`dyt` take their `{m0,n}` word from a *scratchpad* address (the third operand's
+`requant`/`dyt`/`tquant` take their `{m0,n}` word from a *scratchpad* address (the third operand's
 register), so a parameter computed at run time must be `stores`d before the op reads it.
 
 > Before the VPU was cut down to the ops the current model issues, this section was
@@ -267,6 +267,7 @@ vecadd  d, a, b     d[i]=a[i]+b[i]        relu    d, a    max(a[i],0)
 vecdot  d, a, b     Σ a[i]*b[i] -> scalar
 requant d, a, p     clip((a[i]*m0+rnd)>>n) int32->int8, {m0,n} at p
 dyt     d, a, p     as requant, clipped to +-127 (DyT / hardtanh)
+tquant  d, a, p     as requant, clipped to +-1, int8->2 bits (ternary weight)
 ```
 
 That is the whole VPU. `gelu`, `exp`, `square`, `vecemul`, `vecmul`, `sadd`, `sdiv`,
@@ -282,6 +283,15 @@ datapath: pin the output scale to `1/127`, fold `alpha` into the multiplier, and
 the saturating narrow the caller already needed *is* the hardtanh. The floor is
 `-127` rather than int8's `-128` because hardtanh is odd. See
 [vpu.md](vpu.md) and `accel/tpulang/adder_kernel.md` §4.
+
+`tquant` is the same shifter clipped to ±1, and it is the one VPU op that reads
+int8 and writes *narrower* than int8: the trit goes out 2 bits wide in the MXU's
+weight encoding (`00`/`01`/`11`), four to a byte. So its destination is directly
+addressable as a `matmul_t` weight block — which is what lets an **activation be a
+weight operand**. The array does int8 × ternary and cannot do int8 × int8, so
+ternarizing K and V is exactly what moved attention's `Q@K^T` and `P@V` off
+`vecmatmul` and onto it. `cfg vlen` must be a multiple of 4 (the write strobe is
+per byte) and the destination advances a quarter as fast as the source.
 
 All read `cfg vlen` elements.
 
@@ -425,7 +435,7 @@ program's outputs and nothing else — the loop that keeps hardware honest again
 - **Weights are column-major, 2-bit packed** (`00/01/11 → 0/+1/−1`); activations are
   row-major int8. Mixing these up produces a plausible-looking but wrong matmul.
 - **`vecdot` writes to the scratchpad, not a register** — `loads` to get the scalar out.
-- **Requant params must be in the scratchpad** (`requant`/`dyt` read the `{m0,n}` word
+- **Requant params must be in the scratchpad** (`requant`/`dyt`/`tquant` read the `{m0,n}` word
   from a scratchpad address), so `stores` one computed at run time before the op reads it.
 - **Identical DRAM/scratchpad addresses** per tensor, by convention (§4.3) — except for a
   `.t` transfer, whose source and destination must be *different* regions.
@@ -534,13 +544,14 @@ int32 is little-endian 4-byte, int8 a single signed byte.
 | `0x1E` | `vecmatmul`| RRR   | VPU     | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]` (macro op)  |
 | `0x1F` | `halt`    | NONE   | control | stop; raise `done`                                   |
 | `0x21` | `dyt`     | RRR    | VPU     | as `requant`, clipped to ±127 — DyT / hardtanh       |
+| `0x22` | `tquant`  | RRR    | VPU     | as `requant`, clipped to ±1, int8 in / 2 bits out    |
 
 > **Retired opcodes.** `0x02` (`vecmul`), `0x05` (`gelu`), `0x0A`–`0x0F` (`vecemul`,
 > `square`, `exp`, `redmax`, `redsum`, `sadd`), `0x1B` (`sdiv`) and `0x20` (`softmax`)
 > were removed with the VPU datapath behind them —
 > [vpu.md §Removed ops](vpu.md#removed-ops). They are **not** reallocated: a stale binary
 > should decode to an unknown opcode, not to a different instruction. The opcode field is
-> 6 bits, so `0x22–0x3E` remain free for genuinely new ops; `halt` keeps `0x1F` even
+> 6 bits, so `0x23–0x3E` remain free for genuinely new ops; `halt` keeps `0x1F` even
 > though allocation has continued past it.
 
 ## A.4 Instruction forms & selectors
@@ -549,7 +560,7 @@ Which fields are *live* depends on the opcode's form (unused fields are 0):
 
 | Form     | `dst`    | `src0`             | `src1`      | `flags`     | Mnemonics                                     |
 | -------- | -------- | ------------------ | ----------- | ----------- | --------------------------------------------- |
-| `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul[_t], vecdot, vecadd, requant, dyt, vecmatmul, adds/subs/muls |
+| `RRR`    | dst reg  | src0 reg           | src1 reg    | op modifier | matmul[_t], vecdot, vecadd, requant, dyt, tquant, vecmatmul, adds/subs/muls |
 | `RR`     | dst reg  | src0 reg           | —           | —           | relu                                          |
 | `RS`     | dst reg  | src0 reg           | —           | `.t` (rdmem)| rdmem, loads                                  |
 | `SS`     | —        | src0 reg           | src1 reg    | `.t` (wrmem)| wrmem, stores, cmps                           |

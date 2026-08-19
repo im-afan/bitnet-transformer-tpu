@@ -17,7 +17,7 @@ has drifted from the model twice before (``adder_export.py``'s docstring).
 
 **What moves over the wire, and when.** The weights are ~50 KB and identical for
 every problem, so they are written once, before the loop. Per problem only the
-[T][D] input (4096 B) goes down and the [T][VOCAB] int32 logits (1664 B) come
+[T][D] input (4096 B) goes down and the [T][VPAD] int32 logits (2048 B) come
 back — about 5.8 KB, or ~0.5 s at 115200 baud including the header tax. The
 weights are *not* rewritten between problems, which also means a run is a
 standing test that SRAM holds them across ``G`` boundaries.
@@ -108,7 +108,11 @@ def report_timing(counters: list[dict], clk_mhz: float) -> None:
     ``vmm`` gets its own line because it is the one counter whose interesting
     denominator is not ``run``: it answers "is the VPU's share `vecmatmul`, or
     is it the pointwise ops?", and that ratio is what says where VPU work is
-    worth optimizing.
+    worth optimizing. On the current kernel it should read **0.0%** — ternary
+    K/V and a ternary output head put every matmul in the model on the MXU, so
+    nothing issues `vecmatmul` at all (``adder_kernel.md`` §2.5, §2.6). A
+    nonzero ``vmm`` here means the device is running an older image than the
+    one this script assembled.
     """
     if not counters:
         return
@@ -184,14 +188,14 @@ def split_image(tpu: TPU, consts: dict) -> tuple[dict, dict]:
 
 def region_map(c: dict) -> list[tuple[int, int]]:
     """(base, length) of every DRAM block the kernel *reads* but never rewrites."""
-    regions = [(c["D_MASK"], T * T), (c["D_WFC"], c["VOCAB"] * c["D"])]
+    regions = [(c["D_MASK"], T * T), (c["D_WFC"], c["B_WFC"])]
     for li in range(c["LAYERS"]):
         base = c["D_L0"] + li * c["LSTRIDE"]
         regions.append((base + c["O_WQKV"], c["D3"] * c["WCOL"]))
         regions.append((base + c["O_WO"], c["D"] * c["WCOL"]))
         regions.append((base + c["O_W1"], c["D"] * c["WCOL"]))
         regions.append((base + c["O_W2"], c["D"] * c["WCOL"]))
-        regions.append((base + c["O_RQW"], 56))
+        regions.append((base + c["O_RQW"], c["B_RQW"]))
     return regions
 
 
@@ -284,13 +288,17 @@ class BoardBackend:
         if self.args.timing:
             self.read_counters()
 
-        base, n = self.consts["D_LOG"], T * self.consts["VOCAB"] * 4
+        # The device writes VPAD words per row, not VOCAB: the head's output is
+        # padded up to a whole MXU output tile (the program's section 8), so the
+        # row stride and the column count are different numbers.
+        vpad = self.consts["VPAD"]
+        base, n = self.consts["D_LOG"], T * vpad * 4
         raw = self.u.read_mem(base, n)
         out = []
         for t in range(T):
             row = []
             for v in range(self.consts["VOCAB"]):
-                o = (t * self.consts["VOCAB"] + v) * 4
+                o = (t * vpad + v) * 4
                 u = int.from_bytes(raw[o:o + 4], "little")
                 row.append(u - (1 << 32) if u >= (1 << 31) else u)
             out.append(row)

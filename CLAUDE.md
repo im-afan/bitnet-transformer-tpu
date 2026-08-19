@@ -51,8 +51,10 @@ scale, so pinning to `s_x` clips 71% of `O` (92% at L3). This is `adder_kernel.m
 finding with a sharper mechanism: DyT bounds the residual stream but nothing bounds what is
 added to it.
 
-`model/saved/ternary_mha.pt` is the current QAT checkpoint (2 layers) and is what
-`adder_export.py` / `run_adder.py` default to; it is untracked so far.
+`model/saved/ternary_mha.pt` is the last QAT checkpoint (2 layers) and is still what
+`adder_export.py` / `run_adder.py` default to; it is untracked so far, and it **predates
+ternary K/V and the removal of the positional encoding**, so it no longer matches the
+model it is loaded into.
 The three `colab_ternary_mha_small*.pt` are committed but **deleted in the working tree**, so
 any command naming one fails with `FileNotFoundError` until it is restored from git; the old
 `colab_vanilla_mha.pt` / `colab_gqa.pt` / `colab_ternary_mha.pt` were deleted. `test_inference.py`
@@ -70,7 +72,7 @@ TPU stack (these are plain scripts, not `-m` modules — each adds its own direc
 `sys.path`, so run them by path from the repo root):
 
 ```bash
-python accel/tpulang/assembler.py accel/tpulang/examples/adder_model.tpu   # 208 words
+python accel/tpulang/assembler.py accel/tpulang/examples/adder_model.tpu   # 226 words
 python accel/tpulang/gen_vectors.py -p accel/tpulang/examples/adder_model.tpu -o vectors_model
 python accel/tpulang/torch_ref.py                         # every example kernel: ISS vs PyTorch
 python accel/tpulang/adder_export.py -n 256 --iss-check   # real checkpoint → integers, accuracy
@@ -97,6 +99,20 @@ what is in the tree, not what `model/README.md` describes (that file is stale �
 - **ReLU attention, not softmax.** `P = relu(S + causal_mask)`, with the mask built as
   `triu(ones([T,T]) * -1e9, diagonal=1)`. There is no normalization over the source axis at
   all. (The comment in the code says "revert to softmax if training bad".)
+- **K and V are ternary activations; Q and the attention matrix are int8.** `q_kt`/`q_vt`
+  are `TernaryQuant` sites (an `ActQuant` with `qmax=1`, seeded from the absmean rather
+  than the absmax) applied *on top of* the int8 `q_k`/`q_v`. That is not a compression
+  choice — the MXU multiplies an int8 activation by a **ternary weight** and cannot
+  multiply int8 by int8 at all, so ternarizing exactly the operand that lands on the
+  weight side (K in `Q@K^T`, V in `P@V`) is what moved both attention matmuls off the
+  VPU's serial `vecmatmul` and onto the array. See `adder_kernel.md` §2.5. The two-stage
+  narrow is the hardware's: `matmul_t.rq` lands int8, then a `tquant` pass rounds onto
+  the trit grid, and V transposes between the two because the DMA moves bytes.
+- **There is no positional encoding.** `Model.positional_encoding` is gone and
+  `Model.forward` embeds and nothing else. The only position signal left is the causal
+  mask; ReLU attention has no source-axis normalization, so the magnitude of `P @ V`
+  carries the count of visible keys. The same removal under softmax would leave the
+  model position-blind.
 - **Attention is inlined.** The old `mha_torch` / `slow_mha_cuda` helpers are **gone**; the math
   now lives directly in `MultiHeadAttention.forward`. `use_custom_attention` still threads
   `Model.forward → Transformer → MultiHeadAttention.forward` but is **accepted and ignored** —
@@ -113,8 +129,14 @@ what is in the tree, not what `model/README.md` describes (that file is stale �
 - **Ternary (BitNet-style) weights.** `TernaryLinear` quantizes weights to {-1,0,1} scaled by
   absmean, with `RoundClip` providing a straight-through-estimator backward. Note the weight is
   `[in_dim, out_dim]` with `x @ w` — the *transpose* of `nn.Linear`, so ternary and non-ternary
-  checkpoints are not interchangeable. `make_linear(..., use_ternary)` selects it. **`Model.fc`
-  never passes `use_ternary`**, so the output head is always a full-precision `nn.Linear`.
+  checkpoints are not interchangeable. `make_linear(..., use_ternary)` selects it — **including `Model.fc`**, so in a
+  ternary config every weight in the model is a trit and the output head runs on the MXU
+  as a `matmul_t` like any projection. That was the last `vecmatmul` in the shipped
+  kernel; `vecmatmul`/`vecdot` now have no caller in it at all. A non-ternary config
+  (`adder_vanilla`, `adder_gqa`) still gets an `nn.Linear` head, which is the only thing
+  `quantize_head` / `dynamic_fake_quant` still apply to. The head's output is never
+  requantized — an argmax does not care about scale — so unlike every other weight its
+  absmean never appears in a requant word.
 - **int8 activation quantization is now QAT, not post-hoc.** Every requant site is an
   `ActQuant` module holding one per-tensor scale, learned by LSQ (`FakeQuant` implements the
   straight-through input gradient and the analytic scale gradient). Sites the hardware *pins*
@@ -122,7 +144,8 @@ what is in the tree, not what `model/README.md` describes (that file is stale �
   stream's `x_quant`, `q_p is q_s`, `q_hr is q_h` — so the sharing in `__init__` is load-bearing,
   not a shorthand. DyT outputs are pinned to `fixed_scale=1/127` (`hardtanh` bounds them
   analytically) with `qmin=-127`, because `vpu.sv`'s `dyt` clips symmetrically and hardtanh is
-  odd. `set_quant_enabled(model, False)` turns them all off — **necessary to get a real float
+  odd, and the two ternary sites use `qmin=-1, qmax=1`, which is `vpu.sv`'s `tquant`.
+  `set_quant_enabled(model, False)` turns them all off — **necessary to get a real float
   baseline**, since they are live by default. `TernaryLinear.act_scale` is the *old* PTQ buffer
   and is now vestigial (NaN in the QAT checkpoints); `model/calibrate.py` drives that dead path.
 - **MoE is gone** — the `use_moe` expert FFN was removed, along with the vanilla/GQA checkpoints.
@@ -158,8 +181,17 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   sync with the model**: it implements *softmax* attention and the model does ReLU attention,
   and nothing in `model/` loads it any more. It still passes its own self-contained test. Treat
   it as legacy unless someone re-syncs it.
-- **The VPU implements six ops and nothing else.** `VOP_DOT`, `ADD`, `RELU`, `REQUANT`,
-  `DYT`, `VECMATMUL`. `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_MUL/ADD/DIV`,
+- **The VPU implements seven ops and nothing else.** `VOP_DOT`, `ADD`, `RELU`,
+  `REQUANT`, `DYT`, `TQUANT`, `VECMATMUL`. `TQUANT` (`0x22`, `VOP_TQUANT = 17`) is the
+  newest: `requant`'s fixed point clipped to +-1, written **2 bits wide** in the MXU's
+  weight encoding, four elements to a byte — int8 in, a packed ternary weight column
+  out. It is what lets an activation be a weight operand, and therefore what put
+  attention's `Q@K^T` and `P@V` on the array. With `Model.fc` ternary too, `VECMATMUL`
+  and `VOP_DOT` now have **no caller in the shipped kernel at all** — both are kept
+  for the model shape that needs an int8 x int8 matmul, and dropping them would mean
+  dropping the whole reduction path plus its counter block, which is an area decision
+  rather than a deletion. Its `vlen` must be a multiple of 4 (the write strobe is per
+  byte) and its destination advances a quarter as fast as its source. `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_MUL/ADD/DIV`,
   `REDUCEMAX`, `REDUCESUM` and the `SOFTMAX` macro op were **removed** — they served a
   softmax/LayerNorm/GELU model and the current one is ReLU attention + DyT + ReLU FFN.
   Gone with them: both 256-entry activation ROMs, `rtl/luts/`, `accel/tpulang/luts.py`,
@@ -172,7 +204,8 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   - **Retired opcodes are holes, not free space.** `0x02`, `0x05`, `0x0A`–`0x0F`, `0x1B`,
     `0x20` are not reallocated, so a stale binary decodes to an unknown op rather than a
     different one. Likewise `cfg` index 9 (`vscalar`) is vacant — renumbering 10–17 would
-    silently repoint every `setcfg` in every program. New ops go at `0x22`+.
+    silently repoint every `setcfg` in every program. `0x22` is now `tquant`; new ops go
+    at `0x23`+.
   - **`vecdot` survives although no kernel issues it**: it is `vecmatmul`'s inner
     primitive, so the datapath is mandatory and the opcode costs one decode arm.
 - **`tpu/`** — a SystemVerilog TPU running on a **Digilent Cmod A7-35T** (see
@@ -215,7 +248,7 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   (independent PyTorch checks), `gen_vectors.py` (golden vectors for `tpu/tb/`),
   `adder_export.py` (real checkpoint → integers → accuracy), and `examples/`.
 - **`examples/adder_model.tpu` is not an example — it is the whole shipped model** (every layer
-  + the output head) in **208 words of 1024**, one program, one run. `.equ LAYERS` is the only
+  + the output head) in **226 words of 1024**, one program, one run. `.equ LAYERS` is the only
   thing that moves when the model's depth changes — `gen_vectors.py`, `torch_ref.py` and
   `host/run_adder.py` all read it out of the program's own `.equ` table. Its byte-level contract —
   DRAM/scratchpad maps, the 13 requant `{m0,n}` words per layer and where their scales come
@@ -229,10 +262,21 @@ When touching attention numerics, keep the implementations in sync: `model/trans
 
 ## The int8 finding, and why the model keeps changing
 
+> **The numbers in this section describe the architecture *before* ternary K/V.**
+> `model/saved/ternary_mha.pt` was fitted with int8 K and V, a positional encoding and
+> `vecmatmul` attention; it has no `q_kt`/`q_vt` and its weights never saw a ternary K,
+> so `adder_export.py` on it no longer measures the shipped kernel. **The model needs
+> retraining** (`python -m model.train --arch ternary_vanilla`) before rows 8-10 of
+> `adder_kernel.md` §7 can be repeated. `QATCalibration` now falls back to the
+> calibration set for any site whose `ActQuant.initialized` flag is clear, so a stale
+> checkpoint degrades rather than silently quantizing with a scale of 1.0. Everything
+> below about *why* PTQ fails here is unaffected by the change.
+
 **Resolved on the `qat` branch: train through the quantizers and the same kernel scores
 100.00% exact-sequence / 100.00% token** (`adder_export.py -n 256 -c 128 --iss-check` on
 `model/saved/ternary_mha.pt`, ISS cross-check 0/416 logits differ; `adder_kernel.md` §7.6c).
-Nothing in the kernel changed — it is byte-identical to the one that scored 0.00% below. What
+Nothing in the kernel changed *at that point* — it was byte-identical to the one that scored
+0.00% below; the ternary-K/V rewrite came after. What
 changed is that every requant site is an `ActQuant` present during training with an LSQ-learned
 scale, so the clipping is part of the fitted function rather than damage inflicted afterwards.
 
@@ -299,8 +343,8 @@ Several docs describe an earlier model or ISA. When they disagree with the code,
 fix the doc if you are in there anyway.
 
 - **`model/README.md`** — the most stale. Describes LayerNorm/post-LN, softmax attention, GELU
-  in the FFN, `mha_torch`/`slow_mha_cuda`, MoE, `f=512` for the ternary config, and the deleted
-  vanilla/GQA/`colab_ternary_mha` checkpoints. Its *invariants* sections (`EQUALS_POS`, the
+  in the FFN, sinusoidal positional encoding, `mha_torch`/`slow_mha_cuda`, MoE, `f=512` for the
+  ternary config, and the deleted vanilla/GQA/`colab_ternary_mha` checkpoints. Its *invariants* sections (`EQUALS_POS`, the
   sampling, the `TernaryLinear` weight orientation, the double residual) are still correct.
 - **`accel/tpulang/tpunn.md`** — superseded by `adder_kernel.md`; written against the older
   model (LayerNorm, GELU, softmax, biases, `f=512`) and the pre-macro-op ISA. Still the only
@@ -379,11 +423,14 @@ concluding anything from a board run.
 
 ## Long simulations
 
-A full-model `tpu_top_tb` run is ~542 k clocks (5.42 ms simulated at 100 MHz) and dumps
+A full-model `tpu_top_tb` run is ~351 k clocks (3.51 ms simulated at 100 MHz) and dumps
 hundreds of MB of waveform at the defaults, so it needs `-DWATCHDOG_NS=400000000 -DNO_VCD`
 (both are options on `tpu_top_tb.sv`, defaults unchanged). The command line is in
-`adder_kernel.md` §7.7. It was 1.23 M clocks before `sram.sv` became a range engine —
-`accel/tpu/docs/dma.md` §7.
+`adder_kernel.md` §7.7. It was 1.23 M clocks before `sram.sv` became a range engine
+(`accel/tpu/docs/dma.md` §7), 542 k before ternary K/V moved the attention matmuls
+onto the MXU (`adder_kernel.md` §2.5) and 367 k before the ternary output head
+followed them (§2.6); the split is now `mxu = 203 677`, `dma = 117 906`,
+`vpu = 26 080`.
 The ISS runs the same four-layer forward plus the PyTorch reference and the byte comparison in
 ~19 s, so leg-B verification is an edit-run loop, not a batch job.
 

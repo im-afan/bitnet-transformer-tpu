@@ -20,7 +20,7 @@ The toolchain (all in this directory):
 | [`iss.py`](iss.py)            | instruction-set simulator; runs the words, bit-exact with the RTL    |
 | [`gen_vectors.py`](gen_vectors.py) | ties both together: assemble + simulate → golden test vectors for `tpu_top_tb.sv` |
 | [`torch_ref.py`](torch_ref.py) | PyTorch references for the examples — an independent check on the ISS *and* the FPGA |
-| [`adder_export.py`](adder_export.py) | real checkpoint → integers. The calibration, the 14 requant words per layer and the integer pipeline all live in [`model/quant.py`](../../model/quant.py); this script stages them into the kernel's DRAM map and reports task accuracy against the float model. `--iss-check` runs the real weights through `adder_model.tpu` in the ISS to prove the numbers describe the kernel |
+| [`adder_export.py`](adder_export.py) | real checkpoint → integers. The calibration, the 16 requant words per layer and the integer pipeline all live in [`model/quant.py`](../../model/quant.py); this script stages them into the kernel's DRAM map and reports task accuracy against the float model. `--iss-check` runs the real weights through `adder_model.tpu` in the ISS to prove the numbers describe the kernel |
 | [`examples/`](examples)       | annotated `.tpu` programs (vector add, relu layer, tiled matmul, VPU matmul, transposing DMA, and the real model) |
 
 For the machine-level encoding and per-opcode semantics, read the
@@ -93,6 +93,7 @@ vecadd   rdst, rsrc0, rsrc1              dst[i] = src0[i] + src1[i]
 relu     rdst, rsrc0                    dst[i] = max(src0[i], 0)
 requant  rdst, rsrc0, rparam            dst[i] = clip((src0*m0+rnd) >> n)  int32→int8
 dyt      rdst, rsrc0, rparam            as requant, clipped to ±127  (DyT / hardtanh)
+tquant   rdst, rsrc0, rparam            as requant, clipped to ±1, int8→2-bit trit
 vecmatmul rdst, rsrc0, rsrc1            dst[t][s] = Σ_d src0[t][d]*src1[s][d]
 ```
 
@@ -101,7 +102,11 @@ That is the entire VPU instruction set. `vecemul`, `vecmul`, `sadd`, `sdiv`, `ge
 softmax/LayerNorm/GELU model, and this one is ReLU attention + DyT + ReLU feed-forward.
 Their opcodes are retired holes, not free encoding space; see
 [vpu.md §Removed ops](../tpu/docs/vpu.md#removed-ops) for the table and the measured area
-saving. `vecdot` stays only because it is `vecmatmul`'s inner primitive.
+saving. `vecdot` stays only because it is `vecmatmul`'s inner primitive — and
+`vecmatmul` itself now has no caller in the shipped kernel either, since ternary K/V
+and a ternary `Model.fc` put every matmul in the model on the MXU. Both are kept for
+the model shape that needs an int8 × int8 matmul; see
+[vpu.md](../tpu/docs/vpu.md).
 
 VPU vector length comes from `cfg 'vlen'`; MXU token count from `cfg 'tlen'`.
 
@@ -109,6 +114,14 @@ VPU vector length comes from `cfg 'vlen'`; MXU token count from `cfg 'tlen'`.
 (`hardtanh(alpha*x, -1, 1)`) costs on this datapath: pin the output scale to
 `1/127`, fold `alpha` into the multiplier, and the clip of the narrow the caller
 already needed *is* the hardtanh. See [`../tpu/docs/vpu.md`](../tpu/docs/vpu.md).
+
+`tquant` is the same shifter clipped to ±1, and the one VPU op that reads int8 and
+writes *narrower*: the trit lands 2 bits wide in the MXU's weight encoding, four to
+a byte, so its destination is a `matmul_t` weight block with nothing in between.
+That is how an **activation becomes a weight operand** — the array does int8 ×
+ternary and cannot do int8 × int8, so ternarizing K and V is what moved attention's
+`Q@K^T` and `P@V` off `vecmatmul` and onto the array. `vlen` must be a multiple of
+4 and the destination pointer advances a quarter as fast as the source.
 
 **Memory / comms** (operands are registers holding *DRAM/scratchpad* addresses; byte
 length from `cfg 'len'`):
@@ -208,8 +221,9 @@ The MXU and VPU consume fixed layouts (see [ISA §4.4](../tpu/docs/isa.md#44-lay
   `base + j·(ROWS·2/8)`.
 - **Requant word** `{m0,n}`: one int32, `m0` in the low 12 bits, `n` above.
 - **VPU buffers**: int8 operands (1-byte stride), int32 results (4-byte stride) — a
-  buffer's byte size depends on which it is. `requant` is the only op that narrows
-  int32→int8.
+  buffer's byte size depends on which it is. `requant`/`dyt` are the only ops that
+  narrow int32→int8, and `tquant` the only one that writes 2-bit trits (int8 in,
+  `vlen/4` bytes out, in the weight layout above).
 
 ### 2.4 Synchronization
 
@@ -233,7 +247,7 @@ Each stages its own operands over DRAM (§2.2) and ends in `halt`.
 | [`vpu_matmul.tpu`](examples/vpu_matmul.tpu) | a matmul with **no** ternary operand, so the MXU cannot help: attention's `S = Q@K^T` as a `T x T` nest of `vecdot`, contracting over the head dim — `K^T` is never materialised — then a per-row `requant` back to int8. Superseded by `vecmatmul.tpu`, which does the same thing as one macro op, and the only remaining user of `vecdot` |
 | [`transpose_dma.tpu`](examples/transpose_dma.tpu) | `Vᵀ` and `Qᵀ` out of a fused `[T][3D]` QKV block in one dispatch each — `wrmem.t` (spill) and `rdmem.t` (fill), with `tsrow` reading a column slice in place |
 | [`highmem_dma.tpu`](examples/highmem_dma.tpu) | DMA above the low 64 KB of DRAM — the only thing here that leaves the first window. Builds a `0x10000` base with `li`+`adds` (no immediate can name it) and spills there linearly and transposed |
-| [`adder_model.tpu`](examples/adder_model.tpu) | **not an example — the real thing.** The entire `adder_ternary_vanilla` model in one program: every layer (3 ternary projections, both attention matmuls, the causal mask, ReLU attention, `Wo`, the feed-forward, both residuals with their `dyt` normalizations) plus the output head. 208 words |
+| [`adder_model.tpu`](examples/adder_model.tpu) | **not an example — the real thing.** The entire `adder_ternary_vanilla` model in one program: every layer (3 ternary projections, the two `tquant` passes that make K and V ternary, both attention matmuls — now on the MXU — the causal mask, ReLU attention, `Wo`, the feed-forward, both residuals with their `dyt` normalizations) plus a ternary output head, which is on the MXU too. 226 words, and **no `vecmatmul` left anywhere in it** |
 
 `adder_model.tpu` is a full forward pass of the shipped adder checkpoint in a
 single run. It was five runs until `scalar_unit.sv` stopped truncating a
@@ -243,7 +257,7 @@ the model's weights do not fit in (96 KB at the four layers it was written for, 
 today's two). With the full `MEM_ADDR_W` visible
 the weights are staged once and stay resident, so a forward pass is a 4 KB
 upload rather than a 96 KB one. The byte-level contract the host has to satisfy
-— memory maps, the 14 requant words per layer and where their scales come from,
+— memory maps, the 16 requant words per layer and where their scales come from,
 the weight packing — is in [`adder_kernel.md`](adder_kernel.md); §2 there has
 the RTL/ISS change and §7 the verification order.
 

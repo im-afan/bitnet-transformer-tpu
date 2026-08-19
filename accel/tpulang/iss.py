@@ -19,7 +19,10 @@ Numerics are kept bit-exact with the RTL:
   * VPU ops: int8 operands, int32 accumulate, int32 writeback; VOP_REQUANT
     narrows int32->int8 with the same fixed-point rescale (vpu.sv requant8),
     and VOP_DYT does the same with a symmetric +-127 clip (vpu.sv dyt8) — that
-    clip is DyT's hardtanh, not an approximation of it.
+    clip is DyT's hardtanh, not an approximation of it. VOP_TQUANT is the same
+    rescale clipped to +-1 and written in the MXU's 2-bit weight encoding, four
+    elements per byte (vpu.sv tquant2), which is how an int8 activation becomes
+    a ternary weight operand without a round trip through the host.
 
 DMA (rdmem/wrmem) is modelled as a real byte copy between a separate external
 **DRAM** space and the on-chip scratchpad, over ``cfg 'len'`` bytes — matching the
@@ -62,6 +65,7 @@ OP_SETCFGR = 0x1C
 OP_MATMUL_T = 0x1D
 OP_VECMM = 0x1E
 OP_DYT = 0x21
+OP_TQUANT = 0x22
 
 # --- named config registers (scalar_unit.sv CFG_*) ----------------------------
 CFG_TLEN, CFG_VLEN, CFG_LEN, CFG_SCALAR = 0, 1, 2, 3
@@ -266,6 +270,26 @@ class TPU:
             return -127
         return shifted
 
+    # ---- tquant: the same rescale, clipped to a trit (vpu.sv tquant2) -------
+    def tquant2(self, acc: int, m0: int, n: int) -> int:
+        """``clip_pm1((acc*m0 + round) >> n)`` — int8 in, one trit out.
+
+        Identical to :meth:`requant8` bar the clip. The caller packs the result
+        with :meth:`_trit_code`; the two together are one VOP_TQUANT element.
+        """
+        rnd = 0 if n == 0 else (1 << (n - 1))
+        shifted = (acc * m0 + rnd) >> n         # Python >> floors, like >>>
+        if shifted > 1:
+            return 1
+        if shifted < -1:
+            return -1
+        return shifted
+
+    @staticmethod
+    def _trit_code(t: int) -> int:
+        """A trit in the MXU's weight encoding: bit0 = nonzero, bit1 = sign."""
+        return 0b00 if t == 0 else (0b11 if t < 0 else 0b01)
+
     # ---- ternary weight decode (scratchpad.md §2: 00=0, 01=+1, 11=-1) --------
     @staticmethod
     def _trit(colint: int, i: int) -> int:
@@ -314,7 +338,8 @@ class TPU:
                 self._vecmatmul(r_dst & addr_mask, r_src0 & addr_mask,
                                 r_src1 & addr_mask)
 
-            elif opc in (OP_VECDOT, OP_VECADD, OP_RELU, OP_REQUANT, OP_DYT):
+            elif opc in (OP_VECDOT, OP_VECADD, OP_RELU, OP_REQUANT, OP_DYT,
+                         OP_TQUANT):
                 self._vpu(opc, r_dst & addr_mask, r_src0 & addr_mask,
                           r_src1 & addr_mask)
 
@@ -487,6 +512,27 @@ class TPU:
             for i in range(vlen):
                 a32 = self.rd_i32(src0 + i * 4)
                 self.wr_i8(dst + i, narrow(a32, m0, n))
+            return
+
+        # The ternary narrow: int8 in at stride 1, **2 bits** out, so one
+        # output byte per four input elements. The packing order is the weight
+        # encoding `_trit` decodes, which is what makes the result a legal
+        # `matmul_t` weight operand with no rearrangement in between. A vlen
+        # that is not a multiple of 4 leaves the unfilled slots of the last
+        # byte at 0 rather than preserving them — the RTL's write strobe is
+        # per byte, so there is nothing finer to preserve with.
+        if opc == OP_TQUANT:
+            m0 = scalar & ((1 << self.m0_w) - 1)
+            n = (scalar >> self.m0_w) & ((1 << self.n_w) - 1)
+            for b in range((vlen + 3) // 4):
+                byte = 0
+                for j in range(4):
+                    i = 4 * b + j
+                    if i >= vlen:
+                        break
+                    t = self.tquant2(self.rd_i8(src0 + i), m0, n)
+                    byte |= self._trit_code(t) << (2 * j)
+                self.wr_i8(dst + b, byte)
             return
 
         # The one reduction: whole vector -> a single int32 at `dst`.

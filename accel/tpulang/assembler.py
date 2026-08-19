@@ -62,6 +62,10 @@ Compute / dispatch — operands are registers holding scratchpad byte addresses:
     dyt      rdst, rsrc0, rparam             as requant, clipped to +-127
                                              (DyT = hardtanh(alpha*x); the clip
                                               is the hardtanh, vpu.sv header)
+    tquant   rdst, rsrc0, rparam             as requant, clipped to +-1 and written
+                                             2 bits wide (00=0, 01=+1, 11=-1),
+                                             4 elements per byte - i.e. int8 in,
+                                             a packed ternary weight column out
 
 Vector length for the VPU ops comes from cfg 'vlen'; MXU token count from cfg
 'tlen'.
@@ -235,6 +239,13 @@ SPECS: dict[str, Spec] = {
     # does — see vpu.sv's header and adder_kernel.md §4 for why the clip *is*
     # the hardtanh once the output scale is pinned to 1/127.
     "dyt": Spec(0x21, "RRR", {}),
+    # Ternary narrow + pack. `requant`'s fixed point clipped to a single level
+    # per sign, and the result written in the MXU's 2-bit weight encoding rather
+    # than as int8. That is what lets an *activation* become a weight operand:
+    # ternarizing K and V is how Q@K^T and P@V moved off `vecmatmul` (one serial
+    # int8 dot product per output element) and onto the array. cfg vlen counts
+    # input elements and must be a multiple of 4, since the output is bytes.
+    "tquant": Spec(0x22, "RRR", {}),
     # VPU macro op: S[t][s] = sum_d src0[t][d]*src1[s][d] over cfg vrows x vcols,
     # contracting cfg vlen. Attention's Q@K^T and P@V — both operands are int8
     # activations, which the ternary-weight MXU cannot multiply at all.

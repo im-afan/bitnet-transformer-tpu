@@ -6,18 +6,33 @@ for the memory it reads/writes.
 
 ## 1. Scope
 
-The MXU handles every **ternary-weight × int8-activation** matmul in the transformer:
+The MXU handles every **ternary-weight × int8-activation** matmul in the transformer —
+which, since ternary K/V and a ternary output head, means *every matmul in the model*:
 
-| Op             | Shape (per token tile) | Notes                       |
-| -------------- | ---------------------- | --------------------------- |
-| Wq, Wk, Wv, Wo | `T×128 @ 128×128`      | attention projections       |
-| FF fc1         | `T×128 @ 128×512`      | tiled over output columns   |
-| FF fc2         | `T×512 @ 512×128`      | tiled over the contraction  |
+| Op             | Shape (per token tile) | Notes                                 |
+| -------------- | ---------------------- | ------------------------------------- |
+| Wq, Wk, Wv, Wo | `T×128 @ 128×128`      | attention projections                 |
+| Q @ Kᵀ         | `T×32 @ 32×T`          | per head; K is a ternary *activation*  |
+| P @ V          | `T×T @ T×32`           | per head; V likewise                  |
+| FF fc1         | `T×128 @ 128×512`      | tiled over output columns             |
+| FF fc2         | `T×512 @ 512×128`      | tiled over the contraction            |
+| output head    | `T×128 @ 128×16`       | `Model.fc` is ternary; 16 = 13 padded |
 
-It does **not** compute attention scores (`QK^T`, `softmax`, `AV`): those operands are
-int8 activations, not ternary weights, and the dims are small (`head_dim=16`, `T≤32`),
-so they run on the [VPU](vpu.md) as dot products. This mirrors the CUDA path, where a
-dedicated MHA kernel is separate from the projection GEMMs.
+The last row is why the head is padded: this array stores a whole `COLS`-wide output
+tile, so a 13-column result would have its second tile overrun each row into the next
+one's first three words. `adder_model.tpu` rounds the head up to 16 columns and the
+host stages the top three as zero trits (`adder_kernel.md` §2.6).
+
+The attention rows are recent too. `Q@K^T` and `P@V` are
+activation × activation, which this array cannot do — so they ran on the [VPU](vpu.md) as
+`vecmatmul`, one serial dot product per output element, and were the slowest thing in the
+shipped kernel. The fix was to make the operand that lands on the *weight* side ternary:
+K in `Q@K^T`, V in `P@V`, both narrowed by `tquant` straight into this array's packed
+2-bit weight layout. Q and the attention matrix stay int8, which is what the activation
+side wants anyway. See `accel/tpulang/adder_kernel.md` §2.5.
+
+There is no softmax to compute anywhere: attention is ReLU, so the only thing between the
+two matmuls is a `vecadd` against an int8 mask and a `relu`, both on the VPU.
 
 ## 2. Why a ternary systolic array is cheap
 

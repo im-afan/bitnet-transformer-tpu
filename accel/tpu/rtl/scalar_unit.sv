@@ -183,6 +183,14 @@ module scalar_unit #(
                              //       REQUANT, symmetric +-127 clip: DyT's
                              //       hardtanh with the output scale pinned to
                              //       1/127 (vpu.sv header, adder_kernel.md §4).
+        OP_TQUANT  = 6'h22,  // VPU : r[dst] = tquant(r[src0], {n,m0}=r[src1]).
+                             //       Again the same operands and fixed point,
+                             //       clipped to +-1 and written **2 bits** wide
+                             //       in the MXU's weight encoding, 4 elements
+                             //       per byte. This is the op that turns an int8
+                             //       activation into a ternary weight operand,
+                             //       which is what put attention's Q@K^T and
+                             //       P@V on the array instead of on VECMM.
         OP_VECMM   = 6'h1E,  // VPU : macro op — S[t][s] = sum_d src0[t][d]*
                              //       src1[s][d] over cfg vrows x vcols.
                              //       Attention's Q@K^T / P@V: both operands
@@ -215,7 +223,7 @@ module scalar_unit #(
     localparam logic [4:0]
         VOP_DOT = 5'd0,        // vpu.sv-internal: vecmatmul's inner primitive
         VOP_ADD = 5'd1, VOP_RELU = 5'd3, VOP_REQUANT = 5'd10,
-        VOP_VECMATMUL = 5'd13, VOP_DYT = 5'd16;
+        VOP_VECMATMUL = 5'd13, VOP_DYT = 5'd16, VOP_TQUANT = 5'd17;
 
     // Named config registers (host-, SETCFG- or SETCFGR-written; scalar_unit.md
     // §6). 0..3 are the original set; 4..13 carry the macro ops' geometry
@@ -400,6 +408,7 @@ module scalar_unit #(
             OP_RELU:    vpu_op = VOP_RELU;
             OP_REQUANT: vpu_op = VOP_REQUANT;   // in=r[src0], {n,m0}=r[src1], out=r[dst]
             OP_DYT:     vpu_op = VOP_DYT;       // same operands, symmetric clip
+            OP_TQUANT:  vpu_op = VOP_TQUANT;    // ...clipped to +-1, packed 2b
             default:    vpu_op = VOP_DOT;
         endcase
     end
@@ -433,7 +442,8 @@ module scalar_unit #(
     // dispatch_unit below both call it).
     function automatic logic is_vpu_op(input logic [5:0] o);
         return (o == OP_VECDOT) || (o == OP_VECADD) || (o == OP_RELU) ||
-               (o == OP_REQUANT) || (o == OP_VECMM)  || (o == OP_DYT);
+               (o == OP_REQUANT) || (o == OP_VECMM)  || (o == OP_DYT) ||
+               (o == OP_TQUANT);
     endfunction
 
     // Is this opcode a compute/comms dispatch (assert start, then wait on done)?

@@ -542,22 +542,28 @@ def build_highmem_image(tpu: TPU, c: dict) -> dict:
 # below track the accumulator growth at each stage: ternary matmuls over K=128
 # land around +-1e3, the two attention matmuls over 32 terms around +-5e4.
 ADDER_RQ = [
-    (1, 1),   # 0  RQ_Q    X @ Wq      128 terms, sd ~43
+    (1, 1),   # 0  RQ_Q    X @ Wq      128 terms, sd ~45
     (1, 1),   # 1  RQ_K    X @ Wk
-    (1, 1),   # 2  RQ_V    X @ Wv
-    (1, 6),   # 3  RQ_S    Q @ K^T     32 terms of ~21*21, sd ~2.5k
-    (1, 0),   # 4  RQ_ID   mask clamp — must be identity
-    (1, 0),   # 5  RQ_P    relu(S8), already in [0,127]
-    (1, 7),   # 6  RQ_A    P @ V       32 terms; P is unsigned, so this one
-              #                        carries a mean as well as a spread
-    (1, 4),   # 7  RQ_O    A @ Wo      128 terms, sd ~530
-    (1, 0),   # 8  RQ_XO   X + O       must be identity: the second add needs
+    (1, 4),   # 2  RQ_KT   K -> trits. The threshold is |K8| >= 2**n / 2 = 8,
+              #                        which leaves ~70% of the trits nonzero —
+              #                        a word that made them nearly all 0 (or
+              #                        nearly all +-1) would make the attention
+              #                        matmuls agree for the wrong reason
+    (1, 1),   # 3  RQ_V    X @ Wv
+    (1, 4),   # 4  RQ_VT   V^T -> trits, same reasoning
+    (1, 2),   # 5  RQ_S    Q @ K^T     32 terms of int8 x trit, sd ~106
+    (1, 0),   # 6  RQ_ID   mask clamp — must be identity
+    (1, 0),   # 7  RQ_P    relu(S8), already in [0,127]
+    (1, 3),   # 8  RQ_A    P @ V       32 terms; P is unsigned, but the trits
+              #                        are symmetric, so the mean cancels
+    (1, 4),   # 9  RQ_O    A @ Wo      128 terms, sd ~460
+    (1, 0),   # 10 RQ_XO   X + O       must be identity: the second add needs
               #                        both operands back on X's scale
-    (1, 1),   # 9  RQ_X1   dyt(XO + X) — norm1; carries alpha, clips at +-127
-    (1, 3),   # 10 RQ_H    X1 @ W1     128 terms, sd ~250
-    (1, 0),   # 11 RQ_HR   relu(H)
-    (1, 3),   # 12 RQ_F    HR @ W2
-    (1, 1),   # 13 RQ_X2   dyt(X1 + F) — norm2
+    (1, 1),   # 11 RQ_X1   dyt(XO + X) — norm1; carries alpha, clips at +-127
+    (1, 3),   # 12 RQ_H    X1 @ W1     128 terms, sd ~250
+    (1, 0),   # 13 RQ_HR   relu(H)
+    (1, 3),   # 14 RQ_F    HR @ W2
+    (1, 1),   # 15 RQ_X2   dyt(X1 + F) — norm2
 ]
 
 
@@ -594,13 +600,14 @@ def build_adder_model_image(tpu: TPU, c: dict) -> dict:
     """
     T, D, D3 = c["T"], c["D"], c["D3"]
     VOCAB, LAYERS, WCOL = c["VOCAB"], c["LAYERS"], c["WCOL"]
+    VPAD = c["VPAD"]
     img: dict[int, int] = {}
 
     def put(addr: int, byte: int):
         tpu.dram[tpu._d(addr)] = byte & 0xFF
         img[addr] = byte & 0xFF
 
-    # X[t][d] int8 in [-8, 8], the embedded + positionally-encoded input.
+    # X[t][d] int8 in [-8, 8], the embedded input (there is no PE any more).
     for t in range(T):
         for d in range(D):
             put(c["D_XIN"] + t * D + d, _mix(t * 4099 + d * 13 + 1) % 17 - 8)
@@ -610,10 +617,18 @@ def build_adder_model_image(tpu: TPU, c: dict) -> dict:
         for s in range(T):
             put(c["D_MASK"] + t * T + s, 0 if s <= t else -128)
 
-    # fc.weight [VOCAB][D] int8 — nn.Linear stores [out, in] already.
-    for v in range(VOCAB):
-        for d in range(D):
-            put(c["D_WFC"] + v * D + d, _mix(v * 65537 + d * 29 + 2) % 31 - 15)
+    # fc.weight [D][VPAD] trits, column-major 2-bit packed: the head is a
+    # TernaryLinear now, so it is an MXU weight like any other.
+    #
+    # The VOCAB..VPAD columns are the padding the array's whole-tile store
+    # needs. A real host stages them as *zero* trits, but here they carry live
+    # weights on purpose: with zeros there, a kernel that wrote its second
+    # output tile at the wrong stride could still agree with the reference,
+    # because both would be comparing zeros.
+    for n in range(VPAD):
+        col = [_mix(n * 65537 + k * 29 + 2) % 3 - 1 for k in range(D)]
+        for b, byte in enumerate(pack_wcol(col, WCOL)):
+            put(c["D_WFC"] + n * WCOL + b, byte)
 
     for L in range(LAYERS):
         base = c["D_L0"] + L * c["LSTRIDE"]
@@ -635,7 +650,7 @@ def build_adder_model_image(tpu: TPU, c: dict) -> dict:
                 for b, byte in enumerate(pack_wcol(col, WCOL)):
                     put(base + off + n * WCOL + b, byte)
 
-        # This layer's 14 requant {m0,n} words.
+        # This layer's 16 requant {m0,n} words.
         for k, (m0, nsh) in enumerate(ADDER_RQ):
             word = requant_word(m0, nsh)
             for b in range(4):

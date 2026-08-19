@@ -6,14 +6,24 @@
 // from a single wide scratchpad read/modify/write port (V_rw), computing every
 // pointwise / reduction op that is not a ternary-weight matmul.
 //
-// SCOPE. This unit implements exactly the six ops
+// SCOPE. This unit implements exactly the ops
 // accel/tpulang/examples/adder_model.tpu issues, and nothing else:
 //
-//     VOP_DOT  VOP_ADD  VOP_RELU  VOP_REQUANT  VOP_DYT  VOP_VECMATMUL
+//     VOP_DOT  VOP_ADD  VOP_RELU  VOP_REQUANT  VOP_DYT  VOP_TQUANT
+//     VOP_VECMATMUL
 //
 // VOP_DOT is the odd one out: no shipped kernel issues `vecdot`, but it is the
 // inner primitive VOP_VECMATMUL runs once per (row, col) pair, so its datapath
 // is not optional and keeping the opcode costs nothing.
+//
+// **VOP_VECMATMUL now has no caller either.** Ternarizing K and V (VOP_TQUANT)
+// moved both attention matmuls onto the MXU, and making Model.fc a
+// TernaryLinear moved the output head — its last caller — with them. The pair
+// is kept because a model shape that needs an int8 x int8 matmul is one
+// checkpoint away, and because removing them is a real area decision rather
+// than a deletion: VOP_DOT is the reduction path (the accumulator, the fold and
+// the S_WB scalar store), and VOP_VECMATMUL is the counter block around it.
+// Nothing else in this unit uses either.
 //
 // Everything else was removed deliberately (GELU, EXP, SQUARE, ELEMENT_MUL,
 // SCALAR_MUL/ADD/DIV, REDUCEMAX, REDUCESUM, SOFTMAX and its fused SM_EXP), along
@@ -53,9 +63,22 @@
 // all is what lets a kernel say "this is a normalization" instead of "this is a
 // rescale that happens to clip". See accel/tpulang/adder_kernel.md §4.
 //
-// The scalar operand. VOP_REQUANT and VOP_DYT are the only ops left that read
-// `vpu_scalar`, and both read the same thing: one int32 {m0, n} word, loaded once
-// on the first chunk and held for the whole vector.
+// Ternary quantize (VOP_TQUANT). The third op sharing that fixed point, and the
+// only one whose *destination* is not int8: it clips to +-1 and writes the trit
+// in the MXU's 2-bit weight encoding (00 = 0, 01 = +1, 11 = -1), four elements
+// per byte. That is what makes the result directly addressable as a `matmul_t`
+// weight column, with no repacking pass and no host round trip — and therefore
+// what lets an *activation* be a weight operand. The shipped kernel ternarizes
+// K and V with it, which is how attention's Q@K^T and P@V left VOP_VECMATMUL
+// (one serial int8 dot product per output element) for the array.
+//
+// Its write strobe is per byte, so `vpu_vlen` must be a multiple of 4; a partial
+// final byte writes 0 (trit 0) into the slots the tail did not fill rather than
+// preserving what was there.
+//
+// The scalar operand. VOP_REQUANT, VOP_DYT and VOP_TQUANT are the only ops that
+// read `vpu_scalar`, and all three read the same thing: one int32 {m0, n} word,
+// loaded once on the first chunk and held for the whole vector.
 //
 // Streaming: a vector of `vpu_vlen` elements is processed LANES elements at a
 // time. Each chunk reads its operand(s), computes all lanes in one cycle, then
@@ -139,7 +162,10 @@ module vpu #(
         // dst[i] = clip_pm127((src0[i]*m0 + round) >> n) — DyT / hardtanh.
         // int32 in, int8 out, {m0,n} from the scalar operand, exactly like
         // VOP_REQUANT; see the header note for why the clip is symmetric.
-        VOP_DYT         = 5'd16;
+        VOP_DYT         = 5'd16,
+        // dst = 2-bit trit codes, 4 per byte, from int8 inputs. The same
+        // fixed point again, clipped to +-1; see the header note.
+        VOP_TQUANT      = 5'd17;
 
     // -------------------------------------------------------------------------
     // Op-class helpers.
@@ -148,7 +174,7 @@ module vpu #(
         return (o == VOP_DOT) || (o == VOP_ADD);
     endfunction
     function automatic logic needs_scalar(input logic [4:0] o);
-        return (o == VOP_REQUANT) || (o == VOP_DYT);
+        return (o == VOP_REQUANT) || (o == VOP_DYT) || (o == VOP_TQUANT);
     endfunction
     // Sum-only since REDUCEMAX/REDUCESUM were removed; VOP_DOT is the only
     // reduction left, so `acc` never needs a most-negative initial value.
@@ -186,6 +212,23 @@ module vpu #(
         else                     dyt8 = shifted[7:0];
     endfunction
 
+    // Ternary quantize: the same rescale clipped to a single level per sign,
+    // returned already encoded as the MXU's 2-bit weight code (bit 0 = nonzero,
+    // bit 1 = sign — scratchpad.md §2). Returning the *code* rather than a
+    // signed trit is deliberate: the encoding is the only reason this op exists,
+    // so it belongs beside the arithmetic and not in the writeback muxing.
+    function automatic logic [1:0] tquant2(input logic signed [ACC_W-1:0] acc32,
+                                           input logic [M0_W-1:0]         m0,
+                                           input logic [N_W-1:0]          n);
+        logic signed [RQ_W-1:0] prod, round, shifted;
+        prod    = acc32 * $signed({1'b0, m0});
+        round   = (n == 0) ? '0 : (RQ_W'(1) <<< (n - 1));
+        shifted = (prod + round) >>> n;
+        if (shifted >= 1)      tquant2 = 2'b01;   // +1
+        else if (shifted <= -1) tquant2 = 2'b11;  // -1
+        else                    tquant2 = 2'b00;  //  0
+    endfunction
+
     // -------------------------------------------------------------------------
     // FSM.
     // -------------------------------------------------------------------------
@@ -212,11 +255,17 @@ module vpu #(
     // Element widths are per-op, and the two are independent: ADD/RELU/DOT read
     // int8 and write int32; REQUANT and DYT read int32 and write int8. src1 is
     // always an int8 vector (binary ops).
+    // VOP_TQUANT is the one op that reads int8 *and* writes narrower than int8,
+    // so the two predicates are genuinely independent rather than two names for
+    // one thing.
     wire src0_is32   = (op_r == VOP_REQUANT) || (op_r == VOP_DYT);
+    wire dst_is2     = (op_r == VOP_TQUANT);
     wire dst_is8     = (op_r == VOP_REQUANT) || (op_r == VOP_DYT);
     wire [ADDR_W-1:0] src0_stride = src0_is32 ? ADDR_W'(LANES*4) : ADDR_W'(LANES);
     wire [ADDR_W-1:0] src1_stride = ADDR_W'(LANES);
-    wire [ADDR_W-1:0] dst_stride  = dst_is8   ? ADDR_W'(LANES)   : ADDR_W'(LANES*4);
+    wire [ADDR_W-1:0] dst_stride  = dst_is2 ? ADDR_W'(LANES/4)
+                                  : dst_is8 ? ADDR_W'(LANES)
+                                            : ADDR_W'(LANES*4);
 
     // Chunk geometry.
     wire [10:0] chunk_active = (remaining >= LANES) ? 11'(LANES) : remaining;
@@ -266,6 +315,7 @@ module vpu #(
     logic                    lane_active [0:LANES-1];
     logic signed [ACC_W-1:0] res32 [0:LANES-1];   // int32 elementwise result
     logic        [7:0]       res8  [0:LANES-1];    // int8 requant result
+    logic        [1:0]       res2  [0:LANES-1];    // 2-bit trit code (TQUANT)
     logic signed [ACC_W-1:0] red_val [0:LANES-1];  // per-lane value into reduction
 
     logic signed [7:0]       a8;
@@ -280,12 +330,16 @@ module vpu #(
             lane_active[l] = (l < chunk_active);
             res32[l] = '0;
             res8[l]  = '0;
+            res2[l]  = '0;
             red_val[l] = '0;
             unique case (op_r)
                 VOP_ADD:         res32[l] = ACC_W'(a8) + ACC_W'(b8);
                 VOP_RELU:        res32[l] = (a8 > 0) ? ACC_W'(a8) : '0;
                 VOP_REQUANT:     res8[l]  = requant8(a32, rq_m0, rq_n);
                 VOP_DYT:         res8[l]  = dyt8(a32, rq_m0, rq_n);
+                // int8 source, unlike the two above: this narrows an activation
+                // that a requant already produced.
+                VOP_TQUANT:      res2[l]  = tquant2(ACC_W'(a8), rq_m0, rq_n);
                 VOP_DOT:         red_val[l] = a8 * b8;
                 default: ;
             endcase
@@ -306,7 +360,8 @@ module vpu #(
 
     // -------------------------------------------------------------------------
     // Writeback payload + byte strobe (elementwise / requant chunk).
-    // int32 dst: 4 bytes per lane; int8 dst (REQUANT): 1 byte per lane.
+    // int32 dst: 4 bytes per lane; int8 dst (REQUANT/DYT): 1 byte per lane;
+    // 2-bit dst (TQUANT): 1 byte per *four* lanes.
     // -------------------------------------------------------------------------
     logic [SCRATCHPAD_W*8-1:0] wb_data;
     logic [SCRATCHPAD_W-1:0]   wb_strb;
@@ -314,13 +369,23 @@ module vpu #(
         wb_data = '0;
         wb_strb = '0;
         for (int l = 0; l < LANES; l++) begin
-            // Narrow (int8) writeback covers REQUANT and SM_EXP alike.
-            if (dst_is8) begin
+            if (dst_is2) begin
+                // Four trits share a byte, so the strobe cannot be per lane;
+                // it is asserted below, once per group. An inactive lane
+                // contributes code 00 (= trit 0), which is why the tail of a
+                // vlen that is not a multiple of 4 zero-fills.
+                if (lane_active[l]) wb_data[l*2 +: 2] = res2[l];
+            end else if (dst_is8) begin
                 wb_data[l*8 +: 8] = res8[l];
                 if (lane_active[l]) wb_strb[l] = 1'b1;
             end else begin
                 wb_data[l*32 +: 32] = res32[l];
                 if (lane_active[l]) wb_strb[l*4 +: 4] = 4'b1111;
+            end
+        end
+        if (dst_is2) begin
+            for (int b = 0; b < LANES/4; b++) begin
+                if (lane_active[b*4]) wb_strb[b] = 1'b1;
             end
         end
     end

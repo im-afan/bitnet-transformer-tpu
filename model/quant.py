@@ -40,9 +40,9 @@ follow it as it changes. The fixed-point helpers here are deliberately
 identical to that script's so the two remain comparable.
 
 **What is host-side, and why** (unchanged from `adder_kernel.md` §1): the token
-embedding and positional encoding, because the ISA has no gather; and the final
-argmax, because `redmax` returns a maximum and not its index. Everything
-between them is the device's.
+embedding, because the ISA has no gather; and the final argmax, because
+`redmax` returns a maximum and not its index. Everything between them is the
+device's. There is no longer a positional encoding to add.
 """
 
 from __future__ import annotations
@@ -70,13 +70,24 @@ INT8_MIN, INT8_MAX = -128, 127
 Word = tuple[int, int]            # (m0, n), the requant multiplier m0 / 2**n
 
 # The requant sites, in dataflow order. One word each, per layer.
-SLOTS = ["Q", "K", "V", "S", "ID", "P", "A", "O", "XO", "X1", "H", "HR", "F", "X2"]
+# "KT"/"VT" are `tquant` rather than `requant` — the narrow that rounds the int8
+# K and V onto {-1, 0, 1} so the MXU can take them as weight operands. The word
+# format is identical, so nothing downstream of the table cares which op reads
+# it; only the clip differs (+-1 instead of +-127).
+SLOTS = ["Q", "K", "KT", "V", "VT", "S", "ID", "P", "A", "O", "XO",
+         "X1", "H", "HR", "F", "X2"]
 
 # The calibration sites. "xo" and "o" are the two attention-residual addends;
 # they get recorded even though their scales are *pinned* (see derive_layer),
 # because the amount by which they overflow the scale they are pinned to is the
 # diagnostic that says whether the residual path is the problem.
-SITES = ["x", "q", "k", "v", "p", "a", "o", "xo", "x1", "h", "hr", "f", "x2"]
+SITES = ["x", "q", "k", "kt", "v", "vt", "p", "a", "o", "xo",
+         "x1", "h", "hr", "f", "x2"]
+
+# Sites whose grid is {-1, 0, 1}, not int8. Their scale is the tensor's
+# **absmean**, which is BitNet's rule and the one TernaryLinear applies to a
+# weight — absmax/1 would round every element but the largest to zero.
+TERNARY_SITES = {"kt", "vt"}
 
 
 def choose_word(m: float) -> Word:
@@ -123,16 +134,30 @@ def dyt8(acc: torch.Tensor, word: Word) -> torch.Tensor:
     return _rescale(acc, word).clamp(-INT8_MAX, INT8_MAX)
 
 
-def clip_rate(acc: torch.Tensor, word: Word, lo: int = INT8_MIN) -> float:
+def tquant8(acc: torch.Tensor, word: Word) -> torch.Tensor:
+    """`clip_pm1((acc*m0 + 2**(n-1)) >> n)` — vpu.sv's VOP_TQUANT.
+
+    The same fixed point as :func:`requant8`, clipped to a single level per
+    sign. The device writes the result 2 bits wide (00 = 0, 01 = +1, 11 = -1)
+    straight into the column-major layout `matmul_t` reads its weights from, so
+    this op is both the quantization *and* the packing.
+    """
+    return _rescale(acc, word).clamp(-1, 1)
+
+
+def clip_rate(acc: torch.Tensor, word: Word, lo: int = INT8_MIN,
+              hi: int = INT8_MAX) -> float:
     """Fraction of a narrow's inputs that saturate, i.e. that it discards.
 
-    `lo` is the op's lower clip: int8's -128 for `requant`, -127 for `dyt`. For
-    a DyT site this is not a loss rate — saturating is the nonlinearity doing
-    its job — but it is still the statistic that says how much of the tensor is
-    living in the flat region.
+    `lo`/`hi` are the op's clips: int8's [-128, 127] for `requant`, [-127, 127]
+    for `dyt`, [-1, 1] for `tquant`. For a DyT site this is not a loss rate —
+    saturating is the nonlinearity doing its job — and for a ternary site it is
+    not one either, since clipping is most of what ternarizing *is*; but it is
+    still the statistic that says how much of the tensor is living in the flat
+    region.
     """
     shifted = _rescale(acc, word)
-    return float(((shifted > INT8_MAX) | (shifted < lo)).double().mean())
+    return float(((shifted > hi) | (shifted < lo)).double().mean())
 
 
 # =============================================================================
@@ -150,8 +175,9 @@ def clip_rate(acc: torch.Tensor, word: Word, lo: int = INT8_MIN) -> float:
 #   integer bounded by (max|a| * max|b| * K), so if that bound clears 2**53 the
 #   result is exact whatever order BLAS accumulates in.
 #
-# The bounds here are not close: the widest is the output head at
-# 128 * 127 * 128 ~= 2.1e6, eleven orders of magnitude below the limit.
+# The bounds here are not close: the widest is a ternary projection at
+# 128 * 127 * 1 ~= 1.6e4, twelve orders of magnitude below the limit. Every
+# weight in the ternary config is now a trit, the output head included.
 # =============================================================================
 _EXACT_LIMIT = 1 << 53
 
@@ -193,6 +219,11 @@ class QLinear:
     int8 weights go to the VPU's `vecmatmul`. Either way `w` is `[in, out]`,
     which is the orientation `TernaryLinear` already stores and the transpose
     of `nn.Linear`'s.
+
+    The ternary configs have no `int8` weight left — the output head became a
+    `TernaryLinear` too, so `vecmatmul` has no caller in the shipped kernel and
+    every matmul in the model runs on the array. The kind still exists because
+    the float `adder_vanilla` / `adder_gqa` configs keep an `nn.Linear` head.
     """
 
     kind: str                         # "ternary" | "int8"
@@ -271,16 +302,26 @@ class Calibration:
     def __init__(self, n_layers: int):
         self.n_layers = n_layers
         self.m = [{s: 0.0 for s in SITES} for _ in range(n_layers)]
+        # Running [sum|t|, count] beside the absmax: a ternary site is scaled by
+        # the absmean, so both statistics have to be collected in the one pass.
+        self.a = [{s: [0.0, 0] for s in SITES} for _ in range(n_layers)]
 
     def see(self, layer: int, site: str, t: torch.Tensor) -> None:
         if t.numel() == 0:
             return
-        v = float(t.detach().abs().max())
+        a = t.detach().abs()
+        v = float(a.max())
         if v > self.m[layer][site]:
             self.m[layer][site] = v
+        acc = self.a[layer][site]
+        acc[0] += float(a.sum())
+        acc[1] += a.numel()
 
     def scale(self, layer: int, site: str) -> float:
-        """absmax/127 — the symmetric int8 convention used everywhere here."""
+        """absmax/127, or the absmean at a ternary site (see TERNARY_SITES)."""
+        if site in TERNARY_SITES:
+            total, n = self.a[layer][site]
+            return (total / n) if (n and total > 0) else 1.0
         a = self.m[layer][site]
         return (a / 127.0) if a > 0 else 1.0
 
@@ -311,8 +352,7 @@ def instrumented_forward(
     """
     B, T = tokens.shape
     dev = next(model.parameters()).device
-    pe = model.positional_encoding(T)
-    X = model.embedding(tokens) + pe
+    X = model.embedding(tokens)          # no positional encoding
 
     kv, g, dh = model.kv_heads, model.q_heads // model.kv_heads, model.head_dim
     causal = torch.triu(torch.ones(T, T, device=dev) * -1e9, diagonal=1)
@@ -328,6 +368,10 @@ def instrumented_forward(
         at = layer.attention
         Q, K, V = at.Wq(X), at.Wk(X), at.Wv(X)
         rec(li, "q", Q); rec(li, "k", K); rec(li, "v", V)
+        # K and V are ternarized on top of their int8 narrow, so the same
+        # tensor is seen twice - once for the int8 scale, once for the ternary
+        # one, which is an absmean rather than an absmax (TERNARY_SITES).
+        rec(li, "kt", K); rec(li, "vt", V)
 
         Qh = Q.reshape(B, T, kv, g, dh)
         Kh = K.reshape(B, T, kv, dh)
@@ -399,7 +443,9 @@ class QATCalibration(Calibration):
     _SITES = {
         "q": lambda m, l: m.layers[l].attention.q_q,
         "k": lambda m, l: m.layers[l].attention.q_k,
+        "kt": lambda m, l: m.layers[l].attention.q_kt,
         "v": lambda m, l: m.layers[l].attention.q_v,
+        "vt": lambda m, l: m.layers[l].attention.q_vt,
         "p": lambda m, l: m.layers[l].attention.q_p,
         "a": lambda m, l: m.layers[l].attention.q_a,
         # q_o / q_xo *are* the residual-stream site (x_quant), shared by
@@ -416,8 +462,16 @@ class QATCalibration(Calibration):
 
     def __init__(self, model: transformer.Model):
         super().__init__(len(model.layers))
+        # A site whose `initialized` flag is clear never saw a tensor, so its
+        # `scale` is still the nn.Parameter's 1.0 and means nothing. That is
+        # what a checkpoint predating a site looks like after a strict=False
+        # load — the ternary q_kt/q_vt against any pre-`tquant` checkpoint —
+        # and taking the 1.0 would silently quantize with a garbage scale
+        # instead of falling back to the calibration set.
         self.learned = [
-            {s: float(get(model, li).scale.detach().abs()) for s, get in self._SITES.items()}
+            {s: (float(get(model, li).scale.detach().abs())
+                 if bool(get(model, li).initialized) else None)
+             for s, get in self._SITES.items()}
             for li in range(len(model.layers))
         ]
 
@@ -477,8 +531,8 @@ def residual_scales(model: transformer.Model, cal: Calibration,
     the `dyt` op's +-127 clip coincide with the hardtanh exactly — the model
     renormalizes the residual stream every layer, which is precisely what
     `adder_kernel.md` §8.1 found missing in the norm-free checkpoint. Layer 0
-    is the exception: its input is embedding + PE, which nothing bounds, so it
-    stays calibrated.
+    is the exception: its input is the raw embedding, which nothing bounds, so
+    it stays calibrated.
     """
     out = []
     for li, layer in enumerate(model.layers):
@@ -523,11 +577,17 @@ def derive_layer(model: transformer.Model, li: int, cal: Calibration,
     mult = {
         "Q":  s["x"] * qw["Wq"].scale / s["q"],
         "K":  s["x"] * qw["Wk"].scale / s["k"],
+        # `tquant` re-rounds the int8 K and V onto {-1, 0, 1} so the MXU can
+        # take them as weight operands, which is what moves both attention
+        # matmuls off `vecmatmul`. From here on the attention scales are s_kt
+        # and s_vt, not s_k and s_v.
+        "KT": s["k"] / s["kt"],
         "V":  s["x"] * qw["Wv"].scale / s["v"],
-        "S":  s["q"] * s["k"] / (math.sqrt(dh) * s["s"]),
+        "VT": s["v"] / s["vt"],
+        "S":  s["q"] * s["kt"] / (math.sqrt(dh) * s["s"]),
         "ID": 1.0,                          # mask add: narrow and clip only
         "P":  s["s"] / s["p"],
-        "A":  s["p"] * s["v"] / s["a"],
+        "A":  s["p"] * s["vt"] / s["a"],
         # --- the three pinned words ----------------------------------------
         # `vecadd` adds two int8 operands, so a residual is only meaningful if
         # both sides already share a scale. That pins RQ_O and RQ_XO to s_x and
@@ -581,6 +641,7 @@ def prepare(model: transformer.Model, calib_tokens: torch.Tensor,
     if use_qat:
         qcal = QATCalibration(model)
         qcal.m = cal.m                 # keep the measured absmax for the report
+        qcal.a = cal.a                 # ...and the absmean accumulator
         cal = qcal
     L = len(model.layers)
     s_x_all = residual_scales(model, cal, dyt_fixed)
@@ -619,9 +680,12 @@ def prepare(model: transformer.Model, calib_tokens: torch.Tensor,
 @torch.no_grad()
 def quantize_input(model: transformer.Model, tokens: torch.Tensor,
                    s_x0: float) -> torch.Tensor:
-    """embedding + positional encoding -> [B, T, D] int8, the device's input."""
-    pe = model.positional_encoding(tokens.shape[1])
-    X = model.embedding(tokens) + pe
+    """embedding -> [B, T, D] int8, the device's input.
+
+    There is no positional encoding any more (`Model.forward`), so the host's
+    whole share of the front end is one embedding lookup.
+    """
+    X = model.embedding(tokens)
     return torch.round(X / s_x0).clamp(INT8_MIN, INT8_MAX).to(torch.int64)
 
 
@@ -655,8 +719,18 @@ def int_forward(qm: QuantModel, X0: torch.Tensor,
         w, b, W = L["w"], L["bias_i8"], L["words"]
 
         Q = _linear(X, w["Wq"], b["Wq"], W["Q"], stats, "Q")
-        K = _linear(X, w["Wk"], b["Wk"], W["K"], stats, "K")
-        V = _linear(X, w["Wv"], b["Wv"], W["V"], stats, "V")
+        K8 = _linear(X, w["Wk"], b["Wk"], W["K"], stats, "K")
+        V8 = _linear(X, w["Wv"], b["Wv"], W["V"], stats, "V")
+
+        # `tquant`: int8 -> {-1, 0, 1}, written 2 bits wide into the layout the
+        # MXU reads a weight column from. Q and P stay int8 because they are the
+        # *activation* operands; K and V become the weights, which is the whole
+        # reason both attention matmuls can now run on the array.
+        K = tquant8(K8, W["KT"])
+        V = tquant8(V8, W["VT"])
+        if stats is not None:
+            stats.setdefault("KT", []).append(clip_rate(K8, W["KT"], -1, 1))
+            stats.setdefault("VT", []).append(clip_rate(V8, W["VT"], -1, 1))
 
         Qh = Q.reshape(B, T, kv, g, dh)
         Kh = K.reshape(B, T, kv, dh)
@@ -700,6 +774,9 @@ def int_forward(qm: QuantModel, X0: torch.Tensor,
         if stats is not None:
             stats.setdefault("X2", []).append(clip_rate(X1 + F, W["X2"], lo2))
 
+    # The head is `matmul_t` against a ternary weight like everything above it,
+    # and its output is never narrowed: an argmax does not care about scale, so
+    # the device spills the int32 accumulator and the host reads it.
     logits = imatmul(X, qm.fc.w, what="fc")
     if qm.fc_bias_i32 is not None:
         logits = logits + qm.fc_bias_i32
@@ -709,13 +786,14 @@ def int_forward(qm: QuantModel, X0: torch.Tensor,
 # =============================================================================
 # Cross-check: the same scheme, in float.
 # =============================================================================
-def _fq(x: torch.Tensor, s: float, lo: int = INT8_MIN) -> torch.Tensor:
-    """Fake-quantize: round onto the int8 grid of scale `s`, stay in float.
+def _fq(x: torch.Tensor, s: float, lo: int = INT8_MIN,
+        hi: int = INT8_MAX) -> torch.Tensor:
+    """Fake-quantize: round onto the grid of scale `s`, stay in float.
 
-    `lo` matches the device op that would narrow here — -128 for `requant`,
-    -127 for the symmetric `dyt`.
+    `lo`/`hi` match the device op that would narrow here - [-128, 127] for
+    `requant`, [-127, 127] for the symmetric `dyt`, [-1, 1] for `tquant`.
     """
-    return torch.round(x / s).clamp(lo, INT8_MAX) * s
+    return torch.round(x / s).clamp(lo, hi) * s
 
 
 @torch.no_grad()
@@ -733,15 +811,16 @@ def fake_quant_forward(model: transformer.Model, qm: QuantModel,
     B, T = tokens.shape
     kv, g, dh = qm.kv, qm.g, qm.dh
     dev = next(model.parameters()).device
-    X = _fq(model.embedding(tokens) + model.positional_encoding(T), qm.s_x0)
+    X = _fq(model.embedding(tokens), qm.s_x0)
     causal = torch.triu(torch.ones(T, T, device=dev) * -1e9, diagonal=1)
 
     for li, layer in enumerate(model.layers):
         s = qm.layers[li]["scales"]
         at = layer.attention
         Q = _fq(at.Wq(X), s["q"])
-        K = _fq(at.Wk(X), s["k"])
-        V = _fq(at.Wv(X), s["v"])
+        # ...then the ternary narrow on top, exactly as int_forward does it.
+        K = _fq(_fq(at.Wk(X), s["k"]), s["kt"], -1, 1)
+        V = _fq(_fq(at.Wv(X), s["v"]), s["vt"], -1, 1)
         Qh = Q.reshape(B, T, kv, g, dh)
         Kh = K.reshape(B, T, kv, dh)
         Vh = V.reshape(B, T, kv, dh)
@@ -892,7 +971,7 @@ def report_clips(rep: Report) -> None:
     L = len(rep.qm.layers)
     print("\nsaturation rate at each requant (fraction of values clipped to +-127):")
     print(f"  {'site':5s} " + " ".join(f"{'L' + str(i):>9s}" for i in range(L)) + f" {'mean':>9s}")
-    for k in ("Q", "K", "V", "A", "O", "XO", "X1", "H", "F", "X2"):
+    for k in ("Q", "K", "KT", "V", "VT", "A", "O", "XO", "X1", "H", "F", "X2"):
         v = rep.clips.get(k)
         if not v:
             continue

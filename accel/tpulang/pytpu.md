@@ -160,7 +160,7 @@ p.cfg(tlen=T, len=ATILE, vlen=..., scalar=SRQW)     # -> setcfg lines
 
 p.matmul(out, act, wgt, acc=False, rq=False)        # .acc / .rq suffixes
 p.vecadd(dst, a, b);  p.vecdot(dst, a, b);  p.relu(dst, a)
-p.requant(dst, a, param);  p.dyt(dst, a, param)
+p.requant(dst, a, param);  p.dyt(dst, a, param);  p.tquant(dst, a, param)
 
 p.rdmem(scratch, dram, t=False)                     # length from cfg 'len';
 p.wrmem(scratch, dram, t=False)                     #   t=True -> .t (transpose)

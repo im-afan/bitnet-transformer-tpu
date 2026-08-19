@@ -71,8 +71,11 @@ class FakeQuant(torch.autograd.Function):
 def dynamic_fake_quant(x, qmin=-128, qmax=127):
     """Per-tensor int8 fake-quant with a scale taken from the current absmax.
 
-    Used for weights the hardware stores as plain int8 (``W_fc``), where the
-    host derives the scale at export time rather than learning it.
+    For weights the hardware stores as plain int8, where the host derives the
+    scale at export time rather than learning it. The ternary configs no longer
+    have any: the output head became a :class:`TernaryLinear` too, so every
+    weight in `adder_ternary_vanilla` is a trit and this path is reached only by
+    the float `adder_vanilla` / `adder_gqa` configs (see `Model.forward`).
     """
     scale = (x.detach().abs().max() / qmax).clamp_min(1e-8)
     return FakeQuant.apply(x, scale, qmin, qmax, 0.0)
@@ -89,12 +92,21 @@ class ActQuant(nn.Module):
     the first tensor that flows through. DyT outputs are pinned to ``1/127``
     instead: ``hardtanh`` bounds them to ``[-1, 1]`` analytically, so no
     calibration set is involved (``adder_kernel.md`` §4).
+
+    ``qmax=1`` makes the site **ternary** rather than int8 — the same symmetric
+    rounding onto ``{-1, 0, 1}`` that ``TernaryLinear`` does to a weight, and
+    the device op is ``tquant`` rather than ``requant``. A ternary site seeds
+    its scale from the **absmean**, not the absmax: with one nonzero level per
+    sign, an absmax seed rounds all but the single largest element to zero and
+    leaves LSQ climbing out of a dead gradient. Absmean is BitNet's rule and
+    the one ``TernaryLinear.forward`` already applies to a weight.
     """
 
-    def __init__(self, qmin=-128, qmax=127, fixed_scale=None):
+    def __init__(self, qmin=-128, qmax=127, fixed_scale=None, init="absmax"):
         super().__init__()
         self.qmin = qmin
         self.qmax = qmax
+        self.init = init
         self.enabled = True
 
         if fixed_scale is None:
@@ -115,8 +127,9 @@ class ActQuant(nn.Module):
         if bool(self.initialized):
             return
         with torch.no_grad():
-            absmax = x.detach().abs().max().clamp_min(1e-8)
-            self.scale.copy_(absmax / self.qmax)
+            a = x.detach().abs()
+            seed = a.mean() if self.init == "absmean" else a.max() / self.qmax
+            self.scale.copy_(seed.clamp_min(1e-8))
             self.initialized.fill_(True)
 
     def forward(self, x):
@@ -132,6 +145,18 @@ class ActQuant(nn.Module):
     def extra_repr(self):
         kind = "learned" if isinstance(self.scale, nn.Parameter) else "pinned"
         return f"qmin={self.qmin}, qmax={self.qmax}, {kind}"
+
+
+def TernaryQuant():
+    """An :class:`ActQuant` that rounds onto ``{-1, 0, 1}`` — the device's ``tquant``.
+
+    Exists so a ternary *activation* site reads as what it is at the call site.
+    A ternary tensor is the operand the MXU takes as a **weight**, so
+    ternarizing K and V is what moves ``Q@K^T`` and ``P@V`` off the VPU's
+    ``vecmatmul`` — which runs one int8 dot product per output element, serially
+    — and onto the systolic array. See ``accel/tpulang/adder_kernel.md`` §2.5.
+    """
+    return ActQuant(qmin=-1, qmax=1, init="absmean")
 
 
 def set_quant_enabled(module, enabled):
@@ -206,12 +231,28 @@ class MultiHeadAttention(nn.Module):
     """Quantization sites, in ``adder_kernel.md`` §4 block order:
 
     ``RQ_Q``/``RQ_K``/``RQ_V`` (separate — each projection has its own absmean),
-    ``RQ_S`` (with ``1/sqrt(head_dim)`` folded in, so quantize *after* the
-    divide), ``RQ_P`` and ``RQ_XO`` are the ``{1,0}`` identities and so share
-    their producer's site, and ``RQ_A``. ``RQ_O`` is pinned to ``s_x`` because
-    ``vecadd`` takes both residual operands at one scale — that is the site the
-    clipping shows up at, so it deliberately keeps the *tight* ``s_x`` rather
-    than widening to cover ``O``.
+    ``RQ_KT``/``RQ_VT`` (the ternary narrows below), ``RQ_S`` (with
+    ``1/sqrt(head_dim)`` folded in, so quantize *after* the divide), ``RQ_P``
+    and ``RQ_XO`` are the ``{1,0}`` identities and so share their producer's
+    site, and ``RQ_A``. ``RQ_O`` is pinned to ``s_x`` because ``vecadd`` takes
+    both residual operands at one scale — that is the site the clipping shows
+    up at, so it deliberately keeps the *tight* ``s_x`` rather than widening to
+    cover ``O``.
+
+    **K and V are ternary, Q and the attention matrix are int8.** The MXU
+    multiplies an int8 activation by a ternary weight, so ternarizing exactly
+    the two tensors that appear on the *weight* side — K in ``Q @ K^T`` and V in
+    ``P @ V`` — is what lets both attention matmuls run on the array instead of
+    on ``vecmatmul``, which issues one serial int8 dot product per output
+    element and dominated the run. Q and P stay int8 because they are the
+    activation operands, which the MXU takes at full int8 either way.
+
+    Both are two narrows, not one, because that is what the device does: the
+    projection's ``matmul_t.rq`` lands int8 (``RQ_K``), and a separate ``tquant``
+    pass rounds that onto ``{-1, 0, 1}`` (``RQ_KT``) into the 2-bit packed layout
+    the array reads. V additionally transposes between the two — the packed
+    weight column of ``P @ V`` is a column of V, and the DMA can only transpose
+    bytes — which is why the int8 stage is not avoidable by fusing.
     """
 
     def __init__(self, d, q_heads, kv_heads, head_dim, x_quant,
@@ -231,9 +272,11 @@ class MultiHeadAttention(nn.Module):
         self.Wv = make_linear(d, kv_heads * self.head_dim, use_ternary, bias=use_bias)
         self.Wo = make_linear(q_heads * self.head_dim, d, use_ternary, bias=use_bias)
 
-        self.q_q = ActQuant()   # RQ_Q
-        self.q_k = ActQuant()   # RQ_K
-        self.q_v = ActQuant()   # RQ_V
+        self.q_q = ActQuant()       # RQ_Q
+        self.q_k = ActQuant()       # RQ_K   int8, straight off the projection
+        self.q_v = ActQuant()       # RQ_V
+        self.q_kt = TernaryQuant()  # RQ_KT  int8 -> {-1,0,1}: the MXU's weight
+        self.q_vt = TernaryQuant()  # RQ_VT
         # RQ_S: calibrated on the scores that *survive* the mask+ReLU, which is
         # what makes RQ_P the {1,0} identity. Learning the scale finds that on
         # its own: clipped-away negatives contribute nothing to the loss.
@@ -248,8 +291,10 @@ class MultiHeadAttention(nn.Module):
         n_tokens = X.shape[1]
 
         Q = self.q_q(self.Wq(X))
-        K = self.q_k(self.Wk(X))
-        V = self.q_v(self.Wv(X))
+        # K and V go int8 -> ternary; the second narrow is the device's `tquant`
+        # and its output is what the MXU reads as a weight.
+        K = self.q_kt(self.q_k(self.Wk(X)))
+        V = self.q_vt(self.q_v(self.Wv(X)))
 
         Q = torch.reshape(
             Q, [batch_size, n_tokens, self.kv_heads, self.heads_per_q, self.head_dim]
@@ -365,8 +410,8 @@ class Model(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, d)
 
-        # The s_x chain. Layer 0 enters from the embedding + positional encoding
-        # and needs a calibrated scale; every later layer enters on the previous
+        # The s_x chain. Layer 0 enters from the embedding and needs a
+        # calibrated scale; every later layer enters on the previous
         # layer's DyT output, which is analytically 1/127, so its s_x *is* that
         # site. Sharing the module is what makes RQ_O / RQ_XO land on s_x.
         self.q_embed = ActQuant()
@@ -387,30 +432,38 @@ class Model(nn.Module):
             blocks.append(block)
             x_quant = block.q_x2
         self.layers = nn.ModuleList(blocks)
-        self.fc = make_linear(self.d, self.vocab_size, bias=use_bias)
+        # The output head is ternary like every other projection. That is what
+        # puts it on the MXU as a `matmul_t`: the array multiplies an int8
+        # activation by a ternary weight, and `X` arriving from DyT at 1/127 is
+        # already the activation operand. It was the last `vecmatmul` in the
+        # shipped kernel — int8 `X` against an int8 `fc.weight`, which only the
+        # VPU can do — so the whole model now runs on the array.
+        self.fc = make_linear(self.d, self.vocab_size, use_ternary, bias=use_bias)
         self.quantize_head = True
         self.dropout = nn.Dropout(p=0.1)
 
-    def positional_encoding(self, n_tokens):
-        device = next(self.parameters()).device
-        div = torch.exp(torch.arange(0, self.d, 2) * math.log(1 / 10000) * 1 / self.d)
-        pos_tensor = torch.arange(n_tokens).unsqueeze(1)
-
-        pe = torch.zeros((1, n_tokens, self.d))
-        pe[:, :, 0::2] = torch.sin(pos_tensor * div)
-        pe[:, :, 1::2] = torch.cos(pos_tensor * div)
-
-        return pe.to(device)
+    # There is no positional encoding. The model's only position signal is the
+    # causal mask: token t attends over t+1 keys, and attention here is ReLU
+    # with no normalization over the source axis, so the *magnitude* of the
+    # attention output carries the count. Removing the sinusoidal PE also
+    # removes the one unbounded contribution to layer 0's input, which is why
+    # `s_x0` is now the embedding's scale alone.
 
     def forward(self, inputs, attn_mask, use_custom_attention=False):
-        pe = self.positional_encoding(inputs.shape[1])
-        X = self.q_embed(self.dropout(self.embedding(inputs) + pe))
+        X = self.q_embed(self.dropout(self.embedding(inputs)))
         for layer in self.layers:
             X = layer(X, attn_mask, use_custom_attention=use_custom_attention)
 
-        # The output head is a plain int8 `vecmatmul` (W_fc [13][128] row-major,
-        # not ternary). Its output scale is irrelevant to an argmax, so the
-        # logits themselves are never requantized.
+        # The head's output scale is irrelevant to an argmax, so the logits are
+        # never requantized: the device spills the raw int32 accumulator.
+        #
+        # A ternary head carries its own weight quantization (TernaryLinear's
+        # absmean + RoundClip), exactly as the projections do, so there is
+        # nothing here for `quantize_head` to switch — it and
+        # `dynamic_fake_quant` now only reach the int8 `nn.Linear` head that a
+        # non-ternary config still gets.
+        if isinstance(self.fc, TernaryLinear):
+            return self.fc(X)
         w = self.fc.weight
         if self.quantize_head:
             w = dynamic_fake_quant(w)

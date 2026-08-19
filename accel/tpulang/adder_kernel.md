@@ -5,21 +5,33 @@ ternary adder model — today two transformer layers and the output head — as
 **one program, one run**. This document is the byte-level contract the host has
 to satisfy to drive it.
 
-> **Status: built and verified, and the model is now int8-quantizable — with
-> quantization-aware training.** The program assembles to 208 words (`LAYERS = 2`,
-> matching `adder_ternary_vanilla`) and runs to completion in the ISS, matching
-> an independent PyTorch implementation byte-for-byte. On the QAT checkpoint
-> `model/saved/ternary_mha.pt` the ISS matches the reference logits exactly and
-> the fully-integer model scores **100.00% exact-sequence / 100.00% token**
-> (§7.6c). That is a training result, not a kernel change: the identical kernel
-> scored 0.00% on the two post-training-quantized checkpoints (§7.6, §7.6b), and
-> those sections' analysis of *why* PTQ fails here still stands.
+> **Status: built and verified against the ISS; awaiting a retrain.** The program
+> assembles to **227 words** (`LAYERS = 2`, matching `adder_ternary_vanilla`) and
+> runs to completion in the ISS, matching an independent PyTorch implementation
+> byte-for-byte on synthetic weights (§7.5).
 >
-> **Not yet run on the board.** `host/run_adder.py` drives the whole
-> per-problem host loop and reproduces the 100.00% against the ISS backend, but
-> no FPGA was attached when it was written (§7.9). The RTL last matched the ISS
-> on the 196-word, four-layer image; that run predates both the `dyt` op and the
-> drop to two layers.
+> **Every matmul in the model is now on the MXU.** K and V are ternary
+> *activations*, so `Q @ K^T` and `P @ V` are `matmul_t` dispatches rather than
+> `vecmatmul` — §2.5. That took one new VPU op (`tquant`), and it changed the
+> requant table from 14 words per layer to 16. Measured through the RTL, the
+> whole model went **541 590 → 366 710 clocks (1.48x)** with 18 048/18 048
+> output bytes still exact. The output head then followed: `Model.fc` is a
+> `TernaryLinear` too (§2.6), so `vecmatmul` has **no caller left in this
+> kernel** and the VPU runs only elementwise passes and narrows. End to end:
+> **541 590 → 366 710 → 351 181 clocks**, 18 432/18 432 output bytes exact.
+>
+> **The accuracy numbers below predate that change and have not been re-measured.**
+> §7.6c's 100.00% exact-sequence is a QAT result for the *previous* architecture
+> (int8 K and V, a positional encoding, `vecmatmul` attention). `ternary_mha.pt`
+> was fitted against those quantizers, so it cannot be exported through this
+> kernel as it stands — the model has to be retrained with `q_kt`/`q_vt` in the
+> graph and the positional encoding gone. Everything §7.6/§7.6b/§7.6c say about
+> *why* PTQ fails here is unaffected.
+>
+> **Not yet run on the board.** `host/run_adder.py` drives the whole per-problem
+> host loop, but no FPGA was attached when it was written (§7.9). The RTL last
+> matched the ISS on the 196-word, four-layer image; that run predates the `dyt`
+> op, the drop to two layers, and `tquant`.
 
 Read [`README.md`](README.md) (the language), [`../tpu/docs/isa.md`](../tpu/docs/isa.md)
 (the target) and [`../tpu/docs/macro_ops.md`](../tpu/docs/macro_ops.md) (the
@@ -40,13 +52,14 @@ so dropout is off.
 
 ```
 for L in 0..1:
-    Q, K, V = Wq(X), Wk(X), Wv(X)            # ternary, no bias
-    S       = Q @ K^T / sqrt(head_dim)       # per head
+    Q, K, V = Wq(X), Wk(X), Wv(X)            # ternary weights, no bias
+    K, V    = trit(K), trit(V)               # ternary ACTIVATIONS - see §2.5
+    S       = Q @ K^T / sqrt(head_dim)       # per head, on the MXU
     P       = relu(S + causal_mask)          # ReLU attention, NOT softmax
-    A       = P @ V                          # [T, 4*32] -> [T, 128]
+    A       = P @ V                          # [T, 4*32] -> [T, 128], on the MXU
     X       = norm1(X + (Wo(A) + X))         # DOUBLE residual, then DyT
     X       = norm2(X + W2(relu(W1(X))))     # feed-forward residual, then DyT
-logits = X @ fc.weight^T                     # fc is int8, not ternary
+logits = X @ fc.weight                       # ternary too, on the MXU
 ```
 
 There is **no LayerNorm** and **no bias** anywhere. `norm1`/`norm2` are `DyT` —
@@ -65,8 +78,14 @@ Two things stay on the host, structurally rather than by convenience:
 
 | Host-side | Why |
 | --- | --- |
-| token embedding + positional encoding | the ISA has no gather. The host produces `X0[T,128] int8`; that is the program's input. |
+| token embedding | the ISA has no gather. The host produces `X0[T,128] int8`; that is the program's input. **There is no positional encoding** — it was removed from `Model.forward`, so the host's whole share of the front end is the lookup. |
 | `argmax` over 13 logits | `redmax` returns the max, not its index. The TPU produces the logits. |
+
+Without a positional encoding the only thing that distinguishes token positions is
+the causal mask: query `t` attends over `t+1` keys, and this attention has **no
+normalization over the source axis**, so the magnitude of `P @ V` carries the count.
+That is a property of ReLU attention specifically; the same removal under softmax
+would leave the model position-blind.
 
 Everything between those two is the TPU's.
 
@@ -160,6 +179,120 @@ That last row is the real payoff. Weights never change, so after one ~9 s
 upload at 115200 baud, each subsequent forward uploads only the 4 KB `X` and
 reads back 1.7 KB of logits — roughly half a second instead of nine.
 
+### §2.5 — Ternary K and V, and why that moved attention onto the array
+
+The MXU multiplies an **int8 activation by a ternary weight**. It cannot multiply
+two int8 tensors at all, so `Q @ K^T` and `P @ V` — activation times activation —
+had to run on the VPU as `vecmatmul`, which sequences one `DOT` per output element.
+For `T = 32`, four heads, two layers that is 8×1024 dot products of length 32 and
+8×1024 of length 32 per forward, all serial through one 16-lane unit, and it was
+the slowest thing in the program.
+
+The fix is not a bigger VPU. It is to notice **which operand lands on the weight
+side**: `K` in `Q @ K^T`, `V` in `P @ V`. Quantize just those two to `{-1, 0, 1}`
+and both matmuls become legal `matmul_t` dispatches, with Q and the attention
+matrix `P` staying int8 as the activation operands — which is what the array wants
+anyway. `model/transformer.py` does that with two `TernaryQuant` sites (`q_kt`,
+`q_vt`) present during training, so the weights are fitted against the ternary
+grid rather than having it imposed afterwards.
+
+| | before | after |
+| --- | --- | --- |
+| `Q @ K^T` | `vecmatmul` + 2 `requant` | one `matmul_t.rq` |
+| `P @ V` | `vecmatmul` + 2 `requant` + a `.t` spill per head, then a DRAM round trip | one `matmul_t.rq`, writing A's column block in place |
+| VPU work in attention | both matmuls + 12 elementwise passes per head | 8 elementwise passes per head |
+| `vecmatmul` callers | attention (×2 per head per layer) and the output head | **the output head only** — and then §2.6 took that too, leaving none |
+| whole model, `tpu_top_tb` | 541 590 clocks | **366 710 clocks — 1.48x** |
+
+The RTL run splits as `mxu = 201 756`, `dma = 118 296`, `vpu = 43 137` clocks
+(overlapping; `swait = 363 211` is the scalar unit blocked on a dispatch). The VPU
+is now the *smallest* of the three. Note what moved and what did not: the MXU took
+on 128 extra tile passes per layer and the DMA lost `A`'s round trip through DRAM,
+but the saving is essentially all VPU — `vecmatmul` was 8 blocks of 1024 serial
+dot products per layer.
+
+**One new instruction, `tquant`** (`0x22`, `VOP_TQUANT`): `requant`'s fixed point
+clipped to ±1, with the result written 2 bits wide in the array's own weight
+encoding, four elements to a byte. It is the only VPU op that reads int8 and writes
+*narrower* than int8. Writing the packed encoding rather than a signed trit is the
+whole design: the destination is directly addressable as a `matmul_t` weight block,
+so there is no repacking pass and nothing goes back to the host.
+
+Two layout facts follow, and they are why this costs so little:
+
+- **K needs no transpose.** Packed row-major, K's row `t` is `WCOL = 32` contiguous
+  bytes of trits — and column `t` of `K^T` is exactly that. Head `h` is the byte
+  offset `h·DH·2/8 = 8` into every row. So the transpose that `vecmatmul` used to
+  get from its loop order is now free from the layout.
+- **V does need one, and it has to happen in int8.** `P @ V` contracts over keys,
+  which is V's *row* axis, so the array's weight column is a column of V. The only
+  thing on the device that reorders anything is the DMA's `.t` mode, and it moves
+  **bytes** — so V goes `matmul_t.rq → int8 → wrmem.t → rdmem → tquant`, and its
+  int8 stage is not avoidable by fusing. K goes through int8 too, for symmetry and
+  because `tquant` reads int8 by construction.
+
+That is why the table in §4 has *two* words for each of K and V: `RQ_K`/`RQ_V` land
+the projection in int8, and `RQ_KT`/`RQ_VT` round that onto the ternary grid.
+
+The projections also stopped writing into one fused `[T][3D]` buffer. `tquant` reads
+a contiguous vector, so an interleaved K would have to be de-interleaved first; the
+column stride that used to be free is now the thing in the way. The three land in
+three `[T][D]` buffers instead — the same 12 KB, and the *weights* are still one
+fused `rdmem`.
+
+### §2.6 — The ternary output head, and the padding it forces
+
+`Model.fc` used to be the one `make_linear` call that never passed
+`use_ternary`, so the head was an `nn.Linear` — int8 weights, and therefore the
+VPU's `vecmatmul`, because the array cannot multiply int8 by int8. Once §2.5 had
+taken attention off `vecmatmul`, that head was its only remaining caller in the
+whole program. Making it ternary moves it to `matmul_t` on exactly the geometry
+the projections already use, and leaves the VPU running no matmul at all.
+
+`TernaryLinear.w` is `[in, out] = [128][13]`, which is already the column-major
+orientation the array packs a weight in — the same accident that made
+`nn.Linear`'s `[out, in]` convenient for `vecmatmul`, one layout over. So nothing
+is transposed, and the weight block shrinks from **1664 bytes to 512**.
+
+**One thing does not come free: the output width.** The array stores a whole
+`COLS`-wide tile at a time, so a 13-column head is two tiles and the second one
+writes columns 8..15. With a 13-word row stride, columns 13..15 of token `t`
+land on columns 0..2 of token `t+1` — and `n` is the *outer* loop, so the second
+tile would overwrite the first tile's work for every row but the last. The
+kernel therefore rounds the head's output up to a whole tile:
+
+```
+.equ VPAD  (VOCAB + COLS - 1) // COLS * COLS      ; 16
+```
+
+The host stages the three columns above `VOCAB` as **zero trits** and reads 13
+of every 16 int32 words back. It costs 96 bytes of weight and 384 bytes of logit
+block, and it makes the row stride a whole tile so the two output tiles cannot
+collide. `read_logits`, `run_adder.py`'s readback and `torch_ref` all take the
+row stride from `VPAD` and the column count from `VOCAB`; those are now
+different numbers and conflating them is the obvious way to get a plausible
+wrong answer.
+
+`gen_vectors` deliberately puts **live** trits in the padding columns, unlike the
+real host. With zeros there, a kernel that strided its second output tile wrongly
+could still match the reference, because both would be comparing zeros.
+
+Measured through the RTL, the head alone is worth **366 710 → 351 181 clocks**:
+
+| | ternary K/V, int8 head | + ternary head |
+| --- | --- | --- |
+| whole model | 366 710 clocks | **351 181** |
+| `vpu` | 43 137 | **26 080** |
+| `mxu` | 201 756 | 203 677 |
+| `W_fc` in DRAM | 1664 B | **512 B** |
+| logit block | 1664 B | 2048 B (padded) |
+
+The VPU's share fell by 17 057 clocks and the MXU's rose by 1 921 — a `T×128 @
+128×16` on the array costs about a fortieth of what the same product cost as
+`vrows × vcols` serial dot products. It is a smaller absolute win than §2.5's
+because it is one matmul rather than sixteen, but it is the one that empties the
+unit: the VPU is now 7.4% of the run.
+
 ### Versus `tpunn.md`
 
 | | `tpunn.md` (pre-macro-op) | here |
@@ -192,8 +325,8 @@ above and are reached through the `wl` base register.
 | `0x1000` | 1024 | causal mask `[32][32]` int8 | host |
 | `0x1400` | 4096 | `A` `[32][128]` int8 — scratch | device |
 | `0x2400` | 4096 | `V^T` `[128][32]` int8 — scratch | device |
-| `0x3400` | 1664 | `W_fc` `[13][128]` int8 | host |
-| `0x3C00` | 1664 | logits `[32][13]` **int32** — **the result** | device |
+| `0x3400` | 512 | `W_fc` `[128][16]` trits, col-major 2-bit (13 real + 3 zero) | host |
+| `0x3C00` | 2048 | logits `[32][16]` **int32** — **the result**, 13 columns used | device |
 | `0x5000 + L*0x7400` | 29696 | layer `L`'s block, below | |
 
 Inside layer `L`'s block:
@@ -204,7 +337,7 @@ Inside layer `L`'s block:
 | `+0x3000` | 4096 | `Wo` `[128][128]` trits |
 | `+0x4000` | 4096 | `W1` `[128][128]` trits |
 | `+0x5000` | 4096 | `W2` `[128][128]` trits |
-| `+0x6000` | 56 | this layer's 14 requant `{m0,n}` words |
+| `+0x6000` | 64 | this layer's 16 requant `{m0,n}` words |
 | `+0x6400` | 4096 | `X` after this layer — a **checkpoint**, device-written |
 
 The requant words live inside the layer block so the program can reload them
@@ -213,12 +346,23 @@ into one fixed scratchpad slot each iteration, which keeps every
 per-layer `X` spill is for verification (§7), not a data path — `X` itself
 stays in the scratchpad the whole run.
 
-### Scratchpad (64 KB; top byte `0xC837`)
+### Scratchpad (64 KB; top byte `0xCC3F`)
 
-A 12 KB weight window (refilled four times per layer), the 12 KB fused QKV
-block, and small fixed buffers — 51 KB of 64, laid out in the program's `.equ`
-block. The window is sized by the largest single fill (`[Wq|Wk|Wv]`), which is
-why the three projections share one `rdmem`.
+A 12 KB weight window (refilled four times per layer), 12 KB of Q/K/V, and small
+fixed buffers — 52 KB of 64, laid out in the program's `.equ` block. The window is
+sized by the largest single fill (`[Wq|Wk|Wv]`), which is why the three projections
+share one `rdmem`.
+
+Two of the small buffers are new and are the ones worth knowing:
+
+| Addr | Bytes | Tensor |
+| --- | --- | --- |
+| `0xC000` | 1024 | `KTP` — K as packed trits, `[32][128]`, 32 bytes per row. Row `t` *is* weight column `t` of `K^T`; head `h` is the byte offset `8h` into each row. |
+| `0xC400` | 1024 | `VTP` — `V^T` as packed trits, `[128][32]`, 8 bytes per row. Head `h` starts at `256h`. |
+
+Both are `T·D·2/8 = 1024` bytes, i.e. a quarter of the int8 tensor they came from —
+which is also the ratio by which a `tquant` pass's destination pointer advances
+relative to its source.
 
 ---
 
@@ -236,7 +380,7 @@ Ternary weights are already `trit · absmean` in the checkpoint
 (`TernaryLinear.forward`: `RoundClip(w/scale) * w.abs().mean()`), so `absmean`
 is never a tensor — it is just a factor in the following requant's `m`.
 
-### The 14 words, per layer, in block order
+### The 16 words, per layer, in block order
 
 `a_M` is matrix `M`'s `absmean`; `s_T` is tensor `T`'s scale. `α1`/`α2` are the
 two `DyT` layers' learned scalars.
@@ -245,20 +389,26 @@ two `DyT` layers' learned scalars.
 | --- | --- | --- | --- |
 | 0 | `RQ_Q` | `X @ Wq → Q` | `s_x · a_q / s_q` |
 | 1 | `RQ_K` | `X @ Wk → K` | `s_x · a_k / s_k` |
-| 2 | `RQ_V` | `X @ Wv → V` | `s_x · a_v / s_v` |
-| 3 | `RQ_S` | `Q@K^T int32 → S8` | `s_q · s_k / (sqrt(32) · s_s)` |
-| 4 | `RQ_ID` | mask clamp | **`{m0=1, n=0}`** |
-| 5 | `RQ_P` | `relu(S8) → P8` | `s_s / s_p` — **`{1,0}`** is natural |
-| 6 | `RQ_A` | `P@V int32 → A8` | `s_p · s_v / s_a` |
-| 7 | `RQ_O` | `A8 @ Wo → O` | `s_a · a_o / s_x` ← **must land on `s_x`** |
-| 8 | `RQ_XO` | `X + O → XO` | **`{1,0}`** ← stays on `s_x` for the second add |
-| 9 | `RQ_X1` | `dyt(XO + X) → X1` | `s_x · α1 / s_x1` |
-| 10 | `RQ_H` | `X1 @ W1 → H` | `s_x1 · a_1 / s_h` |
-| 11 | `RQ_HR` | `relu(H) → HR` | `s_h / s_hr` — **`{1,0}`** is natural |
-| 12 | `RQ_F` | `HR @ W2 → F` | `s_hr · a_2 / s_x1` ← **must land on `s_x1`** |
-| 13 | `RQ_X2` | `dyt(X1 + F) → X2` | `s_x1 · α2 / s_x2` |
+| 2 | `RQ_KT` | `tquant(K) → trits` | `s_k / s_kt` |
+| 3 | `RQ_V` | `X @ Wv → V` | `s_x · a_v / s_v` |
+| 4 | `RQ_VT` | `tquant(V^T) → trits` | `s_v / s_vt` |
+| 5 | `RQ_S` | `Q@K^T int32 → S8` | `s_q · s_kt / (sqrt(32) · s_s)` |
+| 6 | `RQ_ID` | mask clamp | **`{m0=1, n=0}`** |
+| 7 | `RQ_P` | `relu(S8) → P8` | `s_s / s_p` — **`{1,0}`** is natural |
+| 8 | `RQ_A` | `P@V int32 → A8` | `s_p · s_vt / s_a` |
+| 9 | `RQ_O` | `A8 @ Wo → O` | `s_a · a_o / s_x` ← **must land on `s_x`** |
+| 10 | `RQ_XO` | `X + O → XO` | **`{1,0}`** ← stays on `s_x` for the second add |
+| 11 | `RQ_X1` | `dyt(XO + X) → X1` | `s_x · α1 / s_x1` |
+| 12 | `RQ_H` | `X1 @ W1 → H` | `s_x1 · a_1 / s_h` |
+| 13 | `RQ_HR` | `relu(H) → HR` | `s_h / s_hr` — **`{1,0}`** is natural |
+| 14 | `RQ_F` | `HR @ W2 → F` | `s_hr · a_2 / s_x1` ← **must land on `s_x1`** |
+| 15 | `RQ_X2` | `dyt(X1 + F) → X2` | `s_x1 · α2 / s_x2` |
 
-Six constraints, stated flat because they are where a plausible host will get
+`RQ_KT` and `RQ_VT` are consumed by `tquant`, not `requant`; `RQ_X1` and `RQ_X2` by
+`dyt`. The word format is identical in all three cases, so DRAM staging does not
+care which op reads which slot — only the clip differs (`±1`, `±127`, `±128`).
+
+Seven constraints, stated flat because they are where a plausible host will get
 it wrong:
 
 - **`vecadd` adds int8 operands, so a residual add is only meaningful if both
@@ -280,6 +430,13 @@ it wrong:
   1]` by construction, so every layer after the first enters at `1/127` with no
   calibration set involved.
 - **`1/sqrt(head_dim)` is not an op.** It folds into `RQ_S`.
+- **After `RQ_KT`/`RQ_VT` the attention scales are `s_kt` and `s_vt`, not `s_k`
+  and `s_v`.** That is the one place a plausible host will carry the wrong scale
+  forward: `RQ_S` and `RQ_A` consume the *ternary* scale, and it is typically
+  20–30× the int8 one, because a ternary grid has one level per sign. A ternary
+  site's calibrated scale is its tensor's **absmean**, not `absmax/127` —
+  `absmax` with `qmax = 1` would round every element but the largest to zero.
+  That is BitNet's rule and the one `TernaryLinear` already applies to a weight.
 - **Q, K and V get separate requant words** even though they come from one
   weight block, because each has its own `absmean`. Fusing them into a single
   48-tile `matmul_t` would force one multiplier on all three; three 16-tile
@@ -308,7 +465,7 @@ track the model as it changes, and the two copies that existed before this
 (one here, one next to the model) had already drifted apart on the double
 residual.
 
-Two of the fourteen are not the obvious thing, and both were found by measuring
+Two of the sixteen are not the obvious thing, and both were found by measuring
 rather than by deriving:
 
 - **`s_s` is calibrated on the scores that survive, not on the widest score.**
@@ -343,10 +500,11 @@ In the fused block, columns `0..127` are `Wq`, `128..255` `Wk`, `256..383` `Wv`.
 
 **Causal mask** `[32][32]` int8 row-major: `0` where `s <= t`, `-128` above.
 
-**Activations** `[T][D]` int8 row-major. **`W_fc`** `[13][128]` int8 row-major
-— `nn.Linear` already stores `[out, in]`, exactly the layout `vecmatmul`
-contracts over. Its quantization scale is irrelevant to an argmax, so any
-per-tensor `absmax/127` will do.
+**Activations** `[T][D]` int8 row-major. **`W_fc`** `[128][16]` trits in the
+same column-major 2-bit layout as every other weight — `TernaryLinear` already
+stores `[in, out]`, exactly what the array packs. Columns 13..15 are the padding
+§2.6 explains and are staged as zeros. Its absmean is irrelevant to an argmax,
+so unlike every other weight it never appears in a requant word at all.
 
 ---
 
@@ -360,15 +518,15 @@ part:
 for L in range(4):
     base = 0x5000 + L * 0x7400
     dram[base + 0x0000 : base + 0x6000] = pack_ternary(model.layers[L])   # 24 KB
-    dram[base + 0x6000 : base + 0x6034] = requant_words(L)                # 13 int32
+    dram[base + 0x6000 : base + 0x6040] = requant_words(L)                # 16 int32
 dram[0x1000:0x1400] = causal_mask
-dram[0x3400:0x3A80] = quantize_i8(model.fc.weight)
+dram[0x3400:0x3600] = pack_ternary(model.fc, pad_to=16)   # §2.6
 load_program(adder_model_words)
 
 # ---- per input -----------------------------------------------------------
-dram[0x0000:0x1000] = quantize(embed(tokens) + positional_encoding(T), s_x[0])
+dram[0x0000:0x1000] = quantize(embed(tokens), s_x[0])       # no PE any more
 run()
-logits = int32_at(dram, 0x3C00, (32, 13))
+logits = int32_at(dram, 0x3C00, (32, 16))[:, :13]     # VPAD stride, VOCAB cols
 answer = logits[EQUALS_POS + 1:].argmax(-1)          # host
 ```
 
@@ -385,21 +543,32 @@ whole answer.
 
 ## 6. Costs — measured
 
-**Instructions: 196 words of 1024** (`python assembler.py examples/adder_model.tpu`).
+**Instructions: 227 words of 1024** (`python assembler.py examples/adder_model.tpu`).
 IMEM has stopped being a constraint, and so has DRAM.
 
-**Arithmetic per layer.** 1536 MXU tile passes (3×256 for the projections, 256
-each for `Wo`/`W1`/`W2`) ≈ 3.1 M MACs, plus 8 `vecmatmul` blocks ≈ 0.26 M.
+**Arithmetic per layer.** 1536 MXU tile passes for the D-deep matmuls (3×256 for
+the projections, 256 each for `Wo`/`W1`/`W2`) ≈ 3.1 M MACs, plus **128 more for
+attention** (4 heads × 16 tiles for `Q@K^T` and 16 for `P@V`) ≈ 0.26 M — the work
+that used to be 8 serial `vecmatmul` blocks on the VPU. The VPU's remaining share
+of a layer is 16 `tquant` passes, 32 elementwise attention passes and the two
+residual loops. The output head adds 32 tile passes once (`KTD × NTV` = 16 × 2).
+
+**Clocks, measured through the RTL** (`tpu_top_tb`, §7.7): **351 181** for the whole
+two-layer model, 3.51 ms at 100 MHz. `mxu = 203 677`, `dma = 117 906`,
+`vpu = 26 080` — the VPU is 7.4% of the run and issues no matmul at all.
 
 **ISS: a full four-layer forward plus the PyTorch reference and the byte
 comparison takes ~19 s.** That is far better than the "minutes" estimated
 before it was run, and it means leg-B verification is an edit-run loop rather
 than a batch job. The numpy contingency for `iss._matmul` is not needed.
 
-**Staging.** 105 296 bytes in (weights dominate), 26 240 bytes of device output
-— the four per-layer `X` checkpoints, the final `V^T` and `A`, and the logits.
-On the board that is a one-time ~9 s upload at 115200, then 4 KB in and 1.7 KB
-out per forward (~0.5 s), since the weights are read-only and stay resident.
+**Staging.** 54 912 bytes in — 24 640 per layer (12 KB of `[Wq|Wk|Wv]`, 4 KB
+each for `Wo`/`W1`/`W2`, 64 bytes of requant words), 512 for the ternary head,
+1024 for the mask and 4096 for `X0`. 18 432 bytes of device output: the two
+per-layer `X` checkpoints, the final `V^T` and `A`, and the `[32][16]` logit
+block. On the board that is a one-time ~4.5 s upload at 115200 of the 50 816
+constant bytes, then 4 KB in and 2 KB out per forward, since the weights are
+read-only and stay resident.
 
 ---
 
@@ -413,21 +582,31 @@ a real checkpoint rather than synthetic weights.
 | 1 | `python torch_ref.py` — every example vs PyTorch | **7/7 pass**, exact |
 | 2 | `tb/` RTL suite, 13 testbenches | **12 pass**; `uart_transmitter_tb` is a pre-existing no-op (its whole body is commented out) |
 | 3 | `make cosim` — host driver vs RTL over a simulated UART | **11/11 pass** |
-| 4 | `assembler.py examples/adder_model.tpu` | **208 words** of 1024 (`layers=2`) |
-| 5 | Full model, ISS vs PyTorch, exact | **0 of 16 800 elements differ** — 2 layer checkpoints (4096 int8 each), `V^T`, `A`, and 416 int32 logits |
+| 4 | `assembler.py examples/adder_model.tpu` | **227 words** of 1024 (`layers=2`, ternary K/V) |
+| 5 | Full model, ISS vs PyTorch, exact | **0 of 16 896 elements differ** — 2 layer checkpoints (4096 int8 each), `V^T`, `A`, and 512 int32 logits (`[32][16]`, the padded head). `torch_ref.adder_model` ternarizes K, V *and* `fc` itself, from the same words |
 | 6 | `highmem_dma` + `vpu_matmul` through the RTL over the UART (`make uart`) | **5446 checks, 0 errors** — this is what covers the widened address and the `0x8000` case in hardware |
-| 7 | Full model through the RTL (`tpu_top_tb`, backdoor DRAM) | **18 048 checks, 0 errors** — halts at pc=207 after 541 590 clocks (5.42 ms at 100 MHz). Re-measured 2026-08-17 against freshly regenerated vectors, which came out byte-identical to the committed `tb/vectors_model/`; the earlier 26 240 / pc=195 reading was a different revision of the program |
-| 8 | Real checkpoint, ISS vs the reference (`adder_export.py --iss-check`) | **0/416 logits differ** |
-| 9 | Real-checkpoint task accuracy | int8 **100.00%** exact-sequence on the QAT `layers=2` checkpoint — §7.6c |
-| 10 | Real checkpoint through the host loop, per problem (`host/run_adder.py --dry-run`) | **100.00%** over 32 problems, identical to `quant.int_forward` |
+| 7 | Full model through the RTL (`tpu_top_tb`, backdoor DRAM) | **18 432 checks, 0 errors** — halts at pc=225 after **351 181 clocks** (3.51 ms at 100 MHz), on the 226-word ternary-head image (2026-08-19). `mxu = 203 677`, `dma = 117 906`, `vpu = 26 080` |
+| 7b | `tquant` at the unit level (`make TEST=vpu`) | **318 checks, 0 errors** — three streaming lengths plus `TQUANT-pack`, which pins the 2-bit encoding and bit order against a hand-written byte rather than against a reference that could share a misreading |
+| 8 | Real checkpoint, ISS vs the reference (`adder_export.py --iss-check`) | **0/416 logits differ** — on the pre-ternary-K/V architecture; needs a retrained checkpoint to repeat |
+| 9 | Real-checkpoint task accuracy | int8 **100.00%** exact-sequence on the QAT `layers=2` checkpoint — §7.6c, same caveat |
+| 10 | Real checkpoint through the host loop, per problem (`host/run_adder.py --dry-run`) | **100.00%** over 32 problems, identical to `quant.int_forward` — same caveat |
+
+**Rows 8–10 describe the previous architecture.** `model/saved/ternary_mha.pt` was
+fitted with int8 K and V, a positional encoding and `vecmatmul` attention; its
+`q_kt`/`q_vt` sites do not exist, so `QATCalibration` falls back to the calibration
+set for those two scales and the weights were never fitted against a ternary K.
+Repeating rows 8–10 needs `python -m model.train --arch ternary_vanilla` on the
+current model first.
 
 **§7.7 is a long simulation**, though less long than it was. At `layers=2` the model
 moves ~96 KB through the DMA, plus the MXU/VPU work. That was 2.36 M clocks (at
 `layers=4`) and 1.23 M at `layers=2`, both at ~8-9 clocks/byte; since
 `sram.sv` became a range engine and the DMA a stream client
 (`accel/tpu/docs/dma.md` §7) the memory runs at 1 clock/byte on fills and 2 on
-spills, and the same program halts in **541 590 clocks, 5.42 ms at 100 MHz** —
-byte-identical output, `2.27x` fewer clocks. Still long enough in Icarus to need
+spills, and the same program halted in **541 590 clocks, 5.42 ms at 100 MHz** —
+byte-identical output, `2.27x` fewer clocks. Moving attention onto the array (§2.5)
+took it to **366 710 clocks, 3.67 ms**, a further `1.48x`, and the ternary output
+head (§2.6) to **351 181 clocks, 3.51 ms**. Still long enough in Icarus to need
 the watchdog raised (`-DWATCHDOG_NS`) and the waveform dump off (`-DNO_VCD`;
 without it the run writes hundreds of MB of VCD before the old 2 ms watchdog even
 fires). Both are options on `tpu_top_tb.sv`, defaults unchanged:
@@ -461,12 +640,13 @@ rather than synthetic weights.
 
 **§7.5 is the leg that matters**, and it is genuinely independent: `torch_ref
 .adder_model` is written from `model/transformer.py`, not from the kernel's
-instruction order. Where the kernel is clever, the reference is not — it
-computes `A` the obvious way and transposes, rather than reproducing the
-operand swap that lets one `.t` DMA scatter each head; and it applies the mask
-as the same two operations the kernel claims are equivalent to
-`relu(S + -1e9)`, so the claim is tested rather than assumed. The two share the
-DRAM layout (read from the program's own `.equ` table) and nothing else.
+instruction order. Where the kernel is clever, the reference is not — it writes
+`K^T` as a literal `.t()` rather than relying on a packed row being a weight
+column, it ternarizes V *before* transposing where the kernel must do it after,
+and it applies the mask as the same two operations the kernel claims are
+equivalent to `relu(S + -1e9)`, so each claim is tested rather than assumed. The
+two share the DRAM layout (read from the program's own `.equ` table) and nothing
+else.
 
 **The comparison is not vacuous.** With the synthetic operands in
 `gen_vectors.ADDER_RQ`, the four layer checkpoints use 43–124 distinct int8
@@ -474,6 +654,12 @@ values each at **0% saturation**, `V^T` and `A` cover 246 and 226 distinct
 values with 2% and 16% saturation (so the requant clip path is exercised
 without dominating), and the logits take 350 distinct int32 values. Getting
 there took tuning — see §8.6, which is a finding in its own right.
+
+`RQ_KT`/`RQ_VT` need the same care and for a sharper reason: a ternary word that
+is too large makes every trit `±1` and one that is too small makes every trit `0`,
+and *either* would let the kernel and the reference agree while computing nothing.
+The shipped words put the threshold at `|K8| ≥ 8`, which leaves **65% of the trits
+nonzero and the two signs balanced** (1204 `-1`, 1445 `0`, 1447 `+1` for K).
 
 ### §7.6 — the real checkpoint: the kernel is correct, the model is not quantizable
 
@@ -608,7 +794,7 @@ LSQ ([arxiv 1902.08153](https://arxiv.org/abs/1902.08153)):
 | float, quantizers removed | 0.00% | 29.37% |
 | int8 activations, this kernel | **100.00%** | **100.00%** |
 
-**The ISS cross-check passed: 0 of 416 logits differ.** 208 words, `LAYERS = 2`.
+**The ISS cross-check passed: 0 of 416 logits differ.** 208 words, `LAYERS = 2` (the program was 208 words at the time; it is 227 now — §2.5).
 
 Two things about that table need saying, because read casually it looks like a
 transcription error.
@@ -647,8 +833,11 @@ remain correct about PTQ on those checkpoints, and the `vecadd`-single-scale
 constraint they blame is still real and is still what forces `RQ_O` to be pinned.
 What changed is that training through the constraint is a third remedy, and
 unlike the two §7.6b lists (retrain with the addend bounded; give `vecadd` a
-per-operand shift) it needs no VPU change at all. The kernel is byte-identical to
-the one that scored 0.00%.
+per-operand shift) it needs no VPU change at all. At the time, the kernel was
+byte-identical to the one that scored 0.00%. (It no longer is: §2.5 moved the
+attention matmuls onto the array, which is a performance change and invalidates
+this section's *numbers* — a checkpoint fitted against `vecmatmul` attention with
+int8 K and V is not the model this kernel now runs. The argument stands.)
 
 **Where the scales come from now.** `model/quant.py` grew a `QATCalibration`
 that reads the learned `ActQuant.scale` instead of taking an absmax over a
@@ -669,9 +858,9 @@ model through a PTQ calibration path silently discards half of it.
 
 `host/run_adder.py` is the script that scores a real checkpoint one problem at a
 time through the actual host protocol, rather than benchmarking the integer model
-in-process. Weights, mask, `fc` and the requant words (51 952 bytes) are staged
+in-process. Weights, mask, `fc` and the requant words (50 816 bytes) are staged
 once; each problem then writes only `D_XIN` (4096 B) and reads back `D_LOG`
-(1664 B). Staging is `adder_export.stage_dram`, shared with §7.8, so the
+(2048 B — `VPAD` words a row, of which the host uses `VOCAB`). Staging is `adder_export.stage_dram`, shared with §7.8, so the
 simulated and board paths cannot drift apart the way the pipeline has twice
 before.
 

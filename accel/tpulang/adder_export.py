@@ -19,9 +19,10 @@ the same statement.
 Three stages:
 
   1. **prepare**  — `model/quant.py` calibrates on a set disjoint from the
-     evaluation set and derives the 14 `{m0,n}` words per layer (§4 of the doc).
-     Two of the fourteen are consumed by `dyt` rather than `requant`; the word
-     format is identical, so DRAM staging does not care which.
+     evaluation set and derives the 16 `{m0,n}` words per layer (§4 of the doc).
+     Four of the sixteen are consumed by an op other than `requant` — two `dyt`
+     and two `tquant` — but the word format is identical, so DRAM staging does
+     not care which.
   2. **evaluate** — float baseline vs the integer pipeline over N problems,
      plus the saturation rates §8 says are the diagnostic.
   3. **iss-check** — pack one real problem into the kernel's DRAM layout, run
@@ -77,11 +78,13 @@ def load_model(path: str = CKPT) -> transformer.Model:
 def stage_dram(tpu, consts: dict, qm: quant.QuantModel, X0: torch.Tensor) -> None:
     """Write everything `examples/adder_model.tpu` reads into `tpu.dram`.
 
-    `X0` is one `[T, D]` int8 sequence — the host's embedding + positional
-    encoding, already at layer 0's input scale. Addresses come from the
-    program's own `.equ` table, so a layout change moves both sides at once.
+    `X0` is one `[T, D]` int8 sequence — the host's embedding lookup, already at
+    layer 0's input scale. (There is no positional encoding to add any more.)
+    Addresses come from the program's own `.equ` table, so a layout change moves
+    both sides at once.
     """
     D, VOCAB, WCOL = consts["D"], consts["VOCAB"], consts["WCOL"]
+    VPAD = consts["VPAD"]
 
     def put(addr: int, byte: int) -> None:
         tpu.dram[tpu._d(addr)] = byte & 0xFF
@@ -91,14 +94,6 @@ def stage_dram(tpu, consts: dict, qm: quant.QuantModel, X0: torch.Tensor) -> Non
             put(consts["D_XIN"] + t * D + d, int(X0[t, d]))
         for s in range(T):
             put(consts["D_MASK"] + t * T + s, int(qm.mask[t, s]))
-
-    # `Model.fc` is a plain nn.Linear, so the device runs it on the VPU with
-    # int8 weights. quant.QLinear holds every weight as [in, out]; the kernel's
-    # vecmatmul contracts src1 over its own rows, so it wants [VOCAB][D].
-    wfc = qm.fc.w.t().contiguous()
-    for v in range(VOCAB):
-        for d in range(D):
-            put(consts["D_WFC"] + v * D + d, int(wfc[v, d]))
 
     def pack(base: int, tmat: torch.Tensor) -> None:
         """[K][N] trits -> column-major 2-bit packed (00=0, 01=+1, 11=-1)."""
@@ -110,6 +105,16 @@ def stage_dram(tpu, consts: dict, qm: quant.QuantModel, X0: torch.Tensor) -> Non
                 colint |= (0 if t == 0 else (1 if t > 0 else 0b11)) << (2 * k)
             for b in range(WCOL):
                 put(base + n * WCOL + b, (colint >> (8 * b)) & 0xFF)
+
+    # `Model.fc` is a TernaryLinear now, so the head is an MXU weight like every
+    # other projection rather than the int8 `vecmatmul` operand it used to be.
+    # `QLinear.w` is already [in, out] = [D][VOCAB], which is what `pack` wants.
+    # The columns above VOCAB are the padding the array's whole-tile store needs
+    # (the program's section 8) and are staged as zero trits, so they contribute
+    # nothing to any logit the host reads.
+    wfc = torch.zeros((D, VPAD), dtype=qm.fc.w.dtype)
+    wfc[:, :VOCAB] = qm.fc.w
+    pack(consts["D_WFC"], wfc)
 
     for li, lay in enumerate(qm.layers):
         base = consts["D_L0"] + li * consts["LSTRIDE"]
@@ -127,12 +132,18 @@ def stage_dram(tpu, consts: dict, qm: quant.QuantModel, X0: torch.Tensor) -> Non
 
 
 def read_logits(tpu, consts: dict, vocab: int) -> torch.Tensor:
-    """The kernel's result: `[T, VOCAB]` int32, little-endian, from D_LOG."""
+    """The kernel's result: `[T, VOCAB]` int32, little-endian, from D_LOG.
+
+    The device writes `VPAD` (= VOCAB rounded up to the array's output tile)
+    words per row, so the row stride is not `vocab` — the last few columns of
+    each row are the zero-weight padding and are skipped here.
+    """
+    vpad = consts["VPAD"]
     out = []
     for t in range(T):
         row = []
         for v in range(vocab):
-            a = consts["D_LOG"] + t * (vocab * 4) + v * 4
+            a = consts["D_LOG"] + t * (vpad * 4) + v * 4
             u = sum(tpu.dram[tpu._d(a + b)] << (8 * b) for b in range(4))
             row.append(u - (1 << 32) if u >= (1 << 31) else u)
         out.append(row)

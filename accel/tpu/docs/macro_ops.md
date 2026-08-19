@@ -302,9 +302,20 @@ distorting the instruction format for.
 
 ### 5.3 `vecmatmul dst, src0, src1`
 
+> **Superseded for attention.** `vecmatmul` was built because the MXU is
+> **ternary-weight × int8-activation** (`mxu.sv` header) and attention's `Q@K^T` and
+> `P@V` are activation × activation, so they could not touch the array at all. The
+> shipped kernel no longer issues it for either: K and V are now ternary
+> *activations*, so both are `matmul_t` dispatches
+> (`accel/tpulang/adder_kernel.md` §2.5). Nor does anything else — the output head
+> was its last caller, and `Model.fc` became a `TernaryLinear` too (§2.6), so the
+> whole model runs on the array. The op remains for the model shape that needs an
+> int8 × int8 matmul. Everything below still describes it correctly; only "attention
+> runs here" has stopped being true.
+
 The MXU is **ternary-weight × int8-activation** (`mxu.sv` header). Attention's `Q@K^T` and
-`P@V` are activation × activation, so they cannot touch the MXU at all — which is why
-`vpu_matmul.tpu` exists and is 129 lines. This is the single biggest instruction-count
+`P@V` were activation × activation, so they could not touch the MXU at all — which is why
+`vpu_matmul.tpu` exists and is 129 lines. This was the single biggest instruction-count
 item in a layer and the CISC matmul of §4 does nothing for it.
 
 `vecmatmul` wraps the existing `VOP_DOT` datapath in a two-level counter:

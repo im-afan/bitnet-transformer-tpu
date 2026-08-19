@@ -335,7 +335,7 @@ class Program:
 # p.loop), `li`/`setcfg` (use p.const/p.cfg), `cmps` (no run-time `if` in v1),
 # `wrneigh` (LINK is a no-op in RTL).
 _OPS = {
-    "vecdot": 3, "vecadd": 3, "requant": 3, "dyt": 3,
+    "vecdot": 3, "vecadd": 3, "requant": 3, "dyt": 3, "tquant": 3,
     "relu": 2,
     "stores": 2,
 }   # rdmem/wrmem are hand-written above: they carry the `.t` flag.

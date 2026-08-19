@@ -8,6 +8,7 @@
 //   elementwise (int8 -> int32): ADD, RELU
 //   reduction   (int8 -> int32 scalar): DOT
 //   narrowing   (int32 -> int8): REQUANT, DYT
+//   ternarizing (int8  -> 2 bits): TQUANT
 //
 // That is the whole unit now. The ops this TB used to cover as well — GELU,
 // EXP, SQUARE, ELEMENT_MUL, SCALAR_MUL/ADD/DIV, REDUCESUM, REDUCEMAX and the
@@ -23,6 +24,11 @@
 // input directly: a random spread hits the single value that separates them
 // almost never, and without it a DUT that routed `dyt` to requant8 would pass
 // everything else here.
+//
+// TQUANT is the only op whose destination is narrower than a byte: four trits
+// share one byte and the write strobe is per byte, so its tests check the packed
+// *bytes*, not elements, and `test_tquant_pack` pins the encoding and the
+// bit order directly against a hand-written byte.
 //
 // Coverage includes multi-chunk streaming (vlen > LANES), an exact-boundary
 // vlen, and partial-tail vlen so the lane-active predicate / V_wstrb masking is
@@ -45,7 +51,8 @@ module vpu_tb;
     // ---- Op encoding (matches vpu.sv) ---------------------------------------
     localparam logic [4:0]
         VOP_DOT       = 5'd0,  VOP_ADD       = 5'd1,  VOP_RELU = 5'd3,
-        VOP_REQUANT   = 5'd10, VOP_VECMATMUL = 5'd13, VOP_DYT  = 5'd16;
+        VOP_REQUANT   = 5'd10, VOP_VECMATMUL = 5'd13, VOP_DYT  = 5'd16,
+        VOP_TQUANT    = 5'd17;
 
     // ---- Scratchpad address map (generous spacing; int8 chunks over-read) ---
     localparam logic [ADDR_W-1:0] A_ADDR  = 16'h1000;  // src0
@@ -318,6 +325,68 @@ module vpu_tb;
                  got_dyt, got_rq, errors);
     endtask
 
+    // Reference for TQUANT: the same shifter clipped to +-1, returned as the
+    // MXU's 2-bit weight code (bit 0 = nonzero, bit 1 = sign).
+    function automatic logic [1:0] ref_tquant(input int x, input int m0, input int n);
+        longint prod, round, shifted;
+        prod    = longint'(x) * longint'(m0);
+        round   = (n == 0) ? 0 : (longint'(1) << (n - 1));
+        shifted = (prod + round) >>> n;
+        if      (shifted >=  1) return 2'b01;
+        else if (shifted <= -1) return 2'b11;
+        else                    return 2'b00;
+    endfunction
+
+    task automatic expbyte(input [ADDR_W-1:0] a, input logic [7:0] exp,
+                           input string tag);
+        logic [7:0] got;
+        got = mem[a];
+        checks++;
+        if (got !== exp) begin
+            errors++;
+            $display("  FAIL %-14s @0x%04h: got %02h  exp %02h", tag, a, got, exp);
+        end
+    endtask
+
+    // TQUANT: int8 in at stride 1, 2 bits out, four elements to a byte. Checked
+    // a byte at a time, because that is the granularity the DUT can write.
+    task automatic test_tquant(input int vlen, input int m0, input int n,
+                               input string tag);
+        logic [7:0] exp;
+        gen_i8(vlen);
+        for (int i = 0; i < vlen; i++) put8(A_ADDR + i, tv_a[i]);
+        put32(SC_ADDR, (n << M0_W) | m0);
+        // Poison the destination so a byte the DUT fails to strobe is visible
+        // rather than reading back as a legitimate all-zero trit group.
+        for (int b = 0; b < (vlen + 3) / 4; b++) mem[D_ADDR + b] = 8'hA5;
+        run_op(VOP_TQUANT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
+        for (int b = 0; b < (vlen + 3) / 4; b++) begin
+            exp = '0;
+            for (int j = 0; j < 4; j++)
+                if (b*4 + j < vlen)
+                    exp[j*2 +: 2] = ref_tquant(tv_a[b*4 + j], m0, n);
+            expbyte(D_ADDR + b, exp, tag);
+        end
+        $display("[%s] vlen=%0d m0=%0d n=%0d  (errors so far: %0d)", tag, vlen, m0, n, errors);
+    endtask
+
+    // The encoding itself, against a byte written out by hand. Everything above
+    // compares the DUT to a reference that could share a misreading with it;
+    // this one cannot. {+1, 0, -1, +1} with {m0=1,n=0} must pack to
+    // 01 | 00<<2 | 11<<4 | 01<<6 = 8'b01_11_00_01 = 0x71.
+    task automatic test_tquant_pack();
+        put8(A_ADDR + 0,  1);
+        put8(A_ADDR + 1,  0);
+        put8(A_ADDR + 2, -5);       // clips to -1
+        put8(A_ADDR + 3, 99);       // clips to +1
+        put32(SC_ADDR, (0 << M0_W) | 1);        // {m0=1, n=0}: pass through
+        mem[D_ADDR] = 8'hA5;
+        run_op(VOP_TQUANT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, 4);
+        expbyte(D_ADDR, 8'h71, "TQUANT-pack");
+        $display("[TQUANT-pack] {+1,0,-1,+1} -> %02h  (errors so far: %0d)",
+                 mem[D_ADDR], errors);
+    endtask
+
     // -------------------------------------------------------------------------
     // Stimulus.
     // -------------------------------------------------------------------------
@@ -358,6 +427,16 @@ module vpu_tb;
         test_dyt(33,  512,  8, "DYT-half");
         test_dyt(20, 4095,  0, "DYT-noshift");
         test_dyt_floor();
+
+        // ---- TQUANT: requant's fixed point, clipped to a trit and packed ---
+        // 64 is four whole chunks (LANES = 16), 32 two, 20 one chunk plus a
+        // 4-element tail — the case where the strobe must cover exactly one
+        // extra byte. m0/n are chosen so the threshold lands inside int8's
+        // range and all three codes appear.
+        test_tquant(64, 1, 5, "TQUANT");
+        test_tquant(32, 1, 6, "TQUANT-2chunk");
+        test_tquant(20, 3, 0, "TQUANT-tail");
+        test_tquant_pack();
 
         // Summary.
         $display("==== done: %0d checks, %0d errors ====", checks, errors);
