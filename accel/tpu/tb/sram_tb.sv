@@ -70,6 +70,9 @@ module sram_tb;
     logic                  din_ready;
     logic [DATA_W-1:0]     dout;
     logic                  dout_valid;
+    // Backpressure on the read stream (sram.sv). Held high for every existing
+    // test -- they all take a byte a cycle -- and pulsed low by the hold test.
+    logic                  dout_ready = 1'b1;
     logic                  busy;
     logic                  done;
 
@@ -87,7 +90,7 @@ module sram_tb;
         .clk(clk), .rst_n(rst_n),
         .start(start), .we(we), .addr(addr), .len(len), .stride(stride),
         .din(din), .din_valid(din_valid), .din_ready(din_ready),
-        .dout(dout), .dout_valid(dout_valid),
+        .dout(dout), .dout_valid(dout_valid), .dout_ready(dout_ready),
         .busy(busy), .done(done),
         .sram_addr(sram_addr), .sram_data(sram_data),
         .sram_we(sram_we), .sram_ce(sram_ce), .sram_oen(sram_oen)

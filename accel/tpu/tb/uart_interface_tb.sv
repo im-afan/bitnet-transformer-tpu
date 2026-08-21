@@ -159,7 +159,7 @@ module uart_interface_tb #(
         .start(sram_start), .we(sram_we), .addr(sram_addr),
         .len(16'd1), .stride(16'd0),
         .din(sram_din), .din_valid(1'b1), .din_ready(),
-        .dout(sram_dout), .dout_valid(),
+        .dout(sram_dout), .dout_valid(), .dout_ready(1'b1),
         .busy(sram_busy), .done(sram_done),
         .sram_addr(chip_addr), .sram_data(chip_data),
         .sram_we(chip_we), .sram_ce(chip_ce), .sram_oen(chip_oen)

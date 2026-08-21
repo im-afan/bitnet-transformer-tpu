@@ -67,6 +67,7 @@ module tpu_top_tb;
     localparam int ADDR_W    = 16;
     localparam int XLEN      = 32;
     localparam int IMEM_AW   = 10;
+    localparam int FW_AW     = 12;   // must match tpu_top.sv (HOST_AW = FW_AW+1)
     localparam int CFG_AW    = 5;   // 32 cfg regs: 15..17 are the DMA transpose geometry
     localparam int REG_AW    = 5;
     localparam int M0_W      = 12;
@@ -94,7 +95,7 @@ module tpu_top_tb;
     // DUT host interface.
     // -------------------------------------------------------------------------
     logic                  host_run;
-    logic [IMEM_AW-1:0]    boot_pc;
+    logic [FW_AW:0]        boot_pc;   // HOST_AW: top bit picks the producer
     logic                  busy, done;
     logic [IMEM_AW-1:0]    pc_dbg;
 
@@ -278,6 +279,11 @@ module tpu_top_tb;
         @(negedge clk); host_run = 1'b0;
 
         // Wait for HALT (watchdog below guards against a hang).
+        // A full-model run is ~700 k clocks and prints nothing until it halts,
+        // which makes "slow" and "deadlocked" look identical from outside. Pass
+        // +HEARTBEAT to get a line every HEARTBEAT_CLK clocks with the PC and the
+        // unit-busy flags -- a stalled PC with everything idle is a hang, a
+        // moving one is just a long simulation.
         do @(negedge clk); while (!done);
         run_clk = cyc - run_clk;
         $display("program halted at pc=%0d after %0d clocks", pc_dbg, run_clk);
@@ -303,6 +309,29 @@ module tpu_top_tb;
     // i.e. milliseconds. Default unchanged, so every existing invocation is
     // unaffected.
     //   iverilog ... -DWATCHDOG_NS=200000000
+    // Progress heartbeat for long runs (+HEARTBEAT, optionally +HEARTBEAT_CLK=N).
+    int hb_clk = 50000;
+    initial begin
+        if ($test$plusargs("HEARTBEAT")) begin
+            if ($value$plusargs("HEARTBEAT_CLK=%d", hb_clk)) ;
+            forever begin
+                repeat (hb_clk) @(posedge clk);
+                // Unit busy flags and the queue levels: enough to tell a slow
+                // run from a stuck one, and to say *which* unit is stuck. Deeper
+                // probing means reaching into a unit's FSM, which is what a VCD
+                // is for.
+                $display("[hb %0t] pc=%0d busy=%b | mxu=%b vpu=%b dma=%b | q %0d/%0d/%0d",
+                         $time, pc_dbg, busy,
+                         dut.mxu_busy, dut.vpu_busy, dut.dma_busy,
+                         dut.mxu_level, dut.vpu_level, dut.dma_level);
+                // Redirected stdout is block-buffered, so without this the
+                // heartbeat arrives in 4 KB chunks -- i.e. long after the run
+                // it was supposed to be reporting on.
+                $fflush();
+            end
+        end
+    end
+
     initial begin
         #(`WATCHDOG_NS);
         $display("TPU_TOP: TIMEOUT — program did not halt after %0d ns",

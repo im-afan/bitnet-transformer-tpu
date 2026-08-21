@@ -74,7 +74,7 @@
 //     tdrow == 0  ->  1         (all three unset == a plain linear copy)
 //
 // Addresses accumulate in SCRATCHPAD_ADDR_W bits on both sides, so a transposed
-// transfer addresses one 64 KB DRAM window — the same window the scalar unit's
+// transfer addresses one 64 KB DRAM window - the same window the scalar unit's
 // 16-bit DRAM address can name in the first place.
 // -----------------------------------------------------------------------------
 
@@ -98,6 +98,11 @@ module dma #(
     input  logic                    sram_din_ready,
     input  logic [MEM_DATA_W-1:0]   sram_dout,
     input  logic                    sram_dout_valid,
+    // Backpressure on the fill stream. The controller holds its beat (address
+    // stable, OE asserted, the async SRAM still driving the same byte) until this
+    // goes high, so a long denial on the scratchpad write port throttles DRAM
+    // reads instead of dropping them. See the skid buffer below.
+    output logic                    sram_dout_ready,
     input  logic                    sram_busy,   // unused: we wait on sram_done
     input  logic                    sram_done,
 
@@ -109,6 +114,12 @@ module dma #(
     output logic [SCRATCHPAD_ADDR_W-1:0]  scratchpad_waddr,
     output logic [SCRATCHPAD_BYTES*8-1:0] scratchpad_wdata,
     output logic [SCRATCHPAD_BYTES-1:0]   scratchpad_wstrb,   // per-byte write enable
+    // Grants from the scratchpad's arbiter. The DMA is last in both priority
+    // chains -- it is background traffic and it is the one requester that can
+    // always wait -- so both of these do come back low in practice once the
+    // command queues let a transfer overlap compute (scratchpad.sv, "grants").
+    input  logic                          scratchpad_rgnt,
+    input  logic                          scratchpad_wgnt,
 
     // ---- Scalar unit dispatch (issue-and-wait) ------------------------------
     input  logic                          dma_start,
@@ -131,6 +142,7 @@ module dma #(
         IDLE       = 3'd0,
         ISSUE      = 3'd1,   // one clock: `sram_start` for this row's range
         FILL       = 3'd2,   // fill : drain sram_dout into the scratchpad
+                             //        (and then drain the skid buffer)
         SPILL_RD   = 3'd3,   // spill: address the scratchpad for the next byte
         SPILL_SEND = 3'd4,   // spill: offer that byte to the write stream
         SPILL_END  = 3'd5,   // spill: wait for the row's last write to commit
@@ -144,6 +156,43 @@ module dma #(
     // running sums so neither address generator needs a multiplier.
     reg [15:0]                  col, row;
     reg [SCRATCHPAD_ADDR_W-1:0] src_row_off, dst_col_off;
+
+    // -------------------------------------------------------------------------
+    // Fill skid buffer.
+    //
+    // On a fill the scratchpad write port is the DMA's, but it is now the LOWEST
+    // priority writer on it: the MXU's writeback drains `result_buf` with no
+    // handshake at all and must never be denied, so it goes first. An MXU
+    // writeback is up to MAX_TOKENS rows back to back, which is far longer than
+    // one byte, so "retry next cycle" is not enough on its own -- the byte
+    // arriving from DRAM this cycle has nowhere to go.
+    //
+    // Hence a small FIFO plus backpressure. Bytes land here as they arrive and
+    // are written out whenever the arbiter grants. `sram_dout_ready` goes low one
+    // entry before full, which is exactly the right margin: `dout_valid` is
+    // registered, so at most one further byte is already authorized and in flight
+    // when ready drops. A denial run longer than the buffer throttles the SRAM
+    // rather than overflowing, which costs fill bandwidth during the overlap and
+    // loses nothing.
+    //
+    // The 2-D walk (`counter`/`col`/`row`) advances on the scratchpad WRITE, not
+    // on arrival, because it is what generates the destination address -- the
+    // byte's address has to be the one it is written at, not the one it was
+    // received at. The DRAM side is only sampled in ISSUE, so it is unaffected.
+    // -------------------------------------------------------------------------
+    localparam integer SKID_DEPTH = 4;
+    localparam integer SKID_PTR_W = 2;
+
+    reg [MEM_DATA_W-1:0]  skid [0:SKID_DEPTH-1];
+    reg [SKID_PTR_W-1:0]  sk_wp, sk_rp;
+    reg [SKID_PTR_W:0]    sk_level;
+    reg                   range_done;   // this range's `sram_done` has been seen
+
+    wire sk_empty = (sk_level == '0);
+    wire sk_push  = (state == FILL) && sram_dout_valid;
+    wire sk_pop   = (state == FILL) && !sk_empty && scratchpad_wgnt;
+
+    assign sram_dout_ready = (sk_level < (SKID_PTR_W+1)'(SKID_DEPTH - 1));
 
     // Spill holding register. The scratchpad's contract is that read data is
     // valid *the cycle after* `re` — it says nothing about the cycle after that,
@@ -195,8 +244,9 @@ module dma #(
     assign sram_len    = (remaining < tcols_eff) ? remaining : tcols_eff;
     assign sram_stride = (dma_transpose && dma_write) ? tdrow_eff : 16'd1;
 
-    // A byte moves on either stream's handshake.
-    wire adv = (state == FILL       && sram_dout_valid) ||
+    // A byte moves on either stream's handshake. On a fill that is the granted
+    // scratchpad write (see the skid buffer above), not the arrival from DRAM.
+    wire adv = sk_pop ||
                (state == SPILL_SEND && sram_din_ready);
 
     // -------------------------------------------------------------------------
@@ -211,9 +261,16 @@ module dma #(
             end
             ISSUE:  state_n = dma_write ? SPILL_RD : FILL;
             // `sram_done` lands on the same clock as the range's last
-            // `sram_dout_valid`, so `counter` is still the last byte's index.
-            FILL:   if (sram_done) state_n = all_last ? DONE : ISSUE;
-            SPILL_RD:   state_n = SPILL_SEND;
+            // `sram_dout_valid` -- but that byte may still be sitting in the skid
+            // buffer, and `counter` only counts bytes actually written. So the
+            // range is over when the stream has finished AND the buffer is empty,
+            // and the end-of-transfer test is `counter >= dma_len` on the write
+            // side (the same form SPILL_END already uses).
+            FILL:   if ((sram_done || range_done) && sk_empty && !sk_pop)
+                        state_n = (counter >= dma_len) ? DONE : ISSUE;
+            // The scratchpad read has to be granted before its data is valid one
+            // cycle later; until then, re-present.
+            SPILL_RD:   if (scratchpad_rgnt) state_n = SPILL_SEND;
             SPILL_SEND: if (sram_din_ready)
                             state_n = (row_last || all_last) ? SPILL_END : SPILL_RD;
             // The last byte of the row has been handed over but not committed.
@@ -233,8 +290,8 @@ module dma #(
         sram_din         = have_cap ? cap : scratchpad_rdata[MEM_DATA_W-1:0];
         sram_din_valid   = (state == SPILL_SEND);
         scratchpad_re    = (state == SPILL_RD);
-        scratchpad_we    = (state == FILL) && sram_dout_valid;
-        scratchpad_wdata = { {(SCRATCHPAD_BYTES-1){8'b0}}, sram_dout };  // byte in lane 0
+        scratchpad_we    = (state == FILL) && !sk_empty;
+        scratchpad_wdata = { {(SCRATCHPAD_BYTES-1){8'b0}}, skid[sk_rp] }; // byte in lane 0
         scratchpad_wstrb = scratchpad_we ? SCRATCHPAD_BYTES'(1) : '0;
         dma_busy         = (state != IDLE) && (state != DONE);
         dma_done         = (state == DONE);
@@ -254,8 +311,29 @@ module dma #(
             dst_col_off <= '0;
             cap         <= '0;
             have_cap    <= 1'b0;
+            sk_wp       <= '0;
+            sk_rp       <= '0;
+            sk_level    <= '0;
+            range_done  <= 1'b0;
         end else begin
             state <= state_n;
+
+            // Skid buffer. Push on arrival, pop on a granted write; both can
+            // happen on the same clock, in which case the level is unchanged.
+            if (sk_push) begin
+                skid[sk_wp] <= sram_dout;
+                sk_wp       <= sk_wp + SKID_PTR_W'(1);
+            end
+            if (sk_pop) sk_rp <= sk_rp + SKID_PTR_W'(1);
+            case ({sk_push, sk_pop})
+                2'b10:   sk_level <= sk_level + (SKID_PTR_W+1)'(1);
+                2'b01:   sk_level <= sk_level - (SKID_PTR_W+1)'(1);
+                default: ;
+            endcase
+
+            // `sram_done` is a one-clock pulse and the skid may outlive it.
+            if (state == ISSUE)      range_done <= 1'b0;
+            else if (sram_done)      range_done <= 1'b1;
 
             if (state == IDLE) begin
                 counter     <= '0;
@@ -264,6 +342,10 @@ module dma #(
                 src_row_off <= '0;
                 dst_col_off <= '0;
                 have_cap    <= 1'b0;
+                sk_wp       <= '0;
+                sk_rp       <= '0;
+                sk_level    <= '0;
+                range_done  <= 1'b0;
             end
 
             // 2-D walk. Only `counter` decides when the transfer ends, so a

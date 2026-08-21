@@ -658,12 +658,24 @@ Independent scalar/address work does not currently overlap a dispatch (run-ahead
 scoreboarding is a documented future step — see
 [scalar_unit.md §2](scalar_unit.md#2-execution-model)).
 
-FSM sketch (`scalar_unit.sv`): `FETCH → DECODE → EXEC → {LOAD | WAIT | FETCH}`.
-- Single-cycle ops (scalar arith, `li`, `setcfg`, `cmps`, `branch`, `jmp`, `stores`) retire
-  in `EXEC`.
-- `loads` takes an extra cycle in `S_LOAD` for the synchronous scratchpad read.
-- Dispatches (`matmul`, VPU ops, `rdmem`/`wrmem`, `wrneigh`) and `wait` sit in `S_WAIT`
-  until the selected unit's `done`.
+FSM sketch (`scalar_unit.sv`):
+`FETCH → DECODE → EXEC → {LOAD | RQRD → RQLATCH → PUSH | PUSH | WAIT | FETCH}`.
+- Single-cycle ops (scalar arith, `li`, `setcfg`, `cmps`, `branch`, `jmp`) retire in `EXEC`.
+- `loads`/`stores` take the scratchpad's scalar port, which is **arbitrated** — they
+  re-present in `EXEC` until their grant comes back, then `loads` spends `S_LOAD` on the
+  synchronous read.
+- A dispatch no longer drives a unit's ports directly. It **packs a 128-bit macro-op** from
+  the config registers and its own operands and pushes it into that unit's queue
+  (`S_PUSH`, one clock per command; a `matmul` or `vecmatmul` pushes two — a geometry
+  command and the op). A dispatch whose `{m0,n}` operand is a scratchpad *address* — every
+  `.rq` matmul, and `requant`/`dyt`/`tquant` — first reads the word over the S port
+  (`S_RQRD`/`S_RQLATCH`), because the units now take the literal.
+- `S_WAIT` then blocks until the target unit is idle again — queue empty and nothing in
+  flight. **From a program's point of view nothing about this changed**: dispatch is still
+  issue-and-wait, one op at a time, and every existing program and golden vector is
+  unaffected. What changed is that the *units* no longer read a globally writable config
+  file, so a stale `setcfg` cannot reach a dispatch that did not pack it.
+  See [picorv32_migration.md](picorv32_migration.md).
 - `halt` enters `S_HALT`, drives `done`, and re-enters on the next `host_run`.
 
 Because the ISS runs every dispatch **atomically** (read operands → compute → write back),

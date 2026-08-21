@@ -144,6 +144,7 @@ module uart_bram #(
 
         .dout       (mem_dout),
         .dout_valid (),
+        .dout_ready (1'b1),   // host path takes every byte
 
         .busy (mem_busy),
         .done (mem_done),

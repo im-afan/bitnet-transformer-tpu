@@ -5,9 +5,30 @@
 // in-order engine ("microcontroller, not out-of-order core") that fetches a
 // program from a dedicated instruction BRAM, performs int32 scalar math, and
 // dispatches compute ops to the MXU (mxu.md §7), VPU (vpu.md §6), DMA
-// (Read/WriteMemory), and inter-TPU LINK (comms.md §6). Synchronization uses
-// the doc's v1 model: issue-and-wait — assert a unit's `start`, then block on
-// its `done` before issuing the next dependent op (§2).
+// (Read/WriteMemory), and inter-TPU LINK (comms.md §6).
+//
+// DISPATCH IS NOW A MACRO-OP PUSH, not a wire bundle. Instead of driving a
+// unit's operand ports directly and pulsing `start`, this unit packs its config
+// registers and the instruction's register operands into one or two 128-bit
+// commands and pushes them into that unit's queue (cmd_mxu.sv / cmd_vpu.sv /
+// cmd_dma.sv). Nothing else about the machine changed: it still blocks until the
+// target unit is idle again before retiring, so the issue-and-wait model, every
+// existing .tpu program, iss.py and the golden vectors are all unaffected. This
+// is phase 1 of docs/picorv32_migration.md §11 — the command interface gets
+// built and validated behind the ISA that already works, before a CPU exists to
+// produce commands a different way.
+//
+// The config register file survives *here*, as the thing being packed. It is no
+// longer visible to the units, which is what removes the stale-config hazard:
+// what a matmul executes with is the geometry that was packed into its own
+// command, not whatever the file happened to hold when the array got round to it.
+//
+// ONE SHIM WORTH KNOWING ABOUT. `requant`/`dyt`/`tquant` and `matmul.rq` take
+// their {m0,n} as a *scratchpad address* in this ISA, and the units now want the
+// 16-bit value. So a dispatch that needs one first reads it over the S port
+// (S_RQRD/S_RQLATCH below) and packs the literal. That costs two clocks per
+// requantizing dispatch and exists only because the producer is this ISA;
+// firmware computes {m0,n} in a register and pushes it directly.
 //
 // Encoding (scalar_unit.md §4): fixed 32-bit instruction
 //     [ opcode:6 | dst:8 | src0:8 | src1:8 | flags:2 ]
@@ -51,7 +72,11 @@ module scalar_unit #(
     // the last free slot, which three registers do not fit into. The `dst`
     // instruction field is 8 bits, so the encoding was already wide enough and
     // nothing outside this file's cfg array grows.
-    parameter int CFG_AW   = 5
+    parameter int CFG_AW   = 5,
+    // Requant {m0,n} field widths, matching requant.sv / mxu.sv / vpu.sv. Needed
+    // here because the packer now carries the literal rather than its address.
+    parameter int M0_W     = 12,
+    parameter int N_W      = 4
 ) (
     input  logic                 clk,
     input  logic                 rst_n,
@@ -83,61 +108,24 @@ module scalar_unit #(
     output logic [ADDR_W-1:0]    s_addr,
     output logic [XLEN-1:0]      s_wdata,
     input  logic [XLEN-1:0]      s_rdata,       // valid the cycle after s_re
+    // The S port is arbitrated (scratchpad.sv, "grants"), so a request is only an
+    // access if its grant comes back. Below the MXU and the VPU in both chains,
+    // this unit re-presents until it wins.
+    input  logic                 s_rgnt,
+    input  logic                 s_wgnt,
 
-    // ---- MXU dispatch (mxu.md §7) -------------------------------------------
-    output logic                 mxu_start,
-    output logic [ADDR_W-1:0]    mxu_act_addr,
-    output logic [ADDR_W-1:0]    mxu_weight_addr,
-    output logic [ADDR_W-1:0]    mxu_out_addr,
-    output logic [ADDR_W-1:0]    mxu_scalar_addr, // requant {M0,N} word (config reg)
-    output logic [5:0]           mxu_t_len,      // token columns (config reg)
-    output logic                 mxu_tiled,      // OP_MATMUL_T: use the strides below
-    output logic [ADDR_W-1:0]    mxu_a_row,      // activation row stride (config reg)
-    output logic [ADDR_W-1:0]    mxu_c_row,      // int32 result row stride (config reg)
-    output logic [ADDR_W-1:0]    mxu_w_col,      // weight column stride (config reg)
-    output logic [7:0]           mxu_k_tiles,    // contraction tiles (config reg)
-    output logic [7:0]           mxu_n_tiles,    // output tiles (config reg)
-    output logic                 mxu_accumulate, // tiling accumulate (instr flag[0])
-    output logic                 mxu_requant,    // narrow store int32->int8 (instr flag[1])
-    input  logic                 mxu_busy,
-    input  logic                 mxu_done,
-
-    // ---- VPU dispatch (vpu.md §6) -------------------------------------------
-    output logic                 vpu_start,
-    output logic [4:0]           vpu_op,
-    output logic [ADDR_W-1:0]    vpu_src0,
-    output logic [ADDR_W-1:0]    vpu_src1,
-    output logic [ADDR_W-1:0]    vpu_scalar,
-    output logic [ADDR_W-1:0]    vpu_dst,
-    output logic [9:0]           vpu_vlen,       // vector length (config reg)
-    output logic [15:0]          vpu_rows,       // macro-op rows (config reg)
-    output logic [15:0]          vpu_cols,       // vecmatmul key rows (config reg)
-    output logic [ADDR_W-1:0]    vpu_row0,       // vecmatmul src0 row stride
-    output logic [ADDR_W-1:0]    vpu_row1,       // vecmatmul src1 row stride
-    output logic [ADDR_W-1:0]    vpu_crow,       // vecmatmul dst row stride
-    input  logic                 vpu_busy,
-    input  logic                 vpu_done,
-
-    // ---- DMA (Read/WriteMemory: DRAM <-> scratchpad) ------------------------
-    output logic                 dma_start,
-    output logic                 dma_write,      // 1: scratch->DRAM, 0: DRAM->scratch
-    output logic [ADDR_W-1:0]    dma_scratch_addr,
-    output logic [MEM_ADDR_W-1:0] dma_dram_addr,   // wider than the scratchpad
-    output logic [15:0]          dma_len,        // bytes (config reg)
-    output logic                 dma_transpose,  // transposed addressing (instr flag)
-    output logic [15:0]          dma_tcols,      // source row length, elements (config reg)
-    output logic [15:0]          dma_tsrow,      // source row stride, bytes (config reg)
-    output logic [15:0]          dma_tdrow,      // dest row stride, bytes (config reg)
-    input  logic                 dma_busy,
-    input  logic                 dma_done,
-
-    // ---- Inter-TPU LINK (WriteNeighbor; comms.md §6) ------------------------
-    output logic                 nb_start,
-    output logic [1:0]           nb_dir,         // target direction (instr flags)
-    output logic [ADDR_W-1:0]    nb_src_addr,    // local DRAM
-    output logic [ADDR_W-1:0]    nb_dst_addr,    // neighbor DRAM
-    output logic [15:0]          nb_len,         // bytes (config reg)
-    input  logic                 nb_done
+    // ---- Macro-op command push (docs/picorv32_migration.md §3) -------------
+    // One push port with a unit selector, rather than three. tpu_top muxes
+    // `cmd_full` from the selected unit's queue and fans `cmd_we` out to it.
+    output logic                 cmd_we,
+    output logic [1:0]           cmd_unit,   // U_MXU / U_VPU / U_DMA / U_LINK
+    output logic [127:0]         cmd_data,
+    input  logic                 cmd_full,   // selected queue full: hold the push
+    // Per-unit "queue empty and nothing in flight". This replaces the `done`
+    // pulses the old dispatch waited on: with a queue in the way, "the unit has
+    // caught up" is the only completion this producer can observe, and it is
+    // exactly what issue-and-wait needs.
+    input  logic [3:0]           unit_idle
 );
 
     // -------------------------------------------------------------------------
@@ -271,8 +259,12 @@ module scalar_unit #(
     // -------------------------------------------------------------------------
     // FSM
     // -------------------------------------------------------------------------
-    typedef enum logic [2:0] {
-        S_IDLE, S_FETCH, S_DECODE, S_EXEC, S_LOAD, S_WAIT, S_HALT
+    typedef enum logic [3:0] {
+        S_IDLE, S_FETCH, S_DECODE, S_EXEC, S_LOAD,
+        S_RQRD,    // fetch the {m0,n} word this dispatch needs as a literal
+        S_RQLATCH, // ...it lands here (S-port read latency)
+        S_PUSH,    // push this dispatch's 1 or 2 commands into the unit's queue
+        S_WAIT, S_HALT
     } state_t;
     state_t state, state_n;
 
@@ -350,29 +342,6 @@ module scalar_unit #(
             cfg[a_dst[CFG_AW-1:0]] <= r_src0;
     end
 
-    assign mxu_t_len      = cfg[CFG_TLEN][5:0];
-    assign mxu_scalar_addr = cfg[CFG_SCALAR][ADDR_W-1:0];
-    // Only consulted when `mxu_tiled` is set (OP_MATMUL_T). A plain OP_MATMUL
-    // ignores them outright, so it cannot inherit a stride an earlier program
-    // left behind — config registers are not cleared between runs.
-    assign mxu_tiled      = (opc == OP_MATMUL_T);
-    assign mxu_a_row      = cfg[CFG_AROW][ADDR_W-1:0];
-    assign mxu_c_row      = cfg[CFG_CROW][ADDR_W-1:0];
-    assign mxu_w_col      = cfg[CFG_WCOL][ADDR_W-1:0];
-    assign mxu_k_tiles    = cfg[CFG_KTILES][7:0];
-    assign mxu_n_tiles    = cfg[CFG_NTILES][7:0];
-    assign vpu_vlen       = cfg[CFG_VLEN][9:0];
-    assign vpu_rows       = cfg[CFG_VROWS][15:0];
-    assign vpu_cols       = cfg[CFG_VCOLS][15:0];
-    assign vpu_row0       = cfg[CFG_VROW0][ADDR_W-1:0];
-    assign vpu_row1       = cfg[CFG_VROW1][ADDR_W-1:0];
-    assign vpu_crow       = cfg[CFG_VCROW][ADDR_W-1:0];
-    assign dma_len        = cfg[CFG_LEN][15:0];
-    assign dma_tcols      = cfg[CFG_TCOLS][15:0];
-    assign dma_tsrow      = cfg[CFG_TSROW][15:0];
-    assign dma_tdrow      = cfg[CFG_TDROW][15:0];
-    assign nb_len         = cfg[CFG_LEN][15:0];
-
     // -------------------------------------------------------------------------
     // Instruction memory (BRAM), synchronous read + host write port.
     // -------------------------------------------------------------------------
@@ -385,58 +354,134 @@ module scalar_unit #(
     end
 
     // -------------------------------------------------------------------------
-    // Dispatch operand routing (combinational; qualified by *_start pulses).
+    // Command packing. Field layouts are the ones cmd_mxu.sv / cmd_vpu.sv /
+    // cmd_dma.sv decode; they are duplicated here rather than shared through a
+    // package, the same way VOP_* already is (see the note above it).
+    //
+    //   word0 = cmd_data[31:0]   word1 = [63:32]   word2 = [95:64]   word3 = [127:96]
     // -------------------------------------------------------------------------
-    assign mxu_act_addr    = r_src0[ADDR_W-1:0];
-    assign mxu_weight_addr = r_src1[ADDR_W-1:0];
-    assign mxu_out_addr    = r_dst [ADDR_W-1:0];
-    assign mxu_accumulate  = flags[0];
-    assign mxu_requant     = flags[1];
+    localparam logic [7:0] MXU_GEOM = 8'h01, MXU_MM   = 8'h02,
+                           VPU_OPC  = 8'h01, VPU_GEOM = 8'h02,
+                           DMA_MOVE = 8'h01;
 
-    assign vpu_src0   = r_src0[ADDR_W-1:0];
-    assign vpu_src1   = r_src1[ADDR_W-1:0];
-    // REQUANT/DYT {n,m0} address — always the third register operand now that
-    // OP_SOFTMAX, the one op that had no free slot for it and read cfg vscalar
-    // instead, is gone.
-    assign vpu_scalar = r_src1[ADDR_W-1:0];
-    assign vpu_dst    = r_dst [ADDR_W-1:0];
+    // The {m0,n} literal, fetched over the S port for the ops whose operand is
+    // an address (see the header's shim note).
+    logic [M0_W+N_W-1:0] rq_word_r;
+
+    // Which scratchpad address that fetch uses: cfg scalar for the MXU, the
+    // third register operand for the VPU.
+    wire [ADDR_W-1:0] rq_fetch_addr =
+        ((opc == OP_MATMUL) || (opc == OP_MATMUL_T)) ? cfg[CFG_SCALAR][ADDR_W-1:0]
+                                                     : r_src1[ADDR_W-1:0];
+
+    // Does this dispatch need the literal before it can be packed?
+    function automatic logic needs_rq(input logic [5:0] o, input logic rq_flag);
+        needs_rq = (((o == OP_MATMUL) || (o == OP_MATMUL_T)) && rq_flag) ||
+                   (o == OP_REQUANT) || (o == OP_DYT) || (o == OP_TQUANT);
+    endfunction
+
+    // Two commands are pushed when the geometry has to travel with the op:
+    // every MXU matmul, and the VPU's one macro op.
+    function automatic logic [1:0] push_count(input logic [5:0] o);
+        unique case (o)
+            OP_MATMUL, OP_MATMUL_T, OP_VECMM: push_count = 2'd2;
+            OP_WRNEIGH:                       push_count = 2'd0;  // stub, no queue
+            default:                          push_count = 2'd1;
+        endcase
+    endfunction
+
+    logic [1:0] push_idx;      // which command of the burst is being pushed
+
+    // The config file's entire contribution to a command, named once. (Also a
+    // tool requirement: a bit-select of an array element inside an always_* block
+    // is not something every simulator will take.)
+    wire [15:0] c_arow   = cfg[CFG_AROW]  [15:0];
+    wire [15:0] c_crow   = cfg[CFG_CROW]  [15:0];
+    wire [15:0] c_wcol   = cfg[CFG_WCOL]  [15:0];
+    wire [7:0]  c_ktiles = cfg[CFG_KTILES][7:0];
+    wire [7:0]  c_ntiles = cfg[CFG_NTILES][7:0];
+    wire [5:0]  c_tlen   = cfg[CFG_TLEN]  [5:0];
+    wire [9:0]  c_vlen   = cfg[CFG_VLEN]  [9:0];
+    wire [15:0] c_vrows  = cfg[CFG_VROWS] [15:0];
+    wire [15:0] c_vcols  = cfg[CFG_VCOLS] [15:0];
+    wire [15:0] c_vrow0  = cfg[CFG_VROW0] [15:0];
+    wire [15:0] c_vrow1  = cfg[CFG_VROW1] [15:0];
+    wire [15:0] c_vcrow  = cfg[CFG_VCROW] [15:0];
+    wire [15:0] c_len    = cfg[CFG_LEN]   [15:0];
+    wire [15:0] c_tcols  = cfg[CFG_TCOLS] [15:0];
+    wire [15:0] c_tsrow  = cfg[CFG_TSROW] [15:0];
+    wire [15:0] c_tdrow  = cfg[CFG_TDROW] [15:0];
+
+    // Instruction flag bits and register operands, pre-sliced. Same reason as
+    // the cfg wires above.
+    wire f_acc = flags[0];   // matmul .acc  / dma .t
+    wire f_rq  = flags[1];   // matmul .rq
+    wire [15:0]           rd16    = r_dst [15:0];
+    wire [15:0]           rs0_16  = r_src0[15:0];
+    wire [15:0]           rs1_16  = r_src1[15:0];
+    wire [MEM_ADDR_W-1:0] rs0_mem = r_src0[MEM_ADDR_W-1:0];
+    wire [MEM_ADDR_W-1:0] rs1_mem = r_src1[MEM_ADDR_W-1:0];
+
+    logic [31:0] w0, w1, w2, w3;
     always_comb begin
-        unique case (opc)
-            OP_VECMM:   vpu_op = VOP_VECMATMUL;
-            OP_VECDOT:  vpu_op = VOP_DOT;
-            OP_VECADD:  vpu_op = VOP_ADD;
-            OP_RELU:    vpu_op = VOP_RELU;
-            OP_REQUANT: vpu_op = VOP_REQUANT;   // in=r[src0], {n,m0}=r[src1], out=r[dst]
-            OP_DYT:     vpu_op = VOP_DYT;       // same operands, symmetric clip
-            OP_TQUANT:  vpu_op = VOP_TQUANT;    // ...clipped to +-1, packed 2b
-            default:    vpu_op = VOP_DOT;
+        w0 = '0; w1 = '0; w2 = '0; w3 = '0;
+        unique case (1'b1)
+            // ---- MXU ---------------------------------------------------------
+            (opc == OP_MATMUL) || (opc == OP_MATMUL_T): begin
+                if (push_idx == 2'd0) begin
+                    w0 = {c_arow, 8'h00, MXU_GEOM};
+                    w1 = {c_wcol, c_crow};
+                    w2 = {10'b0, c_tlen,
+                          c_ntiles, c_ktiles};
+                end else begin
+                    w0 = {rd16, 5'b0, (opc == OP_MATMUL_T), f_rq, f_acc,
+                          MXU_MM};
+                    w1 = {rs1_16, rs0_16};
+                    w2 = {16'b0, rq_word_r};
+                end
+            end
+            // ---- VPU ---------------------------------------------------------
+            is_vpu_op(opc): begin
+                if ((opc == OP_VECMM) && (push_idx == 2'd0)) begin
+                    w0 = {c_vrows, 8'h00, VPU_GEOM};
+                    w1 = {c_vrow0, c_vcols};
+                    w2 = {c_vcrow, c_vrow1};
+                end else begin
+                    w0 = {rd16, 3'b0, vpu_op_sel, VPU_OPC};
+                    w1 = {rs1_16, rs0_16};
+                    w2 = {rq_word_r, 6'b0, c_vlen};
+                end
+            end
+            // ---- DMA ---------------------------------------------------------
+            (opc == OP_WRMEM) || (opc == OP_RDMEM): begin
+                w0 = {((opc == OP_WRMEM) ? rs0_16 : rd16),
+                      6'b0, f_acc, (opc == OP_WRMEM), DMA_MOVE};
+                w1 = {{(32-MEM_ADDR_W){1'b0}},
+                      ((opc == OP_WRMEM) ? rs1_mem
+                                         : rs0_mem)};
+                w2 = {c_tcols, c_len};
+                w3 = {c_tdrow, c_tsrow};
+            end
+            default: ;
         endcase
     end
 
-    // WRMEM: scratch r[src0] -> DRAM r[src1];  RDMEM: DRAM r[src0] -> scratch r[dst]
-    //
-    // The two sides are truncated to *different* widths on purpose: the
-    // scratchpad is ADDR_W (16) and external DRAM is MEM_ADDR_W (19). A program
-    // therefore names any byte of the SRAM chip, not just its low 64 KB. Note
-    // that `li` is a 16-bit immediate, so a base above 64 KB is built with
-    // scalar arithmetic (`adds` on a 32-bit register) rather than loaded whole.
-    assign dma_write        = (opc == OP_WRMEM);
-    assign dma_scratch_addr = (opc == OP_WRMEM) ? r_src0[ADDR_W-1:0]     : r_dst [ADDR_W-1:0];
-    assign dma_dram_addr    = (opc == OP_WRMEM) ? r_src1[MEM_ADDR_W-1:0] : r_src0[MEM_ADDR_W-1:0];
-    // `.t`: read the source row-major, write the destination transposed. Both DMA
-    // ops leave flags[0] free (RDMEM is RS-form, WRMEM SS-form), so this needs no
-    // opcode of its own — and being an instruction flag rather than a "the stride
-    // registers are nonzero" test is what stops one program's leftover geometry
-    // from rearranging the next program's plain rdmem (docs/macro_ops.md §4.0).
-    assign dma_transpose    = flags[0];
+    assign cmd_data = {w3, w2, w1, w0};
 
-    // LINK addresses stay at ADDR_W. They are nominally DRAM addresses too, but
-    // no comms block is attached (tpu_top.sv ties `nb_done` high, so `wrneigh`
-    // is a completing no-op) and widening an interface nothing drives would be
-    // churn. Widen these alongside the rest when comms.md lands.
-    assign nb_dir      = flags;
-    assign nb_src_addr = r_src0[ADDR_W-1:0];
-    assign nb_dst_addr = r_src1[ADDR_W-1:0];
+    // VPU op selector (must match vpu.sv VOP_* codes).
+    logic [4:0] vpu_op_sel;
+    always_comb begin
+        unique case (opc)
+            OP_VECMM:   vpu_op_sel = VOP_VECMATMUL;
+            OP_VECDOT:  vpu_op_sel = VOP_DOT;
+            OP_VECADD:  vpu_op_sel = VOP_ADD;
+            OP_RELU:    vpu_op_sel = VOP_RELU;
+            OP_REQUANT: vpu_op_sel = VOP_REQUANT;
+            OP_DYT:     vpu_op_sel = VOP_DYT;
+            OP_TQUANT:  vpu_op_sel = VOP_TQUANT;
+            default:    vpu_op_sel = VOP_DOT;
+        endcase
+    end
 
     // Every op that dispatches to the VPU (declared first: is_dispatch and
     // dispatch_unit below both call it).
@@ -463,28 +508,29 @@ module scalar_unit #(
         endcase
     endfunction
 
-    // done for the currently selected unit.
-    logic sel_done;
-    always_comb begin
-        unique case (sel_unit)
-            U_MXU:  sel_done = mxu_done;
-            U_VPU:  sel_done = vpu_done;
-            U_DMA:  sel_done = dma_done;
-            U_LINK: sel_done = nb_done;
-            default:sel_done = 1'b1;
-        endcase
-    end
+    // "The selected unit has caught up." With a queue between the producer and
+    // the unit, this is the only completion visible from here — and it is exactly
+    // what issue-and-wait needs, so the FSM below is unchanged in shape. The LINK
+    // has no queue and no block behind it, so its idle bit is tied high in
+    // tpu_top and `wrneigh` stays a completing no-op.
+    logic sel_idle;
+    assign sel_idle = unit_idle[sel_unit];
 
-    // start pulses: asserted only in S_EXEC, only for the matching dispatch op.
-    assign mxu_start = (state == S_EXEC) && ((opc == OP_MATMUL) || (opc == OP_MATMUL_T));
-    assign vpu_start = (state == S_EXEC) && is_vpu_op(opc);
-    assign dma_start = (state == S_EXEC) && ((opc == OP_WRMEM) || (opc == OP_RDMEM));
-    assign nb_start  = (state == S_EXEC) && (opc == OP_WRNEIGH);
+    // Command push. One per clock while the queue has room; `push_idx` selects
+    // which word of a two-command burst the packer is presenting.
+    assign cmd_unit = dispatch_unit(opc);
+    assign cmd_we   = (state == S_PUSH) && !cmd_full;
 
-    // Scratchpad scalar port: LOADS reads, STORES writes, both in S_EXEC.
-    assign s_re    = (state == S_EXEC) && (opc == OP_LOADS);
+    wire [1:0] n_push   = push_count(opc);
+    wire       push_end = (state == S_PUSH) && !cmd_full &&
+                          (push_idx + 2'd1 >= n_push);
+
+    // Scratchpad scalar port: LOADS reads, STORES writes, and S_RQRD borrows it
+    // for the {m0,n} fetch. The port is arbitrated now, so a read only happened
+    // if `s_rgnt` came back — every user below re-presents until it does.
+    assign s_re    = ((state == S_EXEC) && (opc == OP_LOADS)) || (state == S_RQRD);
     assign s_we    = (state == S_EXEC) && (opc == OP_STORES);
-    assign s_addr  = r_src0[ADDR_W-1:0];
+    assign s_addr  = (state == S_RQRD) ? rq_fetch_addr : r_src0[ADDR_W-1:0];
     assign s_wdata = r_src1;
 
     // Branch taken?
@@ -510,13 +556,23 @@ module scalar_unit #(
             S_DECODE: state_n = S_EXEC;                // ir latched
             S_EXEC: begin
                 if (opc == OP_HALT)          state_n = S_HALT;
-                else if (opc == OP_LOADS)    state_n = S_LOAD;      // await s_rdata
-                else if (is_dispatch(opc))   state_n = S_WAIT;      // await done
+                else if (opc == OP_LOADS)  begin if (s_rgnt) state_n = S_LOAD;  end
+                else if (opc == OP_STORES) begin if (s_wgnt) state_n = S_FETCH; end
+                else if (is_dispatch(opc)) begin
+                    if      (push_count(opc) == 2'd0) state_n = S_WAIT;  // LINK stub
+                    else if (needs_rq(opc, f_rq))    state_n = S_RQRD;
+                    else                              state_n = S_PUSH;
+                end
                 else if (opc == OP_WAIT)     state_n = S_WAIT;
                 else                         state_n = S_FETCH;     // single-cycle op
             end
             S_LOAD:   state_n = S_FETCH;               // s_rdata valid this cycle
-            S_WAIT:   if (sel_done) state_n = S_FETCH;
+            S_RQRD:   if (s_rgnt) state_n = S_RQLATCH;
+            S_RQLATCH:state_n = S_PUSH;
+            S_PUSH:   if (push_end) state_n = S_WAIT;
+            // The queue makes "done" unobservable, so wait on the unit going idle
+            // again. For a burst that is still one wait, after the last push.
+            S_WAIT:   if (sel_idle) state_n = S_FETCH;
             S_HALT:   if (host_run) state_n = S_FETCH;
             default:  state_n = S_IDLE;
         endcase
@@ -564,9 +620,11 @@ module scalar_unit #(
             state    <= S_IDLE;
             pc       <= '0;
             ir       <= '0;
-            sel_unit <= U_MXU;
-            flag_eq  <= 1'b0;
-            flag_lt  <= 1'b0;
+            sel_unit  <= U_MXU;
+            flag_eq   <= 1'b0;
+            flag_lt   <= 1'b0;
+            push_idx  <= 2'd0;
+            rq_word_r <= '0;
         end else begin
             state <= state_n;
 
@@ -586,14 +644,22 @@ module scalar_unit #(
                         default: begin
                             // LOADS / dispatch / WAIT advance PC when they retire
                             // in S_LOAD / S_WAIT; everything else retires now.
-                            if (opc != OP_LOADS && !is_dispatch(opc) &&
-                                opc != OP_WAIT && opc != OP_HALT)
+                            // STORES is the exception among the "now" group: the
+                            // S port is arbitrated, so it only retires once its
+                            // write was actually granted.
+                            if (opc == OP_STORES) begin
+                                if (s_wgnt) pc <= pc + 1'b1;
+                            end else if (opc != OP_LOADS && !is_dispatch(opc) &&
+                                         opc != OP_WAIT && opc != OP_HALT)
                                 pc <= pc + 1'b1;
                         end
                     endcase
                 end
                 S_LOAD: pc <= pc + 1'b1;                       // LOADS retires
-                S_WAIT: if (sel_done) pc <= pc + 1'b1;         // dispatch/WAIT retires
+                // The {m0,n} literal for a requantizing dispatch.
+                S_RQLATCH: rq_word_r <= s_rdata[M0_W+N_W-1:0];
+                S_PUSH: if (!cmd_full) push_idx <= push_end ? 2'd0 : (push_idx + 2'd1);
+                S_WAIT: if (sel_idle) pc <= pc + 1'b1;         // dispatch/WAIT retires
                 S_HALT: if (host_run) pc <= boot_pc;
                 default: ;
             endcase

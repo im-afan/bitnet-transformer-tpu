@@ -229,6 +229,41 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   `matmul_t` (hardware tile loop) and `vecmatmul`. Phase 5's hardware `softmax` was built,
   validated, and then **removed** (see the VPU note above); `layernorm` + the `rsqrt` LUT
   are not built and are now dropped — DyT replaced LayerNorm and needs no macro op. Still stubbed: the inter-TPU LINK (`wrneigh` is a completing no-op).
+- **Dispatch is a 128-bit macro-op pushed into a per-unit queue, not a wire bundle
+  plus a global config file.** `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv` sit in front
+  of each unit; a command carries its own operands and geometry, so nothing an
+  earlier dispatch (or an earlier *program*) left in a register can reach it. Two
+  producers push: `scalar_unit.sv` still runs tpulang and still waits after every
+  dispatch — so **every `.tpu` program, `iss.py` and every golden vector is
+  unchanged** — and `cpu_subsys.sv` (PicoRV32 + AXI4-Lite, `rtl/vendor/picorv32.v`)
+  pushes the same commands from firmware. `docs/picorv32_migration.md` is the
+  design record and carries the format table, the measured baseline and the phase
+  plan; §0's table is what actually passes today. **Measured cost of the plane on
+  the four-layer model: 690 705 → 693 107 clocks (+0.35%), byte-identical
+  output.** Issue overhead went 6 914 → 9 229 clocks (1.00% → 1.33% of the run);
+  the units gave back 1 536 of that (the requant literal), and the DMA's skid
+  drain cost 1 622. None of the ~1.45x overlap is claimed yet — the scalar unit
+  still waits after every dispatch, and `ovlap` reads 0.
+  - **The requant `{m0,n}` is now a literal in the command**, not a scratchpad
+    address. Same 16 bits either way, and it deleted a two-state fetch in both
+    `mxu.sv` and `vpu.sv`. The scalar unit, whose ISA still names an *address*,
+    reads the word over the S port before packing — a shim that exists only while
+    tpulang is a producer.
+  - **`scratchpad.sv`'s exclusivity invariant is gone.** It held only because
+    issue-and-wait serialized the units; queues break it on purpose. Arbitration
+    is now real, with grants (`V_rgnt`/`s_rgnt`/`dma_rgnt` and the write pair),
+    ordered so the requester that cannot stall wins: reads `A>W>C>V>s>DMA`,
+    writes `C>V>s>DMA`. The VPU freezes its FSM for a clock when denied; the DMA
+    parks fill bytes in a skid buffer and, past that, stops the SRAM read stream
+    through `sram.sv`'s new `dout_ready`. **If you make two units run at once,
+    check every path into the scratchpad takes its grant back** — a denied
+    requester that ignores it loses the access silently.
+  - **`swait` stopped meaning "control overhead"** once dispatch went through
+    queues. The counter block is 10 wide now: 0–6 unchanged (so the UART `'T'`
+    reply stays prefix-compatible), plus `idlec` (clocks with *no* unit busy —
+    this is what instruction overhead costs), `qfull` and `ovlap`. Under the
+    scalar unit `ovlap` and `qfull` are identically 0, which is the check that
+    the command plane is in the path and not yet changing behaviour.
 - **`sram.sv` moves ranges, not bytes.** One request is a start address, a byte count and an
   address stride; `dma.sv` issues one range per source row (in linear mode, one for the whole
   transfer) and streams it. **1 clock/byte on fills, 2 on spills**, against ~8 before, and the
@@ -432,7 +467,16 @@ concluding anything from a board run.
 A full-model `tpu_top_tb` run is ~691 k clocks (6.91 ms simulated at 100 MHz) and dumps
 hundreds of MB of waveform at the defaults, so it needs `-DWATCHDOG_NS=400000000 -DNO_VCD`
 (both are options on `tpu_top_tb.sv`, defaults unchanged). The command line is in
-`adder_kernel.md` §7.7. At `layers=2` it was 1.23 M clocks before `sram.sv` became a range engine
+`adder_kernel.md` §7.7.
+
+**It prints nothing until it halts, which makes "slow" and "deadlocked" look identical
+from outside — pass `+HEARTBEAT` (and `+HEARTBEAT_CLK=N`) for a periodic line with the PC,
+the unit busy flags and the queue levels.** A frozen PC with a unit stuck busy is a hang; a
+moving one is just a long run. Redirect the log to a file rather than piping it through
+`tail`/`head`, which buffer the whole stream. For an edit-run loop, a one-layer copy of the
+kernel (`sed 's/^\.equ LAYERS   4/.equ LAYERS   1/'`) exercises every code path in ~180 k
+clocks; `make examples` runs all ten example kernels against their golden vectors and is
+the fastest full-ISA check there is. At `layers=2` it was 1.23 M clocks before `sram.sv` became a range engine
 (`accel/tpu/docs/dma.md` §7), 542 k before ternary K/V moved the attention matmuls
 onto the MXU (`adder_kernel.md` §2.5), 367 k before the ternary output head followed
 them (§2.6), and 351 k after; `layers=4` then doubled the per-layer part. The split

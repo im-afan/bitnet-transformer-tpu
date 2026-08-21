@@ -49,31 +49,29 @@
 //      ports); what is no longer possible is two reads, or two writes, at once.
 //
 // -----------------------------------------------------------------------------
-// THE EXCLUSIVITY INVARIANT (why arbitration costs nothing here)
+// ARBITRATION AND GRANTS (this replaced the exclusivity invariant)
 // -----------------------------------------------------------------------------
-// Arbitration would normally force a stall handshake, which none of the compute
-// units have. It does not here, because the TPU never issues two scratchpad
-// reads (or two writes) in one cycle in the first place:
+// This file used to state, and assert every cycle, that at most one read and one
+// write were ever requested per clock -- which made the priority mux *exact*
+// rather than approximate, and meant no requester ever needed a stall handshake.
+// That held only because the scalar unit was issue-and-wait: a dispatch parked it
+// in S_WAIT until the unit reported done, so MXU, VPU and DMA activity could not
+// overlap.
 //
-//   * The MXU drives A_re, W_re and C_re from *mutually exclusive* FSM states —
-//     S_LOAD asserts W_re, S_RUN asserts A_re, S_SCL_RD/S_WB_RD assert C_re
-//     (mxu.sv, the `unique case (state)` around the port defaults).
-//   * The VPU likewise reads in S_RD0/S_RD1/S_RDS and writes in later states.
-//   * The scalar unit is issue-and-wait: a dispatch op (MATMUL / VPU / RDMEM /
-//     WRMEM) parks it in S_WAIT until the unit reports done (scalar_unit.sv),
-//     so MXU, VPU and DMA activity never overlaps, and s_re/s_we only fire in
-//     S_EXEC for LOADS/STORES — never while another unit owns the memory.
+// Per-unit command queues (cmd_mxu.sv / cmd_vpu.sv / cmd_dma.sv) delete that
+// premise on purpose -- overlapping the DMA with compute is the whole point of
+// them (docs/picorv32_migration.md §9.3). So the mux now genuinely arbitrates,
+// and the requesters that can lose take a grant back:
 //
-// So the priority mux is *exact*, not approximate: no requester is ever denied.
-// The invariant is checked every cycle by an assertion below (simulation only) —
-// if a future change breaks it you get a loud message, not silent corruption.
+//   reads   A > W > C > V > s > DMA        writes   C > V > s > DMA
 //
-// A consequence worth stating plainly: `*_rdata` are now views of one shared
-// output register, so a read on ANY port updates them all. Under the invariant
-// above each consumer still sees exactly what it did before (it samples one
-// cycle after its own enable, and nothing else is reading meanwhile), but the
-// ports are no longer independently held.
-//
+// Both chains are ordered so the requester that CANNOT stall is first. The MXU's
+// three ports lead both and are mutually exclusive inside its own FSM, so it is
+// never denied and gets no grant wire. The VPU freezes its FSM for a cycle when
+// `V_rgnt`/`V_wgnt` is low; the scalar/CPU port re-presents; the DMA parks the
+// byte in its skid buffer and pauses the SRAM stream. A denied requester that
+// ignores its grant loses the access silently, which is the one failure mode this
+// arrangement can have and the reason each stall path is tested end to end.
 // -----------------------------------------------------------------------------
 // TIMING CONTRACT — unchanged from the flat model
 // -----------------------------------------------------------------------------
@@ -155,6 +153,8 @@ module scratchpad #(
     input  logic [ADDR_W-1:0]    V_waddr,
     input  logic [V_BYTES*8-1:0] V_wdata,
     input  logic [V_BYTES-1:0]   V_wstrb,     // per-byte write enable
+    output logic                 V_rgnt,      // this cycle's read was accepted
+    output logic                 V_wgnt,      // ...and this cycle's write
 
     // ---- S_rw : scalar unit single word (shared addr for read + write) ------
     input  logic                 s_re,
@@ -162,6 +162,8 @@ module scratchpad #(
     input  logic [ADDR_W-1:0]    s_addr,
     input  logic [S_BYTES*8-1:0] s_wdata,
     output logic [S_BYTES*8-1:0] s_rdata,     // valid the cycle after s_re
+    output logic                 s_rgnt,
+    output logic                 s_wgnt,
 
     // ---- DMA : DRAM <-> scratchpad engine (read/modify/write) ---------------
     input  logic                 dma_re,
@@ -170,7 +172,9 @@ module scratchpad #(
     input  logic                 dma_we,
     input  logic [ADDR_W-1:0]    dma_waddr,
     input  logic [DMA_BYTES*8-1:0] dma_wdata,
-    input  logic [DMA_BYTES-1:0]   dma_wstrb    // per-byte write enable
+    input  logic [DMA_BYTES-1:0]   dma_wstrb,   // per-byte write enable
+    output logic                   dma_rgnt,
+    output logic                   dma_wgnt
 );
 
     // -------------------------------------------------------------------------
@@ -274,11 +278,20 @@ module scratchpad #(
     end
 
     // -------------------------------------------------------------------------
-    // Write arbitration. Priority DMA > S > V > C, reproducing the flat model's
-    // "last assignment wins" collision order (it applied C, then V, then S, then
-    // DMA to the same array). Again: never exercised in practice.
+    // Write arbitration. Priority **C > V > s > DMA**: the compute units first,
+    // background traffic last. This reverses the original DMA > S > V > C order,
+    // and reversing it was free -- under the old exclusivity invariant at most one
+    // writer was ever asserted, so the order never arbitrated anything. It matters
+    // now: with per-unit command queues the MXU, the VPU and the DMA can all be
+    // mid-dispatch at once, and the arbiter genuinely has to decide.
     //
-    // The scalar port has no sub-word strobe — a STORES writes the whole word.
+    // The order is chosen so the requester that CANNOT stall wins. The MXU's
+    // writeback is a free-running drain of `result_buf` with no handshake, so it
+    // is first and is never denied. Everything below takes its `*_wgnt` back and
+    // holds: the VPU freezes its FSM for a cycle (vpu.sv), the scalar/CPU port
+    // re-presents, and the DMA parks the byte in its skid buffer (dma.sv).
+    //
+    // The scalar port has no sub-word strobe -- a STORES writes the whole word.
     // -------------------------------------------------------------------------
     logic              wr_req;
     logic [ADDR_W-1:0] wr_addr;
@@ -287,22 +300,22 @@ module scratchpad #(
 
     always_comb begin
         wr_req = 1'b1;
-        if (dma_we) begin
-            wr_addr = dma_waddr;
-            wr_data = DW'(dma_wdata);
-            wr_strb = NBANK'(dma_wstrb);
-        end else if (s_we) begin
-            wr_addr = s_addr;
-            wr_data = DW'(s_wdata);
-            wr_strb = NBANK'({S_BYTES{1'b1}});
+        if (C_we) begin
+            wr_addr = C_waddr;
+            wr_data = DW'(C_wdata);
+            wr_strb = NBANK'(C_wstrb);
         end else if (V_we) begin
             wr_addr = V_waddr;
             wr_data = DW'(V_wdata);
             wr_strb = NBANK'(V_wstrb);
-        end else if (C_we) begin
-            wr_addr = C_waddr;
-            wr_data = DW'(C_wdata);
-            wr_strb = NBANK'(C_wstrb);
+        end else if (s_we) begin
+            wr_addr = s_addr;
+            wr_data = DW'(s_wdata);
+            wr_strb = NBANK'({S_BYTES{1'b1}});
+        end else if (dma_we) begin
+            wr_addr = dma_waddr;
+            wr_data = DW'(dma_wdata);
+            wr_strb = NBANK'(dma_wstrb);
         end else begin
             wr_addr = '0;
             wr_data = '0;
@@ -310,6 +323,22 @@ module scratchpad #(
             wr_req  = 1'b0;
         end
     end
+
+    // -------------------------------------------------------------------------
+    // Grants -- one bit per stallable requester, combinational off the same two
+    // priority chains: "your access is happening on this clock edge".
+    //
+    // The MXU's three ports (A/W/C) are top of both chains and are mutually
+    // exclusive inside its own FSM, so they are never denied and have no grant
+    // wire. Everyone else must look at theirs.
+    // -------------------------------------------------------------------------
+    assign V_rgnt   = V_re   && !(A_re || W_re || C_re);
+    assign s_rgnt   = s_re   && !(A_re || W_re || C_re || V_re);
+    assign dma_rgnt = dma_re && !(A_re || W_re || C_re || V_re || s_re);
+
+    assign V_wgnt   = V_we   && !C_we;
+    assign s_wgnt   = s_we   && !(C_we || V_we);
+    assign dma_wgnt = dma_we && !(C_we || V_we || s_we);
 
     // -------------------------------------------------------------------------
     // Address decomposition and skew.
@@ -467,6 +496,10 @@ module scratchpad #(
     // -------------------------------------------------------------------------
 // synthesis translate_off
 `ifndef SYNTHESIS
+    // Set +VERBOSE_ARB at runtime to trace every contended cycle.
+    bit verbose_arb = 0;
+    initial if ($test$plusargs("VERBOSE_ARB")) verbose_arb = 1;
+
     logic [2:0] n_rd, n_wr;
     assign n_rd = 3'(A_re) + 3'(W_re) + 3'(C_re) + 3'(V_re) + 3'(s_re) + 3'(dma_re);
     assign n_wr = 3'(C_we) + 3'(V_we) + 3'(s_we) + 3'(dma_we);
@@ -501,12 +534,15 @@ module scratchpad #(
     // Plain `always`, not `always_ff`: this block contains only reporting tasks,
     // and a synthesis-intent process holding $error draws (fair) tool warnings.
     always @(posedge clk) if (rst_n) begin
-        if (n_rd > 3'd1)
-            $error("scratchpad: %0d concurrent reads (A=%b W=%b C=%b V=%b S=%b DMA=%b) — %0d dropped",
-                   n_rd, A_re, W_re, C_re, V_re, s_re, dma_re, n_rd - 3'd1);
-        if (n_wr > 3'd1)
-            $error("scratchpad: %0d concurrent writes (C=%b V=%b S=%b DMA=%b) — %0d dropped",
-                   n_wr, C_we, V_we, s_we, dma_we, n_wr - 3'd1);
+        // Contention is legal now, so counting requesters is no longer an error
+        // condition. What would be an error is a denied requester whose own logic
+        // does not treat the denial as a stall -- that access is silently dropped.
+        // The units' stall paths are what the end-to-end vector checks exercise;
+        // this trace is what you turn on when they stop passing.
+        if (verbose_arb && (n_rd > 3'd1 || n_wr > 3'd1))
+            $display("[%0t] scratchpad: contention rd=%0d wr=%0d (re A=%b W=%b C=%b V=%b S=%b D=%b / we C=%b V=%b S=%b D=%b)",
+                     $time, n_rd, n_wr, A_re, W_re, C_re, V_re, s_re, dma_re,
+                     C_we, V_we, s_we, dma_we);
     end
 `endif
 // synthesis translate_on

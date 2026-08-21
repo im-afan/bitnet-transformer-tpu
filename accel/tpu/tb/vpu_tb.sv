@@ -76,7 +76,13 @@ module vpu_tb;
     // primitive-op tests leave them at the defaults set in `initial`.
     logic [15:0]               vpu_rows, vpu_cols;
     logic [ADDR_W-1:0]         vpu_row0, vpu_row1, vpu_crow;
-    logic [ADDR_W-1:0]         vpu_src0, vpu_src1, vpu_scalar, vpu_dst;
+    logic [ADDR_W-1:0]         vpu_src0, vpu_src1, vpu_dst;
+    // The {m0,n} operand is a literal in the dispatch now rather than a
+    // scratchpad address the VPU fetched over the V port before its first chunk
+    // (docs/picorv32_migration.md §3). `run_op` still takes an address, and
+    // reads the word out of the scratchpad model itself, so every caller and
+    // every expected value below is unchanged.
+    logic [M0_W+N_W-1:0]       vpu_rq_word;
     logic [9:0]                vpu_vlen;
     logic                      vpu_busy, vpu_done;
 
@@ -95,7 +101,7 @@ module vpu_tb;
         .clk(clk), .rst_n(rst_n),
         .vpu_start(vpu_start), .vpu_op(vpu_op),
         .vpu_src0(vpu_src0), .vpu_src1(vpu_src1),
-        .vpu_scalar(vpu_scalar), .vpu_dst(vpu_dst),
+        .vpu_rq_word(vpu_rq_word), .vpu_dst(vpu_dst),
         .vpu_vlen(vpu_vlen),
         // Macro-op geometry: unused by the primitive ops this TB exercises.
         // Rows/cols of 0 read as 1 inside the DUT, so even if a macro op were
@@ -104,7 +110,9 @@ module vpu_tb;
         .vpu_row0(vpu_row0), .vpu_row1(vpu_row1), .vpu_crow(vpu_crow),
         .vpu_busy(vpu_busy), .vpu_done(vpu_done),
         .V_re(V_re), .V_raddr(V_raddr), .V_rdata(V_rdata),
-        .V_we(V_we), .V_waddr(V_waddr), .V_wdata(V_wdata), .V_wstrb(V_wstrb)
+        .V_we(V_we), .V_waddr(V_waddr), .V_wdata(V_wdata), .V_wstrb(V_wstrb),
+        // No other requester in this TB, so the arbiter always grants.
+        .V_rgnt(1'b1), .V_wgnt(1'b1)
     );
 
     // -------------------------------------------------------------------------
@@ -184,7 +192,8 @@ module vpu_tb;
                           input logic [ADDR_W-1:0] s0, s1, sc, d,
                           input int vlen);
         @(negedge clk);
-        vpu_op = op; vpu_src0 = s0; vpu_src1 = s1; vpu_scalar = sc;
+        vpu_op = op; vpu_src0 = s0; vpu_src1 = s1;
+        vpu_rq_word = get32(sc);
         vpu_dst = d; vpu_vlen = vlen[9:0]; vpu_start = 1'b1;
         @(negedge clk);
         vpu_start = 1'b0;
@@ -392,7 +401,7 @@ module vpu_tb;
     // -------------------------------------------------------------------------
     initial begin
         vpu_start = 1'b0; vpu_op = '0;
-        vpu_src0 = '0; vpu_src1 = '0; vpu_scalar = '0; vpu_dst = '0; vpu_vlen = '0;
+        vpu_src0 = '0; vpu_src1 = '0; vpu_rq_word = '0; vpu_dst = '0; vpu_vlen = '0;
         vpu_rows = 16'd0; vpu_cols = 16'd0;
         vpu_row0 = '0; vpu_row1 = '0; vpu_crow = '0;
         for (int i = 0; i < MEM_SZ; i++) mem[i] = '0;

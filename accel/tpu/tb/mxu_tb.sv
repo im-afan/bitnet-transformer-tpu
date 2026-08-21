@@ -45,7 +45,10 @@ module mxu_tb;
     localparam int N_W  = 4;
 
     logic              start, accumulate, requant, busy, done;
-    logic [ADDR_W-1:0] act_addr, weight_addr, out_addr, scalar_addr;
+    logic [ADDR_W-1:0] act_addr, weight_addr, out_addr;
+    // The requant {m0,n} is a literal in the dispatch now, not a scratchpad
+    // address the MXU fetches over the C port (docs/picorv32_migration.md §3).
+    logic [M0_W+N_W-1:0] rq_word;
     logic [5:0]        t_len;
 
     logic              A_re;  logic [ADDR_W-1:0] A_raddr;  logic [ROWS*8-1:0] A_rdata;
@@ -57,7 +60,7 @@ module mxu_tb;
     mxu #(.ROWS(ROWS), .COLS(COLS), .ADDR_W(ADDR_W), .M0_W(M0_W), .N_W(N_W)) dut (
         .clk(clk), .rst_n(rst_n),
         .start(start), .act_addr(act_addr), .weight_addr(weight_addr),
-        .out_addr(out_addr), .scalar_addr(scalar_addr), .t_len(t_len),
+        .out_addr(out_addr), .rq_word(rq_word), .t_len(t_len),
         // Strides zero => the single-tile defaults (a_row=ROWS, c_row=COLS*4,
         // w_col=ROWS*2/8), i.e. exactly the constants these replaced. Driving
         // them explicitly rather than leaving them unconnected: an unconnected
@@ -133,6 +136,8 @@ module mxu_tb;
     endfunction
 
     // Requant {M0, N} word: m0 in low M0_W bits, n above it (matches VPU/DUT).
+    // Still written to the scratchpad model so the address map in this TB stays
+    // as documented, but the DUT reads the literal below.
     task automatic put_scalar(input int m0, input int n);
         logic [31:0] w;
         w = (n[N_W-1:0] << M0_W) | m0[M0_W-1:0];
@@ -195,7 +200,7 @@ module mxu_tb;
     // -------------------------------------------------------------------------
     task automatic run_matmul(input int T, input logic acc);
         @(negedge clk);
-        act_addr = ACT; weight_addr = WGT; out_addr = RES; scalar_addr = SCL;
+        act_addr = ACT; weight_addr = WGT; out_addr = RES;
         t_len = T[5:0]; accumulate = acc; requant = 1'b0; start = 1'b1;
         @(negedge clk);
         start = 1'b0;
@@ -206,7 +211,7 @@ module mxu_tb;
     // Requant path: fresh matmul, narrow int32 -> int8 on store into RQO.
     task automatic run_requant(input int T);
         @(negedge clk);
-        act_addr = ACT; weight_addr = WGT; out_addr = RQO; scalar_addr = SCL;
+        act_addr = ACT; weight_addr = WGT; out_addr = RQO;
         t_len = T[5:0]; accumulate = 1'b0; requant = 1'b1; start = 1'b1;
         @(negedge clk);
         start = 1'b0;
@@ -244,6 +249,7 @@ module mxu_tb;
         gen_weights();
         gen_acts(T);
         put_scalar(m0, n);
+        rq_word = (n[N_W-1:0] << M0_W) | m0[M0_W-1:0];
         run_requant(T);
         for (int t = 0; t < T; t++)
             for (int j = 0; j < COLS; j++) begin
@@ -287,7 +293,7 @@ module mxu_tb;
     // -------------------------------------------------------------------------
     initial begin
         start = 1'b0; accumulate = 1'b0; requant = 1'b0; t_len = '0;
-        act_addr = '0; weight_addr = '0; out_addr = '0; scalar_addr = '0;
+        act_addr = '0; weight_addr = '0; out_addr = '0; rq_word = '0;
         for (int i = 0; i < MEM_SZ; i++) mem[i] = '0;
 
         repeat (4) @(posedge clk);

@@ -77,8 +77,10 @@
 // preserving what was there.
 //
 // The scalar operand. VOP_REQUANT, VOP_DYT and VOP_TQUANT are the only ops that
-// read `vpu_scalar`, and all three read the same thing: one int32 {m0, n} word,
-// loaded once on the first chunk and held for the whole vector.
+// use `vpu_rq_word`, and all three use the same thing: one {m0, n} pair, latched
+// at dispatch and held for the whole vector. It used to be a scratchpad address
+// that cost a two-state fetch over the V port before the first chunk; it is now
+// a 16-bit literal in the command (docs/picorv32_migration.md §3).
 //
 // Streaming: a vector of `vpu_vlen` elements is processed LANES elements at a
 // time. Each chunk reads its operand(s), computes all lanes in one cycle, then
@@ -109,7 +111,12 @@ module vpu #(
     input  logic [4:0]           vpu_op,
     input  logic [ADDR_W-1:0]    vpu_src0,
     input  logic [ADDR_W-1:0]    vpu_src1,
-    input  logic [ADDR_W-1:0]    vpu_scalar,   // REQUANT / DYT {n,m0} word address
+    // REQUANT / DYT / TQUANT {n,m0} as a LITERAL, carried in the dispatch
+    // rather than fetched from the scratchpad (docs/picorv32_migration.md §3).
+    // M0_W + N_W = 16 bits, the same width as the address it replaces. The two
+    // states that used to fetch it (S_RDS/S_RDSD) are gone with it, so every
+    // requant/dyt/tquant dispatch is two clocks and one scratchpad read shorter.
+    input  logic [M0_W+N_W-1:0]  vpu_rq_word,
     input  logic [ADDR_W-1:0]    vpu_dst,
     input  logic [9:0]           vpu_vlen,     // vector length in elements
     // ---- Macro-op geometry (config registers; docs/macro_ops.md §5) --------
@@ -137,7 +144,15 @@ module vpu #(
     output logic                      V_we,
     output logic [ADDR_W-1:0]         V_waddr,
     output logic [SCRATCHPAD_W*8-1:0] V_wdata,
-    output logic [SCRATCHPAD_W-1:0]   V_wstrb       // per-byte write enable
+    output logic [SCRATCHPAD_W-1:0]   V_wstrb,      // per-byte write enable
+    // Grants. The scratchpad arbitrates now that per-unit command queues let the
+    // MXU, the VPU and the DMA be mid-dispatch at once (scratchpad.sv, "grants").
+    // The MXU wins both chains because its writeback cannot stall; this unit can,
+    // so when a grant comes back low the whole FSM freezes for that clock and
+    // re-presents the same access. `stalled` below is the only thing that reads
+    // these -- no state, no skid, no change to the datapath.
+    input  logic                      V_rgnt,
+    input  logic                      V_wgnt
 );
 
     localparam int LANES = SCRATCHPAD_W / 4;   // int32 lanes per access (512b -> 16)
@@ -172,9 +187,6 @@ module vpu #(
     // -------------------------------------------------------------------------
     function automatic logic needs_src1(input logic [4:0] o);
         return (o == VOP_DOT) || (o == VOP_ADD);
-    endfunction
-    function automatic logic needs_scalar(input logic [4:0] o);
-        return (o == VOP_REQUANT) || (o == VOP_DYT) || (o == VOP_TQUANT);
     endfunction
     // Sum-only since REDUCEMAX/REDUCESUM were removed; VOP_DOT is the only
     // reduction left, so `acc` never needs a most-negative initial value.
@@ -233,24 +245,30 @@ module vpu #(
     // FSM.
     // -------------------------------------------------------------------------
     typedef enum logic [3:0] {
-        S_IDLE, S_RD0, S_RD0D, S_RD1, S_RD1D, S_RDS, S_RDSD, S_EXEC, S_WB, S_DONE
+        S_IDLE, S_RD0, S_RD0D, S_RD1, S_RD1D, S_EXEC, S_WB, S_DONE
     } state_t;
     state_t state, state_n;
+
+    // Scratchpad denial. V_re/V_we are Moore outputs of `state`, and each state
+    // makes at most one access, so freezing the state register for a clock and
+    // re-driving the same request is exactly a retry. Nothing downstream sees a
+    // difference: `V_rdata` is only ever sampled the cycle after a *granted*
+    // read, because the state that samples it is one the FSM could not have
+    // reached without the grant.
+    wire stalled = (V_re && !V_rgnt) || (V_we && !V_wgnt);
 
     // Latched operands (captured on start; scalar unit may move on immediately).
     logic [4:0]        op_r;
     logic [ADDR_W-1:0] dst_r;
     logic [ADDR_W-1:0] p_src0, p_src1, p_dst;   // running chunk pointers
-    logic [ADDR_W-1:0] scalar_addr_r;
     logic [10:0]       remaining;               // elements left to process (0..1024)
-    logic              scalar_loaded;
 
-    logic [ACC_W-1:0]  scalar_reg;              // REQUANT / DYT {n,m0}
+    logic [M0_W+N_W-1:0]     rq_word_r;         // latched {n,m0} literal
     logic signed [ACC_W-1:0] acc;               // reduction accumulator (sum only)
 
-    // Requant parameters (valid once scalar_reg is loaded).
-    wire [M0_W-1:0] rq_m0 = scalar_reg[M0_W-1:0];
-    wire [N_W-1:0]  rq_n  = scalar_reg[M0_W +: N_W];
+    // Requant parameters. Latched at dispatch, so they are valid from S_RD0 on.
+    wire [M0_W-1:0] rq_m0 = rq_word_r[M0_W-1:0];
+    wire [N_W-1:0]  rq_n  = rq_word_r[M0_W +: N_W];
 
     // Element widths are per-op, and the two are independent: ADD/RELU/DOT read
     // int8 and write int32; REQUANT and DYT read int32 and write int8. src1 is
@@ -404,7 +422,6 @@ module vpu #(
         unique case (state)
             S_RD0: begin V_re = 1'b1; V_raddr = p_src0; end
             S_RD1: begin V_re = 1'b1; V_raddr = p_src1; end
-            S_RDS: begin V_re = 1'b1; V_raddr = scalar_addr_r; end
             S_EXEC: if (!is_reduction(op_r)) begin
                 V_we    = 1'b1;
                 V_waddr = p_dst;
@@ -433,14 +450,11 @@ module vpu #(
                     end
             S_RD0:  state_n = S_RD0D;
             S_RD0D: begin
-                        if (needs_src1(op_r))                          state_n = S_RD1;
-                        else if (needs_scalar(op_r) && !scalar_loaded) state_n = S_RDS;
-                        else                                           state_n = S_EXEC;
+                        if (needs_src1(op_r)) state_n = S_RD1;
+                        else                  state_n = S_EXEC;
                     end
             S_RD1:  state_n = S_RD1D;
             S_RD1D: state_n = S_EXEC;
-            S_RDS:  state_n = S_RDSD;
-            S_RDSD: state_n = S_EXEC;
             S_EXEC: begin
                         if (last_chunk) begin
                             if (is_reduction(op_r)) state_n = S_WB;
@@ -468,14 +482,12 @@ module vpu #(
             p_src0        <= '0;
             p_src1        <= '0;
             p_dst         <= '0;
-            scalar_addr_r <= '0;
+            rq_word_r     <= '0;
             remaining     <= '0;
-            scalar_loaded <= 1'b0;
-            scalar_reg    <= '0;
             acc           <= '0;
             V_data0       <= '0;
             V_data1       <= '0;
-        end else begin
+        end else if (!stalled) begin
             state <= state_n;
 
             unique case (state)
@@ -507,9 +519,8 @@ module vpu #(
                     p_src0        <= vpu_src0;
                     p_src1        <= vpu_src1;
                     p_dst         <= vpu_dst;
-                    scalar_addr_r <= vpu_scalar;
+                    rq_word_r     <= vpu_rq_word;
                     remaining     <= {1'b0, vpu_vlen};
-                    scalar_loaded <= 1'b0;
                     // VOP_DOT is the only reduction left, so the accumulator
                     // always opens at zero.
                     acc           <= '0;
@@ -534,11 +545,6 @@ module vpu #(
 
                 S_RD0D: V_data0 <= V_rdata;
                 S_RD1D: V_data1 <= V_rdata;
-                S_RDSD: begin
-                    scalar_reg    <= V_rdata[ACC_W-1:0];   // REQUANT / DYT {n,m0}
-                    scalar_loaded <= 1'b1;
-                end
-
                 S_EXEC: begin
                     if (is_reduction(op_r)) acc <= acc_next;
                     // Advance to the next chunk (harmless on the last chunk).

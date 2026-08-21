@@ -99,10 +99,10 @@ module tpu_top_uart_tb;
 
     // Performance-counter block returned by 'T'. Must match tpu_top.sv's NPERF
     // and PERF_* indices — those define the wire order, this decodes it.
-    localparam int NPERF   = 7;
+    localparam int NPERF   = 10;
     localparam int P_RUN   = 0, P_MXU = 1, P_MLOAD = 2,
                    P_VPU   = 3, P_DMA = 4, P_SWAIT = 5,
-                   P_VMM   = 6;
+                   P_VMM   = 6, P_IDLEC = 7, P_QFULL = 8, P_OVLAP = 9;
 
     // Word w of a 'T' reply. uart_read_timer() shifts bytes in from the low end,
     // so the first word received (counter 0) ends up in the highest slice.
@@ -450,6 +450,26 @@ module tpu_top_uart_tb;
             $display("  counters: mxu=%0d mload=%0d vpu=%0d (vmm=%0d) dma=%0d swait=%0d",
                      ctr_w(ctr, P_MXU), ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_VPU),
                      ctr_w(ctr, P_VMM), ctr_w(ctr, P_DMA), ctr_w(ctr, P_SWAIT));
+            $display("  macro-op plane: idle=%0d qfull=%0d ovlap=%0d",
+                     ctr_w(ctr, P_IDLEC), ctr_w(ctr, P_QFULL), ctr_w(ctr, P_OVLAP));
+
+            // The scalar unit is still issue-and-wait, so it can never have two
+            // units running at once and can never overrun a queue. Both of these
+            // must read exactly zero while it is the producer -- which makes them
+            // the check that phase 1 really did preserve the old behaviour, and
+            // the first thing that should go nonzero when a program stops
+            // waiting after every dispatch.
+            checks++;
+            if (ctr_w(ctr, P_OVLAP) != 0) begin
+                errors++;
+                $display("  FAIL: ovlap=%0d under issue-and-wait (must be 0)",
+                         ctr_w(ctr, P_OVLAP));
+            end
+            checks++;
+            if (ctr_w(ctr, P_QFULL) != 0) begin
+                errors++;
+                $display("  FAIL: qfull=%0d under issue-and-wait (must be 0)", ctr_w(ctr, P_QFULL));
+            end
 
             // Structural invariants. These hold for *any* program, so they test
             // the counter block rather than this particular pair of programs.

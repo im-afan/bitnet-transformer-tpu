@@ -61,6 +61,7 @@ module bram_controller #(
 
     output logic [DATA_W-1:0] dout,
     output logic              dout_valid,
+    input  logic              dout_ready, // held beat; see sram.sv's note
 
     output logic busy,
     output logic done,
@@ -127,7 +128,7 @@ module bram_controller #(
 
     wire [DEPTH_W-1:0] index = addr_q[DEPTH_W-1:0];   // the alias, made explicit
     wire               en_wr = (state == WRITE) && wr_last;
-    wire               en_rd = (state == READ)  && rd_last;
+    wire               en_rd = (state == READ)  && rd_last && dout_ready;
 
     always_ff @(posedge clk) begin
         if (en_wr) mem[index] <= din_q;
@@ -186,8 +187,9 @@ module bram_controller #(
                 end
 
                 READ: begin
-                    beat <= beat + BEAT_W'(1);
-                    if (rd_last) begin
+                    if (!rd_last) begin
+                        beat <= beat + BEAT_W'(1);
+                    end else if (dout_ready) begin
                         dout_valid <= 1'b1;        // `q` is loaded on this edge
                         beat       <= '0;
                         cnt        <= cnt - LEN_W'(1);
@@ -198,6 +200,7 @@ module bram_controller #(
                             state <= IDLE;
                         end
                     end
+                    // else: hold the beat (sram.sv's dout_ready note).
                 end
 
                 WFETCH: begin

@@ -58,6 +58,9 @@ RTL_uart_bram := ../rtl/uart_bram.sv ../rtl/uart_interface.sv \
 # dma_tb instantiates the DUT against the real scratchpad and a behavioral SRAM
 # chip, so it needs all three (without this `make all` cannot elaborate it).
 RTL_dma := ../rtl/dma.sv ../rtl/scratchpad.sv ../rtl/sram.sv
+# The command front ends share one FIFO module.
+RTL_cmd_queue := ../rtl/cmd_queue.sv
+RTL_cmd_plane := ../rtl/cmd_queue.sv ../rtl/cmd_mxu.sv ../rtl/cmd_vpu.sv ../rtl/cmd_dma.sv
 
 RTL ?= $(if $(RTL_$(TEST)),$(RTL_$(TEST)),../rtl/$(TEST).sv)
 
@@ -76,12 +79,15 @@ UART_TOP := tpu_top_uart_tb
 UART_RTL := ../rtl/tpu_top.sv ../rtl/scalar_unit.sv ../rtl/mxu.sv ../rtl/vpu.sv \
             ../rtl/scratchpad.sv ../rtl/dma.sv ../rtl/sram.sv \
             ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv \
-            ../rtl/perf_counters.sv
+            ../rtl/perf_counters.sv \
+            ../rtl/cmd_queue.sv ../rtl/cmd_mxu.sv ../rtl/cmd_vpu.sv ../rtl/cmd_dma.sv \
+            ../rtl/cpu_subsys.sv ../rtl/vendor/picorv32.v
 
 # Both tpu_top testbenches need the whole core. Declared here (rather than up with
 # the other RTL_<name> lines) so the file list is written once: the backdoor TB
 # does not drive the UART, but tpu_top instantiates the UART blocks either way and
 # will not elaborate without them.
+RTL_cpu_smoke    := $(UART_RTL)
 RTL_tpu_top      := $(UART_RTL)
 RTL_tpu_top_uart := $(UART_RTL)
 
@@ -90,7 +96,7 @@ RTL_tpu_top_uart := $(UART_RTL)
 # driving it, so `make all` would only fail on it. Use `make cosim`.
 TESTS := $(filter-out uart_memory_cosim,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
 
-.PHONY: sim wave list all clean uart echo mem bram cosim
+.PHONY: sim wave list all clean uart echo mem bram cosim examples model
 
 sim: $(TB) $(RTL)
 	$(IVERILOG) -o $(TOP).vvp $(RTL) $(TB)
@@ -107,6 +113,30 @@ uart: $(UART_TOP).sv $(UART_RTL)
 	python $(TPULANG)/gen_vectors.py -p $(TPULANG)/$(PROG2) -o vectors_uart2
 	$(IVERILOG) -o $(UART_TOP).vvp $(UART_RTL) $(UART_TOP).sv
 	$(VVP) $(UART_TOP).vvp
+
+# Every example kernel through the whole core, checked against its own golden
+# vectors -- the ISA regression for the macro-op dispatch plane. The loop lives
+# in run_examples.sh rather than in a recipe, because it is a real script and a
+# make recipe is a bad place to keep one.
+#
+#   make examples                      all of them
+#   make examples EX="relu_layer vecmatmul"
+EX ?=
+
+examples: $(UART_RTL) tpu_top_tb.sv run_examples.sh
+	sh ./run_examples.sh $(EX)
+
+# The whole adder-model kernel through the core. LAYERS=1 (~182 k clocks) is the
+# edit-run loop; LAYERS=4 is the shipped kernel (~690 k) and takes a while. HB=N
+# turns on the progress heartbeat every N clocks.
+#
+#   make model                 layers=1
+#   make model LAYERS=4 HB=100000
+LAYERS ?= 1
+HB     ?= 0
+
+model: $(UART_RTL) tpu_top_tb.sv run_model.sh
+	HB=$(HB) sh ./run_model.sh $(LAYERS)
 
 # Alias for `make TEST=uart_echo sim` (RTL_uart_echo above supplies the sources).
 echo:
@@ -141,4 +171,6 @@ all:
 	done
 
 clean:
-	rm -f *_tb.vvp *_tb.vcd
+	rm -f *_tb.vvp *_tb.vcd ex_*.vvp
+	rm -rf vec_*
+	rm -f model*.vvp

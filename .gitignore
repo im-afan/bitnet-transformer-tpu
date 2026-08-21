@@ -15,8 +15,16 @@ accel/tpu/sim/*.out
 
 # tb/Makefile writes compiled/waveform output next to the testbenches, not into
 # sim/. (Some of these are already tracked from before this rule existed —
-# `git rm --cached accel/tpu/tb/*.vvp accel/tpu/tb/*.vcd` to drop them.)
+# `git rm --cached accel/tpu/tb/*.vvp
+# Golden vectors generated on demand by `make examples` / `make uart`. The
+# committed ones (vectors/, vectors_model/, vectors_uart*/) are named explicitly
+# and stay tracked; these are scratch.
+accel/tpu/tb/vec_*/ accel/tpu/tb/*.vcd` to drop them.)
 accel/tpu/tb/*.vvp
+# Golden vectors generated on demand by `make examples` / `make uart`. The
+# committed ones (vectors/, vectors_model/, vectors_uart*/) are named explicitly
+# and stay tracked; these are scratch.
+accel/tpu/tb/vec_*/
 accel/tpu/tb/*.vcd
 accel/tpu/tb/*.fst
 

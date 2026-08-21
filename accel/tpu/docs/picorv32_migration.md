@@ -1,6 +1,98 @@
-# Migrating the scalar unit to PicoRV32 + macro-op dispatch — plan
+# Migrating the scalar unit to PicoRV32 + macro-op dispatch
 
-**Status: proposal. Nothing here is built.**
+**Status: the RTL is built and passing. Phases 0-2 and 4 are in the tree; 3 and
+5-6 (the Python toolchain and the retirement of the old front end) are not.**
+
+| Phase | State |
+| --- | --- |
+| 0 | **done** - counters reworked (§9.5); `swait` supplemented by `idlec`/`qfull`/`ovlap` |
+| 1 | **done** - `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv`; `scalar_unit.sv` packs its config registers into commands and pushes them |
+| 2 | **done** - scratchpad grants, VPU stall, DMA skid buffer + `sram.sv` backpressure, queue depth 8 |
+| 3 | not started - the RV32IM interpreter, `iss.py`'s trace front end, `gen_vectors.py` rewiring |
+| 4 | **done (RTL)** - `cpu_subsys.sv`: PicoRV32 + AXI4-Lite + the MMIO command aperture, alongside the scalar unit. No firmware toolchain yet, so kernels in C are phase 3's dependency, not this one's. |
+| 5-6 | not started - retiring `scalar_unit.sv`/`assembler.py`/`.tpu`, then a second architecture |
+
+What passes today, on the tree as it stands:
+
+| Test | Result |
+| --- | --- |
+| `make TEST=mxu` / `vpu` / `scratchpad` / `sram` | 168 / 318 / 50 / 4872 checks, 0 errors |
+| `make cosim` (the real host driver against the RTL) | 11 of 11 |
+| `make TEST=dma` (incl. new contention tests) | 16 737 checks, 0 errors |
+| `make TEST=cmd_queue` (new) | 123 checks, 0 errors |
+| `make examples` (new) - all ten example kernels vs. their golden vectors | **10 passed, 0 failed** |
+| `make uart` (two programs, one link, no reset between) | 469 checks, 0 errors |
+| `make TEST=cpu_smoke` (new) | 68 checks, 0 errors - PicoRV32 boots, pushes two DMA commands, 64-byte round trip byte-exact |
+| `make model` - the adder model at `layers=1` through `tpu_top_tb` | **14 336 checks, 0 errors**, halts at pc=225 after 181 898 clocks |
+| `make model LAYERS=4` - the shipped kernel | **26 624 checks, 0 errors**, halts at pc=225 after 693 107 clocks |
+| `make all` | 15 of 15 |
+
+`make examples` is the one that matters most: between them the ten kernels cover
+every path a dispatch can take through the new plane - single-tile `matmul`,
+software tiling, the hardware tile loop and its config strides, `vecmatmul` and
+its geometry command, runtime `setcfgr`, the transposing DMA, and DRAM above
+64 KB. All byte-identical to what `iss.py` produced, unmodified.
+
+Two make targets were added for this, and they are the loop worth using:
+`make examples` (all ten kernels, a few minutes) and `make model [LAYERS=n]`
+(the whole adder kernel; `LAYERS=1` is ~182 k clocks and exercises every code
+path the shipped four-layer one does). A long run prints nothing until it halts,
+so `tpu_top_tb` also gained `+HEARTBEAT` — a frozen PC with a unit stuck busy is
+a hang, a moving one is just slow. That distinction is not academic: it is what
+localized the one real bug found during this work, a broken tile loop that
+looked exactly like a slow simulation for forty minutes.
+
+### What the command plane actually cost
+
+The four-layer run is the like-for-like comparison against §0's baseline, same
+program, same vectors, same 8x8 geometry:
+
+| | baseline | with the command plane | delta |
+| --- | --- | --- | --- |
+| run | 690 705 | **693 107** | **+2 401 (+0.35%)** |
+| MXU | 405 433 | 404 409 | -1 024 |
+| VPU | 52 160 | 51 648 | -512 |
+| DMA | 226 198 | 227 820 | +1 622 |
+| residual = issue overhead | 6 914 (1.00%) | **9 229 (1.33%)** | +2 315 |
+
+Read that as three separate effects, because they pull in different directions:
+
+- **Issue overhead is +2 315 clocks**, from 1.00% of the run to 1.33%. That is
+  the real cost of the plane: a dispatch now spends a clock in `S_PUSH` per
+  command (two for a matmul, which pushes geometry as well), plus two more in
+  `S_RQRD`/`S_RQLATCH` when its `{m0,n}` operand is an address, plus a clock in
+  the unit's front end. It is smaller than §9's estimate for the *CPU* producer
+  (~2.7%) for the obvious reason: the scalar unit packs a command from registers
+  in one clock, where firmware pays four stores.
+- **The units got faster**, by 1 536 clocks between them, because the requant
+  literal deleted a scratchpad round trip from every requantizing dispatch.
+- **The DMA got slower**, by 1 622 clocks, because a fill now drains its skid
+  buffer before the range is declared finished. That is the price of being able
+  to overlap at all, and it is paid per range — which is why the transposing
+  transfers (one range per row) carry most of it.
+
+Net **+0.35%**, byte-identical output. That is the number to hold against the
+~1.45x that §9.3 says the overlap is worth, none of which is claimed yet: the
+scalar unit still waits after every dispatch, and `ovlap` reads 0.
+
+**One measured side effect worth recording.** `tiled_matmul_hw` (two matmuls)
+spends 578 clocks in the MXU against the 582 in `macro_ops.md` §8's phase-0
+table. The 4 clocks are exactly the two states per requantizing matmul that the
+`{m0,n}` literal deleted - the array no longer stops to fetch its requant word
+over the C port before draining the result buffer.
+
+Two measurements worth recording from the UART run, because they are what says
+phase 1 preserved the old behaviour: `ovlap = 0` and `qfull = 0` on both
+programs. The scalar unit still waits after every dispatch, so no two units ever
+run at once and the queue never backs up - the command plane is in the path and
+is provably not yet being used for anything. `idlec` reads 92 of 526 clocks on
+`relu_layer`, which is exactly `run - (mxu + vpu + dma)`.
+
+**What is deliberately still true:** the tpulang ISA is unchanged. Same opcodes,
+same config registers, same programs, same golden vectors, same `iss.py`. The
+config file did not go away - it moved from being *read by the units* to being
+*packed into commands by the producer*, which is what removes the stale-config
+hazard while leaving every existing program running.
 
 Goal: write kernels for model architectures other than the adder in a real language, without
 writing a compiler. Replace `scalar_unit.sv` with a PicoRV32 core; replace the global config
@@ -75,9 +167,11 @@ kernels; and the "compiler" the project has to maintain is a ~200-line MMIO head
 
 ## 2. Scope
 
-**Removed.** `scalar_unit.sv` (1 076 LUTs, 257 FFs, 1 RAMB36, 3 DSP), its config register
-file, its instruction BRAM, the `cfg_*` host preset port, and the config-register inputs on
-`mxu.sv` / `vpu.sv` / `dma.sv`.
+**Removed.** The config-register inputs on `mxu.sv` / `vpu.sv` / `dma.sv`, and the
+scratchpad round trip for the requant `{m0,n}` word (`mxu.sv` lost two FSM states,
+`vpu.sv` lost two). `scalar_unit.sv` and its config file survive as a *producer* —
+phase 5 retires them, and until the firmware toolchain exists they are what keeps
+the `.tpu` suite running.
 
 **Added.** PicoRV32 + firmware BRAM, an AXI4-Lite fabric, one command decoder + queue per
 unit, a status/sync block, a scratchpad AXI window, and backpressure on the scratchpad's
@@ -100,15 +194,32 @@ One **128-bit command**, four RV32 stores, uniform across all three units. §9.2
 alternatives; uniform 128 costs about 1% of total runtime against a tightly packed
 variable-width encoding, and is worth it.
 
-Common header, bits 127..112:
+A command is four 32-bit words, `word0` first: `cmd[31:0]`, `cmd[63:32]`, `cmd[95:64]`,
+`cmd[127:96]`. The header lives in the **low** bits of `word0`, not the high bits of the
+128 — so a producer builds it with an `ori` against a small constant rather than a shift,
+and the first store carries it:
 
-| Bits | Field | Meaning |
+| `word0` bits | Field | Meaning |
 | --- | --- | --- |
-| 127..120 | `op` | command selector (per-unit namespace) |
-| 119..116 | `flags` | `.acc` / `.rq` / `.t`, per op |
-| 115..112 | `rsv` | must be zero — decoders reject nonzero so a format change fails loudly |
+| 7..0 | `op` | command selector, per-unit namespace |
+| 15..8 | `flags` | `.acc` / `.rq` / `tiled` / `write` / `.t`, per op |
+| 31..16 | — | the first operand field (an address, in every command that has one) |
 
-The remaining 112 bits are per-op. Three things fall out of the current ISA:
+As built (`cmd_mxu.sv`, `cmd_vpu.sv`, `cmd_dma.sv`):
+
+| Command | `op` | `word0[31:16]` | `word1` | `word2` | `word3` |
+| --- | --- | --- | --- | --- | --- |
+| `MXU_GEOM` | `0x01` | `arow` | `wcol:crow` | `tlen(6) : ntiles(8) : ktiles(8)` | — |
+| `MXU_MM` | `0x02` | `out` | `wgt:act` | `{n,m0}` | — |
+| `VPU_OP` | `0x01` | `dst` (`flags[4:0]` = the `VOP_*` code) | `src1:src0` | `{n,m0} : vlen(10)` | — |
+| `VPU_GEOM` | `0x02` | `vrows` | `vrow0:vcols` | `vcrow:vrow1` | — |
+| `DMA_MOVE` | `0x01` | `spad` (`flags[0]`=write, `flags[1]`=`.t`) | `dram(19)` | `tcols:len` | `tdrow:tsrow` |
+
+An unknown `op` is discarded with a simulation message rather than executed, so a stale
+command stream fails loudly instead of running the wrong instruction — the same principle
+as the ISA's retired-opcode holes.
+
+Three things fall out of the current ISA:
 
 **The requant word travels in the command, not in the scratchpad.** `{m0,n}` is 12 + 4 = 16
 bits, exactly the width of the scratchpad address that currently points at it. Same command

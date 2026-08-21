@@ -15,6 +15,7 @@ Detailed per-component design notes (this file is the overview):
 | [scalar_unit_pipeline.md](scalar_unit_pipeline.md) | Plan to pipeline it — **proposal, not built**; the RTL is still the multi-cycle FSM |
 | [isa.md](isa.md)                 | Guide to writing TPU programs in tpulang (+ encoding/opcode appendix) |
 | [macro_ops.md](macro_ops.md)     | Moving tiling/attention into hardware (CISC macro-ops). Phases 0–4 **are built** (`setcfgr`, MXU strides, `matmul_t`, `vecmatmul`); `softmax` was built then removed and `layernorm` is dropped — see its banner |
+| [picorv32_migration.md](picorv32_migration.md) | The macro-op **dispatch plane**: 128-bit commands in per-unit queues instead of a global config file, and PicoRV32 as a second producer beside the scalar unit. RTL built and passing; the C toolchain is not. Supersedes macro_ops.md §1's rejection of a CPU |
 | [uart_host.md](uart_host.md)     | The host link: frame format, the five commands, arbitration |
 | [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image and how to use it |
 | [synth.md](synth.md)             | Vivado build flow, Cmod A7-35T deployment, sizing reality check |

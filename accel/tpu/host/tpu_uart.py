@@ -92,6 +92,12 @@ TIMER_COUNTERS = (
     "dma",    # DMA busy
     "swait",  # scalar unit blocked in S_WAIT (the cost of issue-and-wait)
     "vmm",    # VPU running a `vecmatmul` macro op (subset of vpu)
+    # Macro-op dispatch plane (docs/picorv32_migration.md §9.5). `swait` above
+    # stopped meaning "control overhead" once dispatch went through per-unit
+    # command queues; these three are what replace it.
+    "idlec",  # clocks with no unit busy at all — what issue overhead costs
+    "qfull",  # a producer stalled on a full queue — the queue is too shallow
+    "ovlap",  # two or more units busy at once — is the DMA actually overlapping?
 )
 TIMER_WORDS = len(TIMER_COUNTERS)
 TIMER_BYTES = TIMER_WORDS * 4
@@ -102,7 +108,12 @@ STAT_NAK = 0x15
 DEFAULT_BAUD = 115200      # CLK_PER_BIT = 868 @ 100 MHz, 8N1
 
 MEM_ADDR_W = 19            # external SRAM byte address
-IMEM_AW = 10               # instruction memory word address
+IMEM_AW = 10               # scalar unit instruction memory word address
+# The 'I'/'G' word address is one bit wider than the firmware RAM so its top bit
+# can select which producer the host is addressing: 0 = the scalar unit's
+# instruction memory, 1 = the PicoRV32 firmware RAM (tpu_top.sv `host_sel_fw`).
+FW_AW = 12                 # firmware RAM word address (16 KB)
+FW_BASE = 1 << FW_AW       # OR this into an 'I'/'G' address to reach the CPU
 MEM_LIMIT = 1 << MEM_ADDR_W
 IMEM_LIMIT = 1 << IMEM_AW
 

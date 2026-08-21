@@ -165,7 +165,7 @@ module cmod_a7_top #(
         // Widths are written out rather than using '0: Vivado has been
         // inconsistent about unsized literals in port connections.
         .host_run   (1'b0),
-        .boot_pc    ({IMEM_AW{1'b0}}),
+        .boot_pc    ('0),   // width is HOST_AW now; the board never uses this port
         .busy       (busy),
         .done       (done),
         .pc_dbg     (),                     // no pins to spare; left open

@@ -1,3 +1,19 @@
+> ## Dispatch now goes through per-unit command queues
+>
+> Every unit is fronted by `cmd_mxu.sv` / `cmd_vpu.sv` / `cmd_dma.sv`: a 128-bit
+> command queue that carries the operands and geometry a dispatch needs, instead
+> of the unit reading a global config register file at `start`. Producers push
+> commands; the units pop them in order. See
+> [picorv32_migration.md](picorv32_migration.md) §3-§5 for the format and the
+> reasoning, and note the two consequences this document predates:
+>
+> * **The units can run at once.** Scratchpad access is arbitrated with real
+>   grants rather than the exclusivity invariant that used to make arbitration
+>   free (`scratchpad.sv`).
+> * **There are two producers.** `scalar_unit.sv` still runs tpulang and still
+>   waits after each dispatch, so nothing below about the ISA changes; PicoRV32
+>   (`cpu_subsys.sv`) is the other, and pushes the same commands from firmware.
+
 # MXU — Matrix Unit
 
 Weight-stationary systolic array that computes the ternary-weight matmuls of the model.

@@ -62,6 +62,11 @@ module dma_tb;
     logic [15:0]             sram_len, sram_stride;
     logic [MEM_DATA_W-1:0]   sram_din, sram_dout;
     logic                    sram_din_valid, sram_din_ready, sram_dout_valid;
+    logic                    sram_dout_ready;
+    logic                    spad_rgnt, spad_wgnt;
+    // Contention injectors: driving these makes the scratchpad deny the DMA, so
+    // the skid buffer and the SPILL_RD retry are exercised by the same vectors.
+    logic                    spy_V_re = 1'b0, spy_V_we = 1'b0;
     logic                    sram_busy, sram_done;
 
     // ---- DMA <-> scratchpad DMA port ----------------------------------------
@@ -91,10 +96,12 @@ module dma_tb;
         .sram_din(sram_din), .sram_din_valid(sram_din_valid),
         .sram_din_ready(sram_din_ready),
         .sram_dout(sram_dout), .sram_dout_valid(sram_dout_valid),
+        .sram_dout_ready(sram_dout_ready),
         .sram_busy(sram_busy), .sram_done(sram_done),
         .scratchpad_re(spad_re), .scratchpad_raddr(spad_raddr), .scratchpad_rdata(spad_rdata),
         .scratchpad_we(spad_we), .scratchpad_waddr(spad_waddr),
         .scratchpad_wdata(spad_wdata), .scratchpad_wstrb(spad_wstrb),
+        .scratchpad_rgnt(spad_rgnt), .scratchpad_wgnt(spad_wgnt),
         .dma_start(dma_start), .dma_write(dma_write),
         .dma_scratch_addr(dma_scratch_addr), .dma_dram_addr(dma_dram_addr),
         .dma_len(dma_len),
@@ -113,7 +120,7 @@ module dma_tb;
         .start(sram_start), .we(sram_we), .addr(sram_addr),
         .len(sram_len), .stride(sram_stride),
         .din(sram_din), .din_valid(sram_din_valid), .din_ready(sram_din_ready),
-        .dout(sram_dout), .dout_valid(sram_dout_valid),
+        .dout(sram_dout), .dout_valid(sram_dout_valid), .dout_ready(sram_dout_ready),
         .busy(sram_busy), .done(sram_done),
         .sram_addr(chip_addr), .sram_data(chip_data),
         .sram_we(chip_we), .sram_ce(chip_ce), .sram_oen(chip_oen)
@@ -131,12 +138,15 @@ module dma_tb;
         .W_re(1'b0), .W_raddr('0), .W_rdata(),
         .C_re(1'b0), .C_raddr('0), .C_rdata(),
         .C_we(1'b0), .C_waddr('0), .C_wdata('0), .C_wstrb('0),
-        .V_re(1'b0), .V_raddr('0), .V_rdata(),
-        .V_we(1'b0), .V_waddr('0), .V_wdata('0), .V_wstrb('0),
+        .V_re(spy_V_re), .V_raddr('0), .V_rdata(),
+        .V_we(spy_V_we), .V_waddr('0), .V_wdata('0), .V_wstrb('0),
+        .V_rgnt(), .V_wgnt(),
         .s_re(1'b0), .s_we(1'b0), .s_addr('0), .s_wdata('0), .s_rdata(),
+        .s_rgnt(), .s_wgnt(),
         .dma_re(spad_re), .dma_raddr(spad_raddr), .dma_rdata(spad_rdata),
         .dma_we(spad_we), .dma_waddr(spad_waddr),
-        .dma_wdata(spad_wdata), .dma_wstrb(spad_wstrb)
+        .dma_wdata(spad_wdata), .dma_wstrb(spad_wstrb),
+        .dma_rgnt(spad_rgnt), .dma_wgnt(spad_wgnt)
     );
 
     // =========================================================================
@@ -286,6 +296,36 @@ module dma_tb;
         $display("[FILL  %-10s] saddr=%05h daddr=%05h len=%0d  %0d clk (%.2f/byte)  (errors: %0d)",
                  tag, saddr, daddr, len, t_clocks, real'(t_clocks)/real'(len), errors);
     endtask
+
+    // -------------------------------------------------------------------------
+    // Contention injector.
+    //
+    // The DMA is last in both of the scratchpad's priority chains now that
+    // per-unit command queues let a transfer overlap compute (scratchpad.sv).
+    // Driving V_re/V_we from here makes the arbiter deny it exactly as a real
+    // VPU would, which is the only way to exercise two paths that no other test
+    // reaches: the fill skid buffer (a byte arrives from DRAM with nowhere to
+    // put it) and the SPILL_RD retry (the read that has to be re-presented).
+    //
+    // `duty` is the denial pattern: 1 = deny every clock, 2 = every other, and
+    // so on. Denying *every* clock is the interesting one, because it is what
+    // proves the DMA stops rather than drops -- the transfer stalls completely
+    // and then completes correctly when the pressure comes off.
+    // -------------------------------------------------------------------------
+    int contend_duty = 0;   // 0 = off
+    int contend_rd = 0, contend_wr = 0;
+
+    always @(posedge clk) begin
+        if (contend_duty == 0) begin
+            spy_V_re <= 1'b0;
+            spy_V_we <= 1'b0;
+        end else begin
+            spy_V_re <= ($urandom_range(contend_duty-1) == 0);
+            spy_V_we <= ($urandom_range(contend_duty-1) == 0);
+            if (spad_re && !spad_rgnt) contend_rd++;
+            if (spad_we && !spad_wgnt) contend_wr++;
+        end
+    end
 
     task automatic test_spill(input [SCRATCHPAD_ADDR_W-1:0] saddr,
                               input [MEM_ADDR_W-1:0] daddr,
@@ -514,6 +554,41 @@ module dma_tb;
         // A_h^T: 32x32, scattered 128 bytes apart into the [T][D] A buffer.
         test_spill_t(16'h4000, 19'h36000, 32, 32, 16'd32, 16'd128, "AhT");
         chk(t_clocks <= 1024*(WR_BEAT+1) + 32*8, "spill.t A^T: one write beat per byte");
+
+        // ---- Contention: the same transfers with the arbiter denying us -----
+        // Byte-exactness is the whole check. A dropped fill byte leaves a stale
+        // value in the scratchpad; a dropped spill read sends the wrong byte to
+        // DRAM. Both would show up as a miscompare in the tasks below, which are
+        // the same ones used uncontended above.
+        $display("---- contention ----");
+
+        contend_duty = 3;      // deny roughly a third of the DMA's accesses
+        contend_rd = 0; contend_wr = 0;
+        test_fill (16'h1000, 19'h38000, 16'd512, "fill/contend");
+        test_spill(16'h1000, 19'h38800, 16'd512, "spill/contend");
+        $display("  denials seen: %0d read, %0d write", contend_rd, contend_wr);
+        checks++;
+        if (contend_rd == 0 && contend_wr == 0) begin
+            errors++;
+            $display("  FAIL: injector never actually denied the DMA -- this test proved nothing");
+        end
+
+        // Total denial. The transfer must stall, not corrupt: every fill byte
+        // has to wait in the skid buffer (and, once that fills, hold the SRAM
+        // read stream via dout_ready) until the pressure comes off.
+        contend_duty = 1;
+        fork
+            begin
+                test_fill(16'h2000, 19'h39000, 16'd128, "fill/starved");
+            end
+            begin
+                // Hold the port for long enough that the skid buffer must
+                // overflow if backpressure is not working, then release.
+                repeat (200) @(posedge clk);
+                contend_duty = 0;
+            end
+        join
+        contend_duty = 0;
 
         // Summary.
         checks++;

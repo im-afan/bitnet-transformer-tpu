@@ -26,7 +26,18 @@ set RTL_SRCS [list \
     [file join $RTL_DIR uart_receiver.sv] \
     [file join $RTL_DIR uart_transmitter.sv] \
     [file join $RTL_DIR perf_counters.sv] \
+    [file join $RTL_DIR cmd_queue.sv] \
+    [file join $RTL_DIR cmd_mxu.sv] \
+    [file join $RTL_DIR cmd_vpu.sv] \
+    [file join $RTL_DIR cmd_dma.sv] \
+    [file join $RTL_DIR cpu_subsys.sv] \
+    [file join $RTL_DIR vendor picorv32.v] \
 ]
+
+# picorv32.v is vendored, not written here: YosysHQ/picorv32, ISC licensed.
+# It is plain Verilog-2005 and reads fine alongside the SystemVerilog above.
+# Only picorv32_axi and what it instantiates is referenced; Vivado prunes the
+# rest (picorv32_wb, the PCPI divider) once -top is elaborated.
 
 # Sources outside the tpu_top hierarchy. Read anyway so they stay compile-checked
 # by every synthesis run; Vivado prunes unreferenced modules once -top is

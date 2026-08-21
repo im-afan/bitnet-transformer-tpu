@@ -121,15 +121,24 @@ last-writer-wins order). A read and a write still proceed together — they are 
 two ports of the same BRAM — but two simultaneous reads, or two simultaneous
 writes, are not supported.
 
-This costs nothing, because the TPU never issues them. The MXU drives `A_re`,
 `W_re` and `C_re` from mutually exclusive FSM states (`S_LOAD` / `S_RUN` /
-`S_WB_RD`); the VPU reads in `S_RD0`/`S_RD1`/`S_RDS`; and the scalar unit is
-issue-and-wait — a dispatch op parks it in `S_WAIT` until the unit reports done,
-so MXU, VPU and DMA activity never overlaps and `s_re`/`s_we` only fire while no
-other unit owns the memory. The arbiter is therefore *exact*, not best-effort:
-no requester is ever denied, and no stall handshake is needed (none of the units
-have one). `scratchpad.sv` checks the invariant every cycle in simulation and
-`$error`s if it is ever violated.
+`S_WB_*`), and the VPU likewise reads and writes in different states. **What is no
+longer true is that the *units* are mutually exclusive with each other.** That
+held only while the scalar unit was issue-and-wait -- a dispatch parked it in
+`S_WAIT` until the unit reported done, so the MXU, the VPU and the DMA could not
+overlap -- and per-unit command queues (`cmd_*.sv`) exist precisely to break it.
+
+So the priority mux now genuinely arbitrates, and every requester that can lose
+takes a grant back: `V_rgnt`/`V_wgnt`, `s_rgnt`/`s_wgnt`, `dma_rgnt`/`dma_wgnt`.
+Both chains are ordered so the requester that *cannot* stall is first --
+
+    reads   A > W > C > V > s > DMA          writes   C > V > s > DMA
+
+-- which puts all three MXU ports at the top, since its writeback drains
+`result_buf` with no handshake at all. The VPU freezes its FSM for a clock when
+denied, the scalar/CPU port re-presents, and the DMA parks the byte in a skid
+buffer and pauses the SRAM read stream (`dma.sv`, `sram.sv`'s `dout_ready`).
+See [picorv32_migration.md](picorv32_migration.md) §5.
 
 One visible consequence: `*_rdata` are slices of a single shared output register,
 so a read on any port updates all of them. Each consumer samples one cycle after

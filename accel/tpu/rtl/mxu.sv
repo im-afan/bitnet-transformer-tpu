@@ -34,8 +34,8 @@
 // **requantizes on store** (BitNet int32 -> int8): when `requant` is asserted the
 // final int32 element is rescaled by the fixed-point pair {M0, N} as
 // `clip((acc*M0 + round) >> N)` (the same math as requant.sv / vpu.sv
-// VOP_REQUANT) and written as int8; the {M0, N} word is read once from
-// `scalar_addr` over the C port. When `requant` is clear the MXU writes int32 as
+// VOP_REQUANT) and written as int8; the {M0, N} word arrives in
+// the dispatch's own `rq_word` field. When `requant` is clear the MXU writes int32 as
 // before — this is the mode intermediate contraction tiles use so `accumulate`
 // can keep running int32 partials in the result bank (mxu.md §6); the final tile
 // asserts `requant` to narrow. The int8 output row is COLS bytes (C_wstrb masks
@@ -84,7 +84,14 @@ module mxu #(
     input  logic [ADDR_W-1:0] act_addr,     // activation tile base
     input  logic [ADDR_W-1:0] weight_addr,  // ternary weight tile base
     input  logic [ADDR_W-1:0] out_addr,     // result base (int32, or int8 if requant)
-    input  logic [ADDR_W-1:0] scalar_addr,  // requant {M0, N} word (used when requant)
+    // Requant {M0, N} as a LITERAL, not a scratchpad address. It is M0_W + N_W
+    // = 16 bits, exactly the width of the address that used to point at it, so
+    // the 128-bit command it now rides in is no tighter for it
+    // (docs/picorv32_migration.md §3). What goes away is the one-shot C-port
+    // fetch this unit used to run before every requantized store: two states,
+    // two scratchpad reads, and one more contender on the arbitrated read port
+    // per matmul.
+    input  logic [M0_W+N_W-1:0] rq_word,    // {n, m0} (used when requant)
     input  logic [5:0]        t_len,        // number of token columns T
     input  logic              accumulate,   // add into existing int32 result (tiling)
     input  logic              requant,      // narrow store int32 -> int8 via {M0, N}
@@ -206,8 +213,6 @@ module mxu #(
         S_IDLE,           // waiting for a dispatch
         S_LOAD,           // streaming a weight tile into the PE registers
         S_RUN,            // feeding activations / draining column sums
-        S_RQ_PARAM_RD,    // one-shot read of the requant {M0, N} word
-        S_RQ_PARAM_LATCH, // that word lands here (C-port read latency)
         S_WB_ACC_RD,      // accumulate readback of one existing int32 result row
         S_WB_WRITE,       // write one result row out
         S_DONE            // one-cycle completion pulse
@@ -215,7 +220,7 @@ module mxu #(
     state_t state, state_n;
 
     // Latched dispatch parameters.
-    logic [ADDR_W-1:0] act_base, wgt_base, out_base, rq_param_addr;
+    logic [ADDR_W-1:0] act_base, wgt_base, out_base;
     // Effective strides, resolved once at dispatch (zero -> single-tile default).
     // Latched rather than read live so a dispatch cannot straddle a config write;
     // under issue-and-wait it cannot anyway, but the address generators below
@@ -258,7 +263,7 @@ module mxu #(
     logic [5:0]        tok_count;      // T, tokens in this dispatch
     logic              acc_mode;       // latched `accumulate`
     logic              requant_mode;   // latched `requant`
-    logic [M0_W-1:0]   rq_mult_m0;     // requant multiplier (loaded from scalar_addr)
+    logic [M0_W-1:0]   rq_mult_m0;     // requant multiplier (latched from rq_word)
     logic [N_W-1:0]    rq_shift_n;     // requant shift
     logic [15:0]       expected_completions;  // total bottom completions = T * COLS
 
@@ -341,10 +346,6 @@ module mxu #(
                 A_re    = (act_req_cnt < {10'b0, tok_count});
                 A_raddr = act_tile_base + ADDR_W'(act_req_cnt * act_row_stride);
             end
-            S_RQ_PARAM_RD: begin      // one-shot fetch of the {M0, N} word
-                C_re    = 1'b1;
-                C_raddr = rq_param_addr;
-            end
             S_WB_ACC_RD: begin        // accumulate readback (int32 running partial)
                 C_re    = 1'b1;
                 // always the int32 stride: the partials are int32 whatever the
@@ -387,17 +388,14 @@ module mxu #(
             // End of a contraction tile. If more remain, go straight back to
             // LOAD for the next weight tile with the partials still sitting in
             // result_buf — the scratchpad is not touched between tiles. Only
-            // after the last one does the result drain out. Requant fetches
-            // {M0, N} once before draining the result buffer.
+            // after the last one does the result drain out. The requant {M0, N}
+            // arrives in the dispatch itself, so there is nothing to fetch
+            // before the drain any more.
             S_RUN:   if (completions == expected_completions) begin
                          if      (!k_tile_last)  state_n = S_LOAD;
-                         else if (requant_mode)  state_n = S_RQ_PARAM_RD;
                          else if (acc_mode)      state_n = S_WB_ACC_RD;
                          else                    state_n = S_WB_WRITE;
                      end
-            S_RQ_PARAM_RD:                       state_n = S_RQ_PARAM_LATCH;
-            S_RQ_PARAM_LATCH: if (acc_mode) state_n = S_WB_ACC_RD;
-                              else          state_n = S_WB_WRITE;
             S_WB_ACC_RD:                         state_n = S_WB_WRITE;
             // Output tile finished. If more remain, restart the contraction for
             // the next one; otherwise the whole matmul is done.
@@ -449,7 +447,8 @@ module mxu #(
                     act_base       <= act_addr;
                     wgt_base       <= weight_addr;
                     out_base       <= out_addr;
-                    rq_param_addr  <= scalar_addr;
+                    rq_mult_m0     <= rq_word[M0_W-1:0];
+                    rq_shift_n     <= rq_word[M0_W +: N_W];
                     tok_count      <= t_len;
                     acc_mode       <= accumulate;
                     requant_mode   <= requant;
@@ -570,14 +569,6 @@ module mxu #(
                 end
 
                 // -------------------------------------------------------------
-                // Requant {M0, N} lands the cycle after S_RQ_PARAM_RD (same
-                // C-port read contract as the accumulate readback).
-                S_RQ_PARAM_LATCH: begin
-                    rq_mult_m0 <= C_rdata[M0_W-1:0];
-                    rq_shift_n <= C_rdata[M0_W +: N_W];
-                end
-
-                // -------------------------------------------------------------
                 // Writeback: one result row per token (int32, or int8 if requant).
                 // On the last row, if output tiles remain, step to the next one:
                 // reset the contraction, rewind the activation base to column 0,
@@ -595,7 +586,7 @@ module mxu #(
                     end
                 end
 
-                default: ; // S_WB_ACC_RD (C_re asserted comb), S_RQ_PARAM_RD, S_DONE
+                default: ; // S_WB_ACC_RD (C_re asserted comb), S_DONE
             endcase
 
             // ---------------------------------------------------------------

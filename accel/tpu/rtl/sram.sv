@@ -98,9 +98,16 @@ module sram_controller #(
     input  logic              din_valid,
     output logic              din_ready,  // `din` is taken on this clock's edge
 
-    // ---- read data stream ---------------------------------------------------
+    // ---- read data stream (ready/valid) -------------------------------------
+    // `dout_ready` low holds the beat: the address stays put, CE#/OE# stay
+    // asserted, and the async SRAM keeps driving the same byte, so resuming
+    // re-samples exactly the byte that was paused. This is what lets the DMA
+    // stop the fill stream when the scratchpad write port is denied for longer
+    // than its skid buffer can absorb (dma.sv), instead of dropping bytes.
+    // A consumer that cannot stall ties it high and nothing changes.
     output logic [DATA_W-1:0] dout,
     output logic              dout_valid, // `dout` holds a fresh byte
+    input  logic              dout_ready, // taken on this clock's edge
 
     output logic busy,
     output logic done,                    // one-clock pulse, end of range
@@ -205,8 +212,9 @@ module sram_controller #(
 
                 // ---- read: one address per beat, sampled on its last clock ---
                 READ: begin
-                    beat <= beat + BEAT_W'(1);
-                    if (rd_last) begin
+                    if (!rd_last) begin
+                        beat <= beat + BEAT_W'(1);
+                    end else if (dout_ready) begin
                         dout       <= sram_data;
                         dout_valid <= 1'b1;
                         beat       <= '0;
@@ -220,6 +228,7 @@ module sram_controller #(
                             state    <= IDLE;
                         end
                     end
+                    // else: hold at the last beat with the address unchanged.
                 end
 
                 // ---- write: park until the producer has the next byte -------

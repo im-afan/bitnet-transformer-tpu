@@ -21,6 +21,14 @@ line buffer this document originally planned — the width adapter moved into
 a block of memory from one place to another *on its own*, so the main processor (here, the
 [scalar unit](scalar_unit.md)) doesn't have to spend an instruction per byte.
 
+> **Since updated.** Dispatch arrives from `cmd_dma.sv`'s command queue rather
+> than from the scalar unit's wire bundle, and the geometry (`len`, `tcols`,
+> `tsrow`, `tdrow`) travels *in the command* instead of in config registers --
+> so a transfer carries its own length and the stale-`len` pitfall is gone by
+> construction. The engine below is otherwise unchanged, plus a fill skid buffer
+> and grant handshakes on both scratchpad ports so a transfer can overlap
+> compute. See [picorv32_migration.md](picorv32_migration.md) §3 and §5.
+
 The pattern everywhere in this TPU is **issue-and-wait**: the scalar unit hands a unit a
 command (`start` + operands), then blocks until that unit raises `done`. The MXU and VPU
 already work this way. The DMA is the same idea applied to a *memory copy*:
@@ -346,7 +354,11 @@ directions on a fused QKV block.
 - **Single clock domain.** The SRAM is asynchronous but its controller is clocked on the same
   `clk` as the DMA and scratchpad, so there is **no clock-domain crossing** here — unlike the
   comms link ([comms.md](comms.md) §4). That keeps v1 simple: no async FIFOs.
-- **No arbitration needed in v1.** The scalar unit blocks on `dma_done` (issue-and-wait), so
+- **Arbitration is real now** (this bullet described v1). The engine takes
+  `scratchpad_rgnt`/`scratchpad_wgnt` back from the arbiter and holds when
+  denied; fill bytes wait in a four-entry skid buffer and, if that fills,
+  `sram_dout_ready` stops the DRAM read stream rather than dropping a byte.
+  The original v1 reasoning: the scalar unit blocks on `dma_done` (issue-and-wait), so
   while the DMA runs the MXU/VPU are idle and nobody else touches the scratchpad. The
   scratchpad's "DMA fills idle cycles" note ([scratchpad.md](scratchpad.md) §4) is about a
   future overlapped mode; v1 has the memory to itself.
