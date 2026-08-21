@@ -37,6 +37,26 @@ with the in-place operators, the way the hand-written examples do:
 falls back to allocating a fresh one, so it can never corrupt either.
 Temporaries created inside a ``with p.loop(...)`` block are reclaimed when it
 ends; the matching rule is *do not use a Reg outside the block that made it*.
+
+There are 31 allocatable registers and no spilling, so a whole-model kernel has
+to reuse them.  The three ways to get an address into one, in increasing order
+of how long it lives:
+
+    r.set(V)          # reload one register with a succession of addresses
+    p.reg("n", V)     # a NEW register, `li`'d here, reclaimed at scope exit
+    p.const(V)        # cached + hoisted + permanent; for the handful of bases
+                      # and strides that are live for the whole program
+
+``p.const`` is also what an ``int`` operand turns into implicitly, so passing a
+bare address to an op costs a *permanent* register — deliberate for a stride you
+use everywhere, a leak for one you touch once.  ``examples/gen_adder_model.py``
+is the worked example: 18 permanent, everything else through ``set``.
+
+**Coverage of the ISA** is checked at import against ``assembler.SPECS`` — every
+mnemonic is either wrapped here or listed in ``_ELSEWHERE`` with the pytpu call
+that emits it (see :func:`isa_coverage`).  Notable: ``matmul_t`` runs the whole
+tile loop in hardware and is what every shipped kernel issues; the VPU is down
+to seven ops after the softmax/LayerNorm/GELU removal (docs/vpu.md).
 """
 
 from __future__ import annotations
@@ -56,6 +76,10 @@ import assembler                                              # noqa: E402
 
 IMEM_WORDS = 1024        # scalar_unit.sv IMEM_AW = 10
 NUM_REGS = assembler.NUM_REGS
+SPAD_BYTES = 1 << 16     # scratchpad address space (iss.TPU.addr_w)
+DRAM_BYTES = 1 << 19     # external SRAM, program-visible in full since
+                         # scalar_unit.sv emits MEM_ADDR_W rather than ADDR_W
+MNEM_W = 12              # instruction column; see Program._fmt
 
 
 class TpuError(Exception):
@@ -101,6 +125,28 @@ class Reg:
                 return self
         a, b = (other, self) if swap else (self, other)
         return self.p._arith(mnem, a, b, self if inplace and not self.protected else None)
+
+    def set(self, value) -> "Reg":
+        """Reload this register with an immediate — `li this, value`.
+
+        The missing third case beside :meth:`Program.const` (cached, hoisted,
+        permanent) and :meth:`Program.reg` (a *new* register): reusing one
+        register for a succession of unrelated addresses, which is how the
+        hand-written kernels keep 30 live values in 31 registers.  Returns
+        self, so `rq.set(RQ_KT)` reads as a statement and chains if you want.
+
+        Refuses a protected register: silently clobbering a `p.const` cache
+        entry would corrupt every other user of that constant, and clobbering a
+        loop counter would corrupt the loop.
+        """
+        if self.protected:
+            raise TpuError(
+                f"'{self.name}' is protected (a p.const cache entry or a loop "
+                "counter) and cannot be re-loaded; use p.reg() for a register "
+                "you intend to overwrite")
+        self.p._body.append(
+            self.p._fmt(self.p._pad, "li", self, self.p._expr(value)))
+        return self
 
     def __add__(self, o):   return self._bin("adds", o)
     def __radd__(self, o):  return self._bin("adds", o, swap=True)
@@ -149,7 +195,9 @@ class Program:
         if e in self._consts:
             return self._consts[e]
         r = self._alloc(name or f"k_{e}", permanent=True, protected=True)
-        self._pro.append(f"    li      {r}, {e}")
+        # Depth-0 formatting on purpose: the prologue is emitted before the
+        # body whatever nesting level the p.const() call happened at.
+        self._pro.append(self._fmt("    ", "li", r, e))
         self._consts[e] = r
         return r
 
@@ -157,7 +205,7 @@ class Program:
         """A fresh named register, optionally initialised with `li`."""
         r = self._alloc(name)
         if init is not None:
-            self._body.append(f"{self._pad}li      {r}, {self._expr(init)}")
+            self._body.append(self._fmt(self._pad, "li", r, self._expr(init)))
         return r
 
     def _expr(self, v) -> str:
@@ -220,8 +268,16 @@ class Program:
     def _pad(self) -> str:
         return "    " + "  " * self._depth
 
+    @staticmethod
+    def _fmt(pad: str, mnem: str, *ops) -> str:
+        # MNEM_W, not 8: `matmul_t.rq` is 11 characters and `matmul.acc.rq` 13,
+        # so a narrower field would run the mnemonic into its first operand with
+        # no separating space and emit `matmul_t.rqdst, act, wgt`.  The width
+        # matches examples/adder_model.tpu's instruction column.
+        return f"{pad}{mnem:<{MNEM_W}}" + ", ".join(str(o) for o in ops)
+
     def _ins(self, mnem: str, *ops) -> None:
-        self._body.append(f"{self._pad}{mnem:<8}" + ", ".join(str(o) for o in ops))
+        self._body.append(self._fmt(self._pad, mnem, *ops))
 
     def emit(self, line: str = "") -> None:
         """Append a raw line (comment, or an instruction pytpu does not wrap)."""
@@ -232,14 +288,65 @@ class Program:
 
     # ---- config, MXU, control ------------------------------------------------
     def cfg(self, **kw) -> None:
-        """setcfg for each keyword: tlen / vlen / len / scalar (immediates, not registers)."""
+        """`setcfg name, imm` for each keyword.  Config is **sticky**.
+
+        A dispatch's operands are three addresses; its *shape* comes from these,
+        and they persist until overwritten — so a `p.cfg(...)` block applies to
+        every following dispatch, not just the next one.  The 17 names, by
+        consumer (`assembler.CFG_NAMES` is the authority):
+
+            DMA        len, and tcols / tsrow / tdrow for `t=True`
+            VPU        vlen  (<= 1023; `tquant` additionally needs vlen % 4 == 0)
+            MXU        tlen, scalar, and the macro-op geometry that `matmul_t`
+                       reads: ktiles, ntiles, arow, wcol, crow
+            vecmatmul  vrows, vcols, vrow0, vrow1, vcrow
+
+        Values are immediates.  For a shape only known at run time use
+        :meth:`cfgr`, which is `setcfgr` — the register form.
+        """
         for k, v in kw.items():
             if k not in assembler.CFG_NAMES:
                 raise TpuError(f"unknown cfg '{k}' (use {'/'.join(assembler.CFG_NAMES)})")
-            self._body.append(f"{self._pad}setcfg  {k}, {self._expr(v)}")
+            if isinstance(v, Reg):
+                raise TpuError(f"cfg '{k}' takes an immediate; for a register use "
+                               f"p.cfgr('{k}', {v})")
+            self._body.append(self._fmt(self._pad, "setcfg", k, self._expr(v)))
+
+    def cfgr(self, name: str, src) -> None:
+        """`setcfgr name, rN` — a config register written from a *register*.
+
+        The immediate form freezes a macro-op's geometry at assembly time; this
+        is what lets one vary at run time (docs/macro_ops.md §9.2).  No
+        extension is applied: the consumer masks to its own field width.
+        """
+        if name not in assembler.CFG_NAMES:
+            raise TpuError(f"unknown cfg '{name}' (use {'/'.join(assembler.CFG_NAMES)})")
+        self._ins("setcfgr", name, self._val(src))
 
     def matmul(self, out, act, wgt, acc: bool = False, rq: bool = False) -> None:
+        """The array's native 8x8 tile: `out = act @ wgt` over cfg tlen tokens.
+
+        One dispatch is one tile, so anything larger is a loop in the program.
+        For a whole matrix in one dispatch use :meth:`matmul_t`.
+        """
         self._ins("matmul" + (".acc" if acc else "") + (".rq" if rq else ""),
+                  self._val(out), self._val(act), self._val(wgt))
+
+    def matmul_t(self, out, act, wgt, acc: bool = False, rq: bool = False) -> None:
+        """The **tiled** matmul: the whole ktiles x ntiles loop, in hardware.
+
+        Same operands and flags as :meth:`matmul`, but they name tiles of a
+        larger matrix and the strides come from cfg arow/wcol/crow with the tile
+        counts from cfg ktiles/ntiles — set all five first.  A distinct opcode
+        rather than a third flag on `matmul`, so a stale stride cannot turn one
+        program's plain matmul into a tiled one.
+
+        `rq=True` requants int32 -> int8 **on the store**, using the {m0,n} word
+        at `cfg scalar` — not the VPU's `requant`, which takes its word in a
+        register.  With it the result rows are `crow/4` bytes rather than
+        `crow`.  Every matmul in examples/adder_model.tpu is this instruction.
+        """
+        self._ins("matmul_t" + (".acc" if acc else "") + (".rq" if rq else ""),
                   self._val(out), self._val(act), self._val(wgt))
 
     # ---- DMA -----------------------------------------------------------------
@@ -261,9 +368,16 @@ class Program:
         return dst
 
     def wait(self, unit: str) -> None:
+        """Block until `unit` is idle.  Rarely needed: dispatch is issue-and-wait.
+
+        The scalar unit already stalls until the unit it started raises `done`
+        (docs/scalar_unit_pipeline.md §5.5), so a result is in the scratchpad by
+        the time the next instruction issues.  examples/adder_model.tpu contains
+        no `wait` at all.
+        """
         if unit not in assembler.UNIT_CODES:
             raise TpuError(f"unknown unit '{unit}' (use {'/'.join(assembler.UNIT_CODES)})")
-        self._body.append(f"{self._pad}wait    {unit}")
+        self._body.append(self._fmt(self._pad, "wait", unit))
 
     def halt(self) -> None:
         self._body.append(f"{self._pad}halt")
@@ -282,17 +396,17 @@ class Program:
         with self.scope():
             i = self._alloc(name, protected=True)
             bound, one = self.const(stop), self.const(1)
-            self._body.append(f"{self._pad}li      {i}, {self._expr(start)}")
+            self._body.append(self._fmt(self._pad, "li", i, self._expr(start)))
             self._body.append(f"{top}:")
             self._ins("cmps", i, bound)
-            self._body.append(f"{self._pad}bge     {end}")
+            self._body.append(self._fmt(self._pad, "bge", end))
             self._depth += 1
             try:
                 yield i
             finally:
                 self._depth -= 1
                 self._ins("adds", i, i, one)
-                self._body.append(f"{self._pad}jmp     {top}")
+                self._body.append(self._fmt(self._pad, "jmp", top))
                 self._body.append(f"{end}:")
 
     # ---- output --------------------------------------------------------------
@@ -330,15 +444,74 @@ class Program:
 
 # --- the remaining ops, generated from a table rather than hand-written -------
 # Every operand is a register holding a scratchpad/DRAM byte address, so they all
-# have the same shape: coerce each argument through _val and emit.  Mnemonics in
-# assembler.SPECS but absent here are deliberate omissions: `branch`/`jmp` (use
-# p.loop), `li`/`setcfg` (use p.const/p.cfg), `cmps` (no run-time `if` in v1),
-# `wrneigh` (LINK is a no-op in RTL).
+# have the same shape: coerce each argument through _val and emit.
+#
+# This is the *whole* VPU: seven ops.  `gelu`, `exp`, `square`, `vecmul`,
+# `vecemul`, `sadd`, `sdiv`, `redmax`, `redsum` and the `softmax` macro op were
+# removed from the RTL along with both activation ROMs and the restoring divider
+# (docs/vpu.md §Removed ops) — they served a softmax/LayerNorm/GELU model and
+# `model/transformer.py` is ReLU attention + DyT + ReLU feed-forward.  Their
+# opcodes are holes, not free space: a stale binary decodes to an unknown op
+# rather than to a different one.
 _OPS = {
-    "vecdot": 3, "vecadd": 3, "requant": 3, "dyt": 3, "tquant": 3,
+    # narrowing: the only three ops that go int32 -> int8 (or narrower)
+    "requant": 3,       # clip_i8((acc*m0 + 2**(n-1)) >> n), {m0,n} at rsrc1
+    "dyt": 3,           # ...with a symmetric +-127 clip: DyT / hardtanh
+    "tquant": 3,        # ...clipped to +-1 and written 2 bits wide, 4 per byte.
+                        # cfg vlen must be a multiple of 4 and the destination
+                        # advances a quarter as fast as the source.
+    # widening: read int8, write int32
+    "vecadd": 3,
     "relu": 2,
+    # reductions / VPU matmul
+    "vecdot": 3,        # the only reduction; writes one int32 to the SCRATCHPAD
+    "vecmatmul": 3,     # int8 x int8 macro op over cfg vrows/vcols/vrow0/vrow1/
+                        # vcrow, contracting cfg vlen.  No caller in the shipped
+                        # kernel since K and V went ternary and the head became
+                        # a TernaryLinear — the MXU cannot multiply int8 by int8,
+                        # so this is for the model shape that needs it.
     "stores": 2,
 }   # rdmem/wrmem are hand-written above: they carry the `.t` flag.
+
+
+# Every other mnemonic in the ISA, and how pytpu spells it.  Kept as data so the
+# check below can prove the two agree; if this file ever falls behind
+# `assembler.SPECS` you find out at import, not in a generated program.
+_ELSEWHERE = {
+    "matmul": "p.matmul()",
+    "matmul_t": "p.matmul_t()",
+    "rdmem": "p.rdmem()",
+    "wrmem": "p.wrmem()",
+    "loads": "p.loads()",
+    "wait": "p.wait()",
+    "halt": "p.halt()",
+    "setcfg": "p.cfg()",
+    "setcfgr": "p.cfgr()",
+    "li": "p.const() / p.reg(init=...) / Reg.set()",
+    "adds": "Reg + and +=",
+    "subs": "Reg - and -=",
+    "muls": "Reg * and *=",
+    "cmps": "p.loop() (v1 has no run-time `if`)",
+    "branch": "p.loop()",
+    "jmp": "p.loop()",
+    "wrneigh": "not exposed: the inter-TPU LINK is a completing no-op in RTL",
+}
+
+_covered = set(_OPS) | set(_ELSEWHERE)
+_extra, _gone = set(assembler.SPECS) - _covered, _covered - set(assembler.SPECS)
+if _extra or _gone:
+    raise ImportError(
+        "pytpu is out of step with assembler.SPECS — "
+        + (f"the ISA gained {sorted(_extra)} (add them to _OPS or _ELSEWHERE); "
+           if _extra else "")
+        + (f"pytpu still exposes {sorted(_gone)}, which the ISA dropped"
+           if _gone else "").strip())
+
+
+def isa_coverage() -> str:
+    """One line per ISA mnemonic and the pytpu call that emits it."""
+    how = {m: f"p.{m}()" for m in _OPS} | _ELSEWHERE
+    return "\n".join(f"{m:<10} {how[m]}" for m in sorted(assembler.SPECS))
 
 
 def _make_op(mnem: str, arity: int):

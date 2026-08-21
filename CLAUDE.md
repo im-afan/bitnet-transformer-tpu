@@ -38,7 +38,7 @@ question. Useful flags: `--check` (instrumented forward vs `Model.forward`), `--
 suspect, not the model), `--words`, `--dynamic-range`, `--dyt-scale calibrated`.
 
 The numbers below are the **PTQ-era** ones and are still what that checkpoint scores; the
-current `model/saved/ternary_mha.pt` (QAT, `layers=2`) scores 100.00% / 100.00% instead — see
+last `model/saved/ternary_mha.pt` (QAT, `layers=2`) scored 100.00% / 100.00% instead — see
 [The int8 finding](#the-int8-finding-and-why-the-model-keeps-changing).
 
 **Measured on `colab_ternary_mha_small_dyt.pt` (256 problems): float 93.36% exact-sequence /
@@ -52,9 +52,12 @@ finding with a sharper mechanism: DyT bounds the residual stream but nothing bou
 added to it.
 
 `model/saved/ternary_mha.pt` is the last QAT checkpoint (2 layers) and is still what
-`adder_export.py` / `run_adder.py` default to; it is untracked so far, and it **predates
-ternary K/V and the removal of the positional encoding**, so it no longer matches the
-model it is loaded into.
+`adder_export.py` / `run_adder.py` default to; it is untracked, and it **predates ternary
+K/V, the removal of the positional encoding, the ternary output head and `layers=4`**. It
+no longer loads at all: `fc.weight` is an unexpected key against a `TernaryLinear` head, so
+`adder_export.load_model` raises instead of silently scoring a half-random network. **The
+model needs retraining** — `python -m model.train --arch ternary_vanilla` — before any
+accuracy number in this file or in `adder_kernel.md` means anything again.
 The three `colab_ternary_mha_small*.pt` are committed but **deleted in the working tree**, so
 any command naming one fails with `FileNotFoundError` until it is restored from git; the old
 `colab_vanilla_mha.pt` / `colab_gqa.pt` / `colab_ternary_mha.pt` were deleted. `test_inference.py`
@@ -151,9 +154,12 @@ what is in the tree, not what `model/README.md` describes (that file is stale �
 - **MoE is gone** — the `use_moe` expert FFN was removed, along with the vanilla/GQA checkpoints.
 - **Named configs** at the bottom (`adder_vanilla`, `adder_gqa`, `adder_ternary_vanilla`) are
   the source of truth for hyperparameters and are wired to the `--arch` choices in `train.py`.
-  `adder_ternary_vanilla` is now `d=128, f=128, layers=2, q_heads=kv_heads=4, use_bias=False`
+  `adder_ternary_vanilla` is now `d=128, f=128, layers=4, q_heads=kv_heads=4, use_bias=False`
   — `f` dropped from 512, and the biases are off because the TPU's VPU has no row-broadcast
-  operand (see the comment on that factory and `accel/tpulang/tpunn.md`).
+  operand (see the comment on that factory and `accel/tpulang/tpunn.md`). **Depth went 4 → 2
+  → 4**: the QAT retrain fitted at two layers, and then ternary K/V plus a ternary head cost
+  more accuracy than two layers could carry. The kernel follows automatically — `.equ LAYERS`
+  is the only thing that moves, and the instruction count does not change with it.
 
 **`model/numbers_data.py`** — synthetic dataset. Non-obvious invariants:
 
@@ -423,14 +429,14 @@ concluding anything from a board run.
 
 ## Long simulations
 
-A full-model `tpu_top_tb` run is ~351 k clocks (3.51 ms simulated at 100 MHz) and dumps
+A full-model `tpu_top_tb` run is ~691 k clocks (6.91 ms simulated at 100 MHz) and dumps
 hundreds of MB of waveform at the defaults, so it needs `-DWATCHDOG_NS=400000000 -DNO_VCD`
 (both are options on `tpu_top_tb.sv`, defaults unchanged). The command line is in
-`adder_kernel.md` §7.7. It was 1.23 M clocks before `sram.sv` became a range engine
+`adder_kernel.md` §7.7. At `layers=2` it was 1.23 M clocks before `sram.sv` became a range engine
 (`accel/tpu/docs/dma.md` §7), 542 k before ternary K/V moved the attention matmuls
-onto the MXU (`adder_kernel.md` §2.5) and 367 k before the ternary output head
-followed them (§2.6); the split is now `mxu = 203 677`, `dma = 117 906`,
-`vpu = 26 080`.
+onto the MXU (`adder_kernel.md` §2.5), 367 k before the ternary output head followed
+them (§2.6), and 351 k after; `layers=4` then doubled the per-layer part. The split
+is now `mxu = 405 433`, `dma = 226 198`, `vpu = 52 160`.
 The ISS runs the same four-layer forward plus the PyTorch reference and the byte comparison in
 ~19 s, so leg-B verification is an edit-run loop, not a batch job.
 
@@ -438,5 +444,7 @@ The ISS runs the same four-layer forward plus the PyTorch reference and the byte
 
 - **Do**: read files to gain a good understanding of code, ask questions when design choices are unclear,
 and write code. Plan out anything in markdown files when it is a large task.
+Make comments & text summaries as concise as possible. I don't want fluff, just describe the code using simple language and that's it.
+Follow my requests exactly--do not write any extra code, unless I specifically ask an open-ended question that requests you to come up with a solution yourself. 
 - **Don't**: run code or any other commands (such as checking for packages, etc) unless otherwise told to do so.
 If extra context is needed about my development environment or feedback is needed for your code, please ask.

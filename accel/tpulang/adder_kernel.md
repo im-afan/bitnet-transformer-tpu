@@ -1,14 +1,16 @@
 # adder_kernel — running `adder_ternary_vanilla` on the TPU
 
 [`examples/adder_model.tpu`](examples/adder_model.tpu) is the whole shipped
-ternary adder model — today two transformer layers and the output head — as
+ternary adder model — today four transformer layers and the output head — as
 **one program, one run**. This document is the byte-level contract the host has
 to satisfy to drive it.
 
-> **Status: built and verified against the ISS; awaiting a retrain.** The program
-> assembles to **227 words** (`LAYERS = 2`, matching `adder_ternary_vanilla`) and
-> runs to completion in the ISS, matching an independent PyTorch implementation
-> byte-for-byte on synthetic weights (§7.5).
+> **Status: built and verified against the ISS and the RTL; awaiting a retrain.**
+> The program assembles to **226 words** (`LAYERS = 4`, matching
+> `adder_ternary_vanilla`) and runs to completion in the ISS, matching an
+> independent PyTorch implementation byte-for-byte on synthetic weights (§7.5),
+> and in the RTL (§7.7). Depth went back to 4 because ternary K/V plus a ternary
+> head cost more accuracy at two layers than the retrain could recover.
 >
 > **Every matmul in the model is now on the MXU.** K and V are ternary
 > *activations*, so `Q @ K^T` and `P @ V` are `matmul_t` dispatches rather than
@@ -18,15 +20,18 @@ to satisfy to drive it.
 > output bytes still exact. The output head then followed: `Model.fc` is a
 > `TernaryLinear` too (§2.6), so `vecmatmul` has **no caller left in this
 > kernel** and the VPU runs only elementwise passes and narrows. End to end:
-> **541 590 → 366 710 → 351 181 clocks**, 18 432/18 432 output bytes exact.
+> **541 590 → 366 710 → 351 181 clocks** at two layers, all byte-exact. At the
+> current four, the same kernel is 690 705 clocks and 26 624/26 624 exact.
 >
-> **The accuracy numbers below predate that change and have not been re-measured.**
-> §7.6c's 100.00% exact-sequence is a QAT result for the *previous* architecture
-> (int8 K and V, a positional encoding, `vecmatmul` attention). `ternary_mha.pt`
-> was fitted against those quantizers, so it cannot be exported through this
-> kernel as it stands — the model has to be retrained with `q_kt`/`q_vt` in the
-> graph and the positional encoding gone. Everything §7.6/§7.6b/§7.6c say about
-> *why* PTQ fails here is unaffected.
+> **The accuracy numbers below predate all of that and have not been
+> re-measured.** §7.6c's 100.00% exact-sequence is a QAT result for the
+> *previous* architecture: two layers, int8 K and V, a positional encoding,
+> `vecmatmul` attention, an int8 head. `model/saved/ternary_mha.pt` was fitted
+> against those quantizers and no longer even *loads* — `fc.weight` is an
+> unexpected key against a `TernaryLinear` head, so `adder_export.load_model`
+> raises rather than silently scoring a half-random network. **A retrain is the
+> one outstanding item** (§7.10). Everything §7.6/§7.6b/§7.6c say about *why*
+> PTQ fails here is unaffected.
 >
 > **Not yet run on the board.** `host/run_adder.py` drives the whole per-problem
 > host loop, but no FPGA was attached when it was written (§7.9). The RTL last
@@ -45,13 +50,13 @@ model (LayerNorm, GELU, softmax, biases, `f=512`) and an earlier ISA (no
 
 ## 1. The model, exactly as it is today
 
-`model/transformer.py::adder_ternary_vanilla` — `d=128`, `f=128`, `layers=2`,
+`model/transformer.py::adder_ternary_vanilla` — `d=128`, `f=128`, `layers=4`,
 `q_heads=kv_heads=4`, `head_dim=32`, `vocab=13`, `use_ternary=True`,
 `use_bias=False`. Sequence length `T=32` (`train.py --max_tokens`). Inference,
 so dropout is off.
 
 ```
-for L in 0..1:
+for L in 0..3:
     Q, K, V = Wq(X), Wk(X), Wv(X)            # ternary weights, no bias
     K, V    = trit(K), trit(V)               # ternary ACTIVATIONS - see §2.5
     S       = Q @ K^T / sqrt(head_dim)       # per head, on the MXU
@@ -94,8 +99,8 @@ Everything between those two is the TPU's.
 ## 2. One program, and the change that made it one
 
 A layer's ternary weights are 24 KB packed (`Wq|Wk|Wv` is 128×384 trits = 12 KB;
-`Wo`, `W1`, `W2` are 128×128 = 4 KB each), so 48 KB at today's `layers=2` and
-96 KB at the `layers=4` this kernel was first written for. Either way the top of
+`Wo`, `W1`, `W2` are 128×128 = 4 KB each), so 96 KB at today's `layers=4` — and
+48 KB even at the `layers=2` the QAT retrain briefly used. Either way the top of
 the image is past the 64 KB line, and until now that was unreachable from a
 program, for a reason that turned out not to be about memory at all:
 
@@ -314,10 +319,10 @@ ISA got stronger.**
 
 ## 3. Memory maps
 
-### DRAM (512 KB available; the top byte used is `0x13FFF`, i.e. 80 KB)
+### DRAM (512 KB available; the top byte used is `0x21FFF`, i.e. 136 KB)
 
 Globals live below `0x5000` so each fits a 16-bit `li`. The layer blocks sit
-above and are reached through the `wl` base register.
+above and are reached through the `lay_base` base register.
 
 | Addr | Bytes | Tensor | Written by |
 | --- | --- | --- | --- |
@@ -543,8 +548,10 @@ whole answer.
 
 ## 6. Costs — measured
 
-**Instructions: 227 words of 1024** (`python assembler.py examples/adder_model.tpu`).
-IMEM has stopped being a constraint, and so has DRAM.
+**Instructions: 226 words of 1024** (`python assembler.py examples/adder_model.tpu`),
+and *independent of depth* — the per-layer body is a loop over `lay_base`, not unrolled,
+so `.equ LAYERS` moves no instruction count at all. IMEM has stopped being a
+constraint, and so has DRAM.
 
 **Arithmetic per layer.** 1536 MXU tile passes for the D-deep matmuls (3×256 for
 the projections, 256 each for `Wo`/`W1`/`W2`) ≈ 3.1 M MACs, plus **128 more for
@@ -553,20 +560,22 @@ that used to be 8 serial `vecmatmul` blocks on the VPU. The VPU's remaining shar
 of a layer is 16 `tquant` passes, 32 elementwise attention passes and the two
 residual loops. The output head adds 32 tile passes once (`KTD × NTV` = 16 × 2).
 
-**Clocks, measured through the RTL** (`tpu_top_tb`, §7.7): **351 181** for the whole
-two-layer model, 3.51 ms at 100 MHz. `mxu = 203 677`, `dma = 117 906`,
-`vpu = 26 080` — the VPU is 7.4% of the run and issues no matmul at all.
+**Clocks, measured through the RTL** (`tpu_top_tb`, §7.7): **690 705** for the whole
+four-layer model, 6.91 ms at 100 MHz. `mxu = 405 433`, `dma = 226 198`,
+`vpu = 52 160` — the VPU is 7.6% of the run and issues no matmul at all. That is
+1.97x the two-layer figure against 2x the layers, the difference being the
+output head, which is fixed cost.
 
 **ISS: a full four-layer forward plus the PyTorch reference and the byte
 comparison takes ~19 s.** That is far better than the "minutes" estimated
 before it was run, and it means leg-B verification is an edit-run loop rather
 than a batch job. The numpy contingency for `iss._matmul` is not needed.
 
-**Staging.** 54 912 bytes in — 24 640 per layer (12 KB of `[Wq|Wk|Wv]`, 4 KB
+**Staging.** 104 192 bytes in — 24 640 per layer (12 KB of `[Wq|Wk|Wv]`, 4 KB
 each for `Wo`/`W1`/`W2`, 64 bytes of requant words), 512 for the ternary head,
-1024 for the mask and 4096 for `X0`. 18 432 bytes of device output: the two
+1024 for the mask and 4096 for `X0`. 26 624 bytes of device output: the four
 per-layer `X` checkpoints, the final `V^T` and `A`, and the `[32][16]` logit
-block. On the board that is a one-time ~4.5 s upload at 115200 of the 50 816
+block. On the board that is a one-time ~9 s upload at 115200 of the 100 096
 constant bytes, then 4 KB in and 2 KB out per forward, since the weights are
 read-only and stay resident.
 
@@ -582,14 +591,14 @@ a real checkpoint rather than synthetic weights.
 | 1 | `python torch_ref.py` — every example vs PyTorch | **7/7 pass**, exact |
 | 2 | `tb/` RTL suite, 13 testbenches | **12 pass**; `uart_transmitter_tb` is a pre-existing no-op (its whole body is commented out) |
 | 3 | `make cosim` — host driver vs RTL over a simulated UART | **11/11 pass** |
-| 4 | `assembler.py examples/adder_model.tpu` | **227 words** of 1024 (`layers=2`, ternary K/V) |
-| 5 | Full model, ISS vs PyTorch, exact | **0 of 16 896 elements differ** — 2 layer checkpoints (4096 int8 each), `V^T`, `A`, and 512 int32 logits (`[32][16]`, the padded head). `torch_ref.adder_model` ternarizes K, V *and* `fc` itself, from the same words |
+| 4 | `assembler.py examples/adder_model.tpu` | **226 words** of 1024 (`layers=4`, ternary K/V, ternary head) |
+| 5 | Full model, ISS vs PyTorch, exact | **0 of 25 088 elements differ** — 4 layer checkpoints (4096 int8 each), `V^T`, `A`, and 512 int32 logits (`[32][16]`, the padded head). `torch_ref.adder_model` ternarizes K, V *and* `fc` itself, from the same words |
 | 6 | `highmem_dma` + `vpu_matmul` through the RTL over the UART (`make uart`) | **5446 checks, 0 errors** — this is what covers the widened address and the `0x8000` case in hardware |
-| 7 | Full model through the RTL (`tpu_top_tb`, backdoor DRAM) | **18 432 checks, 0 errors** — halts at pc=225 after **351 181 clocks** (3.51 ms at 100 MHz), on the 226-word ternary-head image (2026-08-19). `mxu = 203 677`, `dma = 117 906`, `vpu = 26 080` |
+| 7 | Full model through the RTL (`tpu_top_tb`, backdoor DRAM) | **26 624 checks, 0 errors** — halts at pc=225 after **690 705 clocks** (6.91 ms at 100 MHz), on the 226-word `layers=4` image (2026-08-19). `mxu = 405 433`, `dma = 226 198`, `vpu = 52 160` |
 | 7b | `tquant` at the unit level (`make TEST=vpu`) | **318 checks, 0 errors** — three streaming lengths plus `TQUANT-pack`, which pins the 2-bit encoding and bit order against a hand-written byte rather than against a reference that could share a misreading |
-| 8 | Real checkpoint, ISS vs the reference (`adder_export.py --iss-check`) | **0/416 logits differ** — on the pre-ternary-K/V architecture; needs a retrained checkpoint to repeat |
-| 9 | Real-checkpoint task accuracy | int8 **100.00%** exact-sequence on the QAT `layers=2` checkpoint — §7.6c, same caveat |
-| 10 | Real checkpoint through the host loop, per problem (`host/run_adder.py --dry-run`) | **100.00%** over 32 problems, identical to `quant.int_forward` — same caveat |
+| 8 | Real checkpoint, ISS vs the reference (`adder_export.py --iss-check`) | **0/416 logits differ** — on the pre-ternary-K/V architecture; **blocked** on a retrain (§7.10) |
+| 9 | Real-checkpoint task accuracy | int8 **100.00%** exact-sequence on the QAT `layers=2` checkpoint — §7.6c, same block |
+| 10 | Host loop end to end, per problem (`host/run_adder.py --dry-run`) | **the device reproduces `quant.int_forward` exactly** at `layers=4` — but on an *untrained* checkpoint, so the accuracy number is meaningless. §7.10 |
 
 **Rows 8–10 describe the previous architecture.** `model/saved/ternary_mha.pt` was
 fitted with int8 K and V, a positional encoding and `vecmatmul` attention; its
@@ -598,15 +607,17 @@ set for those two scales and the weights were never fitted against a ternary K.
 Repeating rows 8–10 needs `python -m model.train --arch ternary_vanilla` on the
 current model first.
 
-**§7.7 is a long simulation**, though less long than it was. At `layers=2` the model
-moves ~96 KB through the DMA, plus the MXU/VPU work. That was 2.36 M clocks (at
+**§7.7 is a long simulation**, though less long than it was. At `layers=4` the model
+moves ~100 KB through the DMA, plus the MXU/VPU work. That was 2.36 M clocks (at
 `layers=4`) and 1.23 M at `layers=2`, both at ~8-9 clocks/byte; since
 `sram.sv` became a range engine and the DMA a stream client
 (`accel/tpu/docs/dma.md` §7) the memory runs at 1 clock/byte on fills and 2 on
 spills, and the same program halted in **541 590 clocks, 5.42 ms at 100 MHz** —
 byte-identical output, `2.27x` fewer clocks. Moving attention onto the array (§2.5)
 took it to **366 710 clocks, 3.67 ms**, a further `1.48x`, and the ternary output
-head (§2.6) to **351 181 clocks, 3.51 ms**. Still long enough in Icarus to need
+head (§2.6) to **351 181 clocks, 3.51 ms**. Going back to four layers doubles the
+per-layer part: **690 705 clocks, 6.91 ms**, which is what the committed
+`tb/vectors_model/` now checks. Still long enough in Icarus to need
 the watchdog raised (`-DWATCHDOG_NS`) and the waveform dump off (`-DNO_VCD`;
 without it the run writes hundreds of MB of VCD before the old 2 ms watchdog even
 fires). Both are options on `tpu_top_tb.sv`, defaults unchanged:
@@ -794,7 +805,7 @@ LSQ ([arxiv 1902.08153](https://arxiv.org/abs/1902.08153)):
 | float, quantizers removed | 0.00% | 29.37% |
 | int8 activations, this kernel | **100.00%** | **100.00%** |
 
-**The ISS cross-check passed: 0 of 416 logits differ.** 208 words, `LAYERS = 2` (the program was 208 words at the time; it is 227 now — §2.5).
+**The ISS cross-check passed: 0 of 416 logits differ.** 208 words, `LAYERS = 2` (the program was 208 words at the time; it is 226 now, at `LAYERS = 4` — §2.5, §2.6).
 
 Two things about that table need saying, because read casually it looks like a
 transcription error.
@@ -874,6 +885,44 @@ serial ports enumerated), so `run_adder.py -p COM5` is the outstanding step. The
 FPGA path is exercised by §7.6 (`make uart`) and §7.7 (`tpu_top_tb`) for a
 196-word, four-layer image; neither has been repeated since `dyt` landed or since
 `LAYERS` dropped to 2.
+
+### §7.10 — the host loop at `layers=4`, and what is still blocked
+
+`host/run_adder.py --dry-run -n 16 --ckpt <untrained>` on the current kernel:
+
+```
+program   : adder_model.tpu  (226 words)
+image     : 100096 constant bytes (weights, mask, fc, requant words)
+backend   : ISS (--dry-run; nothing is sent to a board)
+
+accuracy over 16 problems:
+                          exact-sequence     token
+  ISS                              0.00%    76.47%
+  quant.int_forward                0.00%    76.47%
+
+PASSED: the ISS reproduces the simulated integer model exactly
+```
+
+**The accuracy row is not a result and must not be read as one.** No checkpoint
+exists for this architecture (see the status note at the top), so this was run on
+a model trained for 50 steps purely to seed its 45 `ActQuant` scales — without
+that, every scale is an uninitialized 1.0 and `QATCalibration` falls back to
+absmax for all of them, which would leave the QAT export path untested. 0.00%
+exact-sequence is what an untrained network scores.
+
+**What it does establish** is everything between the checkpoint and the logits,
+at `layers=4` and end to end through the real host protocol: the split image
+(100 096 constant bytes staged once, 4096 per problem), the per-problem
+write/run/read cycle, the `VPAD`-strided logit readback, and — the point of the
+run — that the device's logits reproduce `quant.int_forward`'s **exactly**, which
+is what makes any future accuracy number a statement about the kernel rather than
+about `model/quant.py`.
+
+**Outstanding: the retrain.** `python -m model.train --arch ternary_vanilla`
+against the current `adder_ternary_vanilla`, then point `--ckpt` at the result and
+rows 8–10 become real numbers. Measured on the development box (CPU, no CUDA):
+624 ms per micro-step at `mini_batch_size=256`, i.e. ~1.25 s per optimizer step at
+the default `batch_size=512`.
 
 ---
 

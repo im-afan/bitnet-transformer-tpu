@@ -373,15 +373,16 @@ longer has the ops a softmax would need. From
 [`adder_model.tpu`](../../tpulang/examples/adder_model.tpu), one chunk of one head:
 
 ```asm
-    setcfg  vlen, CHUNK
-    li      rq, RQ_S
-    requant s8a, s32,  rq       ; int32 scores -> int8, 1/sqrt(head_dim) folded in
-    li      rq, RQ_ID
-    vecadd  tmp, s8a, mska      ; + causal mask (int8 data: 0 or -128) -> int32
-    requant s8a, tmp, rq        ; -> int8; a masked entry is now <= -1
-    li      rq, RQ_P
-    relu    tmp, s8a            ; masked -> exactly 0
-    requant p8a, tmp, rq        ; -> int8 attention weights
+    setcfg      scalar,   RQ_S                ; 1/sqrt(head_dim) folded in
+    matmul_t.rq scr_lo,   q_head,   kt_head   ; Q @ K^T -> int8 scores, on the MXU
+
+    setcfg      vlen,     CHUNK
+    li          rq_word,  RQ_ID
+    vecadd      acc_i32,  scr_lo,   msk_lo    ; + causal mask (int8: 0 or -128) -> int32
+    requant     scr_lo,   acc_i32,  rq_word   ; -> int8; a masked entry is now <= -1
+    li          rq_word,  RQ_P
+    relu        acc_i32,  scr_lo              ; masked -> exactly 0
+    requant     att_lo,   acc_i32,  rq_word   ; -> int8 attention weights
 ```
 
 The pattern to absorb: **the mask is data, not control flow.** An int8 tensor of `0`
@@ -390,8 +391,10 @@ negative, so the `relu` takes it to exactly zero. That is exact for every score 
 rather than a tolerance — and it is why ReLU attention needs no reduction at all, where
 softmax needed a max, a sum and a divide.
 
-Five dispatches per chunk and every one is load-bearing: `requant` is the only op that
-narrows int32→int8, and `vecadd`/`relu` read int8.
+Four VPU dispatches per chunk and every one is load-bearing: `requant` is the only op
+that narrows int32→int8, and `vecadd`/`relu` read int8. The score requant itself is not
+among them — since K became ternary the scores come off the MXU already narrowed by its
+store-side `.rq`, which is what `setcfg scalar` selects.
 
 > This section used to walk through `softmax_row.tpu`, decomposing softmax into
 > `redmax`/`sadd`/`exp`/`redsum`/`sdiv`. That example and those instructions are gone;
