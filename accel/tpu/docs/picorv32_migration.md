@@ -9,7 +9,7 @@
 | 1 | **done** - `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv`; `scalar_unit.sv` packs its config registers into commands and pushes them |
 | 2 | **done** - scratchpad grants, VPU stall, DMA skid buffer + `sram.sv` backpressure, queue depth 8 |
 | 3 | not started - the RV32IM interpreter, `iss.py`'s trace front end, `gen_vectors.py` rewiring |
-| 4 | **done (RTL)** - `cpu_subsys.sv`: PicoRV32 + AXI4-Lite + the MMIO command aperture, alongside the scalar unit. No firmware toolchain yet, so kernels in C are phase 3's dependency, not this one's. |
+| 4 | **done (RTL)** - `cpu_subsys.sv`: PicoRV32 + AXI4-Lite + the MMIO command aperture, alongside the scalar unit. The C toolchain now exists too (`../fw/`, §8): `matmul.c` (hardware tile walk) and `matmul_loop.c` (the same product, tile grid walked in C) are the kernels and `host/run_fw_matmul.py` runs either. Both **build** (Homebrew `riscv64-elf-gcc` 16.2.0, 248 and 352 bytes of the 16 KB) and both **pass in simulation** through `tb/fw_matmul_tb.sv` (`make fw`) — see §9.6. Not yet run on the board. |
 | 5-6 | not started - retiring `scalar_unit.sv`/`assembler.py`/`.tpu`, then a second architecture |
 
 What passes today, on the tree as it stands:
@@ -23,6 +23,7 @@ What passes today, on the tree as it stands:
 | `make examples` (new) - all ten example kernels vs. their golden vectors | **10 passed, 0 failed** |
 | `make uart` (two programs, one link, no reset between) | 469 checks, 0 errors |
 | `make TEST=cpu_smoke` (new) | 68 checks, 0 errors - PicoRV32 boots, pushes two DMA commands, 64-byte round trip byte-exact |
+| `make fw` (new) - the C firmware through `tpu_top`, image via `FW_INIT` | **129 checks, 0 errors** on both kernels; `matmul` halts after 2 120 clocks, `matmul_loop` after 2 508. First exercise of the CPU -> MXU path |
 | `make model` - the adder model at `layers=1` through `tpu_top_tb` | **14 336 checks, 0 errors**, halts at pc=225 after 181 898 clocks |
 | `make model LAYERS=4` - the shipped kernel | **26 624 checks, 0 errors**, halts at pc=225 after 693 107 clocks |
 | `make all` | 15 of 15 |
@@ -375,8 +376,8 @@ The UART protocol survives almost intact ([`uart_host.md`](uart_host.md), `uart_
 
 | Command | Today | After |
 | --- | --- | --- |
-| `'I'` | write instruction BRAM, 10-bit address | write firmware BRAM, **12–14 bit address** |
-| `'G'` | pulse `host_run` with `boot_pc` | release CPU reset; `boot_pc` becomes the reset vector |
+| `'I'` | write instruction BRAM, 10-bit address | **13-bit** word address: 12 index bits + `boot_pc[12]` selecting IMEM or firmware RAM |
+| `'G'` | pulse `host_run` with `boot_pc` | same bit selects; set = release CPU reset. As built the reset vector is the fixed `PROGADDR_RESET = 0`, so the index bits are ignored for the CPU |
 | `'R'`/`'W'` | SRAM read/write while idle | unchanged |
 | `'T'` | perf counter block | unchanged shape, different counters (§9.5) |
 
@@ -422,10 +423,30 @@ price and it should be paid deliberately — see the phase plan, which keeps the
 alive alongside PicoRV32 through phase 4 precisely so the existing suite stays a live
 regression while the new path is proven.
 
-New in the tree: `accel/tpu/fw/` — `start.S`, a linker script, `tpu.h` (the MMIO driver:
-command builders, `sync`, strict mode), one `.c` per kernel, and a Makefile.
-`riscv-none-elf-gcc` (xPack) is the practical Windows toolchain; `-march=rv32imc
--mabi=ilp32 -nostdlib -ffreestanding`, no libc.
+In the tree: `accel/tpu/fw/` — `start.S`, `link.ld`, `tpu.h` (the MMIO aperture and one
+builder per command), `bin2hex.py`, one `.c` per kernel, and a Makefile that autodetects
+the cross prefix. `riscv-none-elf-gcc` (xPack) works on Windows and macOS; Homebrew's
+`riscv64-elf-gcc` is the shorter path on macOS and is what the images in the tree were
+built with (16.2.0, binutils 2.47, `brew install riscv64-elf-gcc`, bottled — no source
+build). Nothing outside the compiler is needed: `-nostdlib` means the newlib the formula
+drags along is never linked, so the multilib set does not matter either.
+
+The `-march` is **`rv32ic_zmmul`**, not `rv32imc`: `cpu_subsys.sv` builds the core with
+`ENABLE_FAST_MUL(1)` but `ENABLE_DIV(0)`, so `mul` is real and `div`/`rem` decode as an
+illegal instruction and trap. `-mabi=ilp32 -nostdlib -ffreestanding`, no libc and no
+libgcc — a kernel that wants division needs the RTL parameter first. (A gcc older than 12
+has no `zmmul`; `rv32ic` works there if the kernel multiplies nothing at run time.)
+
+Two kernels so far, on the same `[8x32] @ [32x16]` problem and the same addresses, so
+`host/run_fw_matmul.py` checks either: `matmul.c` issues one `MXU_MM` with `tiled` and
+`ktiles/ntiles = 4/2`, and `matmul_loop.c` walks that grid in C as 8 single-tile
+dispatches, `.acc` across the contraction. The pair mirrors
+`examples/tiled_matmul_hw.tpu` vs `examples/tiled_matmul.tpu`, and is the cheapest way to
+measure what the hardware tile loop buys once the producer is a CPU — the software version
+pays 8 dispatch issues plus an int32 C round trip through the scratchpad per contraction
+tile, against one issue and one store per output tile. `matmul_loop.c` still sets the
+`tiled` flag: it selects the configured strides over the single-tile constants, and at
+counts of 1 the hardware loop runs one pass. Neither has been executed yet.
 
 ---
 
@@ -531,8 +552,143 @@ answers this section's question:
 | `qfull[unit]` — CPU stalled on a full queue | is the queue deep enough? |
 | `overlap` — cycles with ≥2 units busy | is the §9.3 win being realized? |
 
+**`qfull` as built does not answer its question.** `tpu_top.sv` samples
+`p_cmd_we & p_cmd_full`, but *both* producers already gate their own write enable with
+`!cmd_full` — `scalar_unit.sv:522` and `cpu_subsys.sv:177` — so the term is unsatisfiable
+and the counter reads 0 by construction, not by observation. Every "`qfull = 0`" in this
+document is therefore evidence of nothing. The fix is to sample the stall rather than the
+accepted write (`state == S_PUSH && cmd_full`, and the equivalent commit-pending term in
+`cpu_subsys`); until then, use the queue level or `idlec` and treat `qfull` as unwired.
+
 Plus `rdcycle` in the firmware, which makes per-section timing a `printf`-free two-line
 measurement inside the kernel.
+
+### 9.6 What the C producer actually cost, measured
+
+First run of the CPU as a producer of *compute*, `tb/fw_matmul_tb.sv` on the
+`[8x32] @ [32x16]` problem. Both kernels produce byte-identical C, checked against a
+reference computed in the testbench:
+
+| clocks | `matmul.c` (one `matmul_t`) | `matmul_loop.c` (grid walked in C) |
+| --- | --- | --- |
+| run | **2 077** | **2 454** |
+| MXU | 289 | 392 |
+| ...of which weight load | 80 | 80 |
+| DMA | 1 420 | 1 420 |
+| `idlec` = CPU issue | **368 (17.7%)** | **642 (26.2%)** |
+| `ovlap` | 0 | 0 |
+
+Four things fall out, and only the last one is a surprise:
+
+- **`run - (mxu + dma) == idlec` exactly**, and `ovlap` is 0, which says the firmware's
+  `tpu_wait` fences are doing what they claim: no two units ever run at once, so this is
+  the strict-mode baseline §4 asks for, not an overlapped run.
+- **The hardware tile loop is worth 103 MXU clocks here** (289 vs 392), and the FSM state
+  histogram says exactly where, with nothing left over:
+
+  | `mxu.sv` state | `matmul` | `matmul_loop` | Δ |
+  | --- | --- | --- | --- |
+  | `S_LOAD` | 80 | 80 | 0 |
+  | `S_RUN` | 192 | 192 | 0 |
+  | `S_WB_ACC_RD` | 0 | 48 | **+48** |
+  | `S_WB_WRITE` | 16 | 64 | **+48** |
+  | `S_DONE` | 1 | 8 | +7 |
+  | **busy** | **289** | **392** | **+103** |
+
+  `LOAD` and `RUN` are *identical* — 8 weight tiles at 10 clocks and 8 contraction passes
+  at 24, whoever walks the grid. All 103 clocks are writeback. `S_WB_WRITE` is one clock
+  per token row: the hardware loop drains only when an **output** tile is finished
+  (`NTILES*M` = 16 rows), the software one drains at the end of every dispatch
+  (`NTILES*KTILES*M` = 64). The 48 extra rows are intermediate contraction partials. Worse,
+  six of the eight dispatches carry `.acc`, so each of their rows first spends a clock in
+  `S_WB_ACC_RD` reading the running int32 row back over the C port — `(KTILES-1)*NTILES*M`
+  = 48 more. The hardware loop never enters that state at all: `k_tile_first` selects
+  load-vs-add *inside* `result_buf`, so accumulating across the contraction costs zero
+  cycles and zero scratchpad accesses.
+
+  In closed form, software tiling costs **`2*KTILES - 1` times** the writeback of the
+  hardware loop (7x here), and it scales with the contraction depth while the hardware
+  loop does not. It is also 1 536 bytes read + 1 536 written on the arbitrated C port that
+  the hardware loop never issues — free today at `ovlap = 0`, contention once units
+  overlap. This is what `macro_ops.md` §4.2 meant by "the int32 C traffic disappears
+  rather than being made faster", now measured from both sides.
+- **289 MXU clocks matches the scalar unit's** `tiled_matmul_hw` at 578 for two matmuls.
+  Same array, same work — the producer does not touch it.
+- **Issue overhead is 18–26% of the run, not the ~2.7% §9.1 estimated.** That is not a
+  contradiction — §9.4 says issue cost is per-dispatch and roughly constant while unit
+  work scales with the tensor, and this problem is 2 000 clocks against the adder model's
+  690 000. The share is what a 2 000-clock kernel looks like, not a regression. §9.7
+  sweeps the shape and separates the two effects properly.
+
+The 368 clocks are not divisible by hand: they cover CPU boot, 20 MMIO stores, three
+poll-loop exits and the `DONE` write. The **marginal** number is clean, though, because
+the two kernels differ by exactly seven `MXU_MM` commands and a loop: **+274 clocks for
++7 commands ≈ 39 clocks each** — and that is only the *exposed* part; §9.7 measures the
+whole ~85 and shows what hides the rest.
+
+### 9.7 How issue overhead scales with the problem
+
+§9.4 predicted that issue cost is per-dispatch and roughly constant while unit work scales
+with the tensor. `tb/run_fw_sweep.sh` (`make fwsweep`) measures it: both kernels rebuilt at
+each shape, both run through `fw_matmul_tb.sv`, `cmds` taken from the queues' own `issued`
+counters.
+
+| shape M x K x N | kernel | run | MXU | DMA | `idlec` | cmds | MXU/dispatch |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8x8x8 | `matmul` | 1 039 | 43 | 604 | **392** | 5 | 43 |
+| | `matmul_loop` | 1 039 | 43 | 604 | **392** | 5 | 43 |
+| 8x16x16 | `matmul` | 1 755 | 153 | 1 228 | **374** | 5 | 153 |
+| | `matmul_loop` | 1 828 | 188 | 1 228 | **412** | 8 | 47 |
+| 8x32x32 | `matmul` | 3 520 | 577 | 2 572 | **371** | 5 | 577 |
+| | `matmul_loop` | 4 413 | 784 | 2 572 | **1 057** | 20 | 49 |
+| 8x64x64 | `matmul` | 8 294 | 2 241 | 5 644 | **409** | 5 | 2 241 |
+| | `matmul_loop` | 11 562 | 3 200 | 5 644 | **2 718** | 68 | 50 |
+| 8x128x128 | `matmul` | 22 537 | 8 833 | 13 324 | **380** | 5 | 8 833 |
+| | `matmul_loop` | 35 222 | 12 928 | 13 324 | **8 970** | 260 | 50 |
+| 16x32x32 | `matmul` | 5 994 | 737 | 4 876 | **381** | 5 | 737 |
+| | `matmul_loop` | 6 720 | 1 136 | 4 876 | **708** | 20 | 71 |
+| 32x32x32 | `matmul` | 10 911 | 1 057 | 9 484 | **370** | 5 | 1 057 |
+| | `matmul_loop` | 11 782 | 1 840 | 9 484 | **458** | 20 | 115 |
+
+**The hardware tile walk makes CPU cost O(1) in the problem.** `matmul.c` issues five
+commands whatever the shape, and its `idlec` is 370–409 clocks across a **205x** range of
+array work (43 → 8 833) and a 4x range of M. The spread is not a trend — it is gcc
+materializing different address constants. Two commands describe a 16x16 grid exactly as
+well as a 1x1 one, which is the whole argument for `MXU.GEOM` + `tiled`.
+
+**The C loop is O(KTILES*NTILES), and the CPU — not the array — is the bottleneck there.**
+Instrumenting the queue at 8x128x128: `mxu_level` **never exceeded 1**, and **not one push
+landed while the MXU was busy**. The two strictly alternate, so the CPU's own per-dispatch
+cost is recoverable as `(mxu + idlec - baseline) / dispatches`: **91** clocks at 8x32x32,
+**87** at 8x64x64, **84** at 8x128x128. Call it ~85 to build and push one 128-bit command —
+13 instructions, four AXI4-Lite stores, and every instruction fetch over that same bus
+(topology A, §6). Against §9.1's estimate of ~26 for a chunk-loop dispatch, the factor is
+the fetch path, not the command format.
+
+**What that costs the run is `max(0, cpu - array)` per dispatch**, which is why the M axis
+matters more than the tile axis:
+
+| M | MXU/dispatch | CPU/dispatch | exposed per dispatch |
+| ---: | ---: | ---: | ---: |
+| 8 | 50 | ~85 | 34  (`(8970-380)/255`) |
+| 16 | 71 | ~85 | 22  (`(708-381)/15`) |
+| 32 | 115 | ~85 | **6**  (`(458-370)/15`) |
+
+At M=32 the array's per-tile work passes the CPU's issue time and software tiling becomes
+**free in CPU terms** — the crossover is around M ~ 24 on this 8x8 array. It is not free
+overall: §9.6's writeback penalty is untouched by M, and is the whole of the remaining
+871 clocks at 32x32x32.
+
+Three consequences:
+
+- **A deeper queue would not help anything here.** Depth is 8 and the level never reached
+  2. The queue is not the constraint; ~85 clocks per command is.
+- **The 1.56x gap at 8x128x128** (22 537 vs 35 222) splits 68% CPU issue (+8 590) and 32%
+  array writeback (+4 095). At small M, issue cost — not the C traffic of §9.6 — is the
+  larger half of the argument for `matmul_t`.
+- **DMA is ~58% of the hardware-tiled run at every shape**, and none of it overlaps
+  (`ovlap = 0`). That is §9.3's 1.45x, still unclaimed and still the largest single item
+  on the table.
 
 ---
 
@@ -594,9 +750,11 @@ rather than a rewrite you hope is equivalent.
    BRAM cost to 8 tiles (33 → 40 of 50) and the UART load to ~2.8 s.
 5. **`COMPRESSED_ISA`.** On, unless the phase-4 area measurement says otherwise. It is the
    cheapest thing to give back.
-6. **The Windows RISC-V toolchain.** xPack `riscv-none-elf-gcc` is the path of least
-   resistance, but it is a new binary dependency in a repo whose only dep is `torch`. Confirm
-   it installs before phase 3, not during phase 4.
+6. ~~**The Windows RISC-V toolchain.**~~ Settled: `fw/Makefile` takes any bare-metal
+   RISC-V gcc and autodetects the prefix (xPack `riscv-none-elf-`, Homebrew
+   `riscv64-elf-`, or a self-built one). It is still a new binary dependency in a repo
+   whose only dep is `torch`, which is why `tb/fw_smoke.hex` stays hand-encoded — the CPU
+   testbench must not be gated on an installed compiler.
 7. **Does the CPU get the scratchpad window?** Yes in this plan, and it is what opens on-chip
    argmax and embedding lookup — but it is also a fourth requester on an arbitrated port, so
    it depends on §5 landing first.

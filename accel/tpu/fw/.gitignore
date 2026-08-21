@@ -1,0 +1,7 @@
+# Build output. The .hex is generated too — unlike tb/fw_smoke.hex, which is
+# hand-encoded precisely so the CPU testbench needs no toolchain.
+*.o
+*.d
+*.elf
+*.hex
+*.map

@@ -82,11 +82,15 @@ python accel/tpulang/adder_export.py -n 256 --iss-check   # real checkpoint → 
 python accel/tpu/host/run_program.py --dry-run            # toolchain only, no board
 python accel/tpu/host/run_adder.py --dry-run -n 32        # real checkpoint, host loop, ISS backend
 python accel/tpu/host/run_adder.py -p COM5 -n 64          # ...the same, on the FPGA
+make -C accel/tpu/fw                                      # C firmware -> matmul.hex (RISC-V gcc)
+python accel/tpu/host/run_fw_matmul.py --dry-run          # its operands + reference, no board
 cd accel/tpu/tb && make list                              # RTL testbenches (Icarus)
 ```
 
 `make` targets in `tb/`: `sim` (default TB), `uart` (`tpu_top_uart_tb`), `cosim` (host driver
-vs RTL over a simulated UART), `echo`/`mem`/`bram` (bring-up images), `wave`, `list`, `all`.
+vs RTL over a simulated UART), `examples` (all ten kernels vs golden vectors), `model`
+(the adder kernel, `LAYERS=n`), `fw` / `fwsweep` (C firmware, needs a RISC-V gcc),
+`echo`/`mem`/`bram` (bring-up images), `wave`, `list`, `all`.
 
 ## Architecture
 
@@ -236,7 +240,28 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   producers push: `scalar_unit.sv` still runs tpulang and still waits after every
   dispatch — so **every `.tpu` program, `iss.py` and every golden vector is
   unchanged** — and `cpu_subsys.sv` (PicoRV32 + AXI4-Lite, `rtl/vendor/picorv32.v`)
-  pushes the same commands from firmware. `docs/picorv32_migration.md` is the
+  pushes the same commands from firmware. Firmware is `accel/tpu/fw/`: `tpu.h` is
+  the MMIO aperture plus one builder per command, and the Makefile wants a
+  bare-metal RISC-V gcc at **`-march=rv32ic_zmmul`** — *not* `rv32imc`, the core
+  is built with `ENABLE_DIV(0)` and a `div` traps. Two C kernels, same
+  `[8x32] @ [32x16]` problem and same addresses: `matmul.c` (one `matmul_t`, the
+  array walks the 4x2 tile grid) and `matmul_loop.c` (the grid walked in C as 8
+  single-tile dispatches, `.acc` across the contraction — the firmware analogue
+  of `tiled_matmul.tpu` vs `tiled_matmul_hw.tpu`). `host/run_fw_matmul.py` loads
+  either over `'I'` (word address bit 12 picks the CPU's RAM over IMEM) and
+  checks the result; `make -C accel/tpu/fw PROG=matmul_loop` builds the second.
+  Both build with Homebrew `riscv64-elf-gcc` 16.2.0 and both **pass in
+  simulation** — `cd accel/tpu/tb && make fw [FWPROG=matmul_loop]` runs the image
+  out of `FW_INIT` through the whole core, 129 checks, 0 errors. **Not yet run on
+  hardware.** `make fwsweep` walks the shape (both kernels take `M=`/`KTILES=`/
+  `NTILES=` at build time) and measures the point of the exercise: the hardware
+  tile walk costs the CPU **~380 clocks at every shape** (5 commands, flat over a
+  205x range of array work), the C loop costs **~85 clocks per dispatch**, of
+  which only `max(0, 85 − MXU-clocks-per-tile)` is exposed — zero once M > ~24.
+  `docs/picorv32_migration.md` §9.6–9.7 carry the breakdown; §9.5 now also records
+  that the `qfull` counter is **structurally 0** (both producers gate `cmd_we`
+  with `!cmd_full`, so `p_cmd_we & p_cmd_full` never fires) and proves nothing.
+  `docs/picorv32_migration.md` is the
   design record and carries the format table, the measured baseline and the phase
   plan; §0's table is what actually passes today. **Measured cost of the plane on
   the four-layer model: 690 705 → 693 107 clocks (+0.35%), byte-identical
@@ -490,5 +515,6 @@ The ISS runs the same four-layer forward plus the PyTorch reference and the byte
 and write code. Plan out anything in markdown files when it is a large task.
 Make comments & text summaries as concise as possible. I don't want fluff, just describe the code using simple language and that's it.
 Follow my requests exactly--do not write any extra code, unless I specifically ask an open-ended question that requests you to come up with a solution yourself. 
+Update every related doc whenever you make a change.
 - **Don't**: run code or any other commands (such as checking for packages, etc) unless otherwise told to do so.
 If extra context is needed about my development environment or feedback is needed for your code, please ask.

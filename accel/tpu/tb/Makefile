@@ -90,13 +90,15 @@ UART_RTL := ../rtl/tpu_top.sv ../rtl/scalar_unit.sv ../rtl/mxu.sv ../rtl/vpu.sv 
 RTL_cpu_smoke    := $(UART_RTL)
 RTL_tpu_top      := $(UART_RTL)
 RTL_tpu_top_uart := $(UART_RTL)
+RTL_fw_matmul    := $(UART_RTL)
 
-# Every test discoverable from the *_tb.sv files present. uart_memory_cosim is
-# excluded: it has no rtl/<name>.sv and cannot run without host/sim_link.py
-# driving it, so `make all` would only fail on it. Use `make cosim`.
-TESTS := $(filter-out uart_memory_cosim,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
+# Every test discoverable from the *_tb.sv files present. Two are excluded:
+# uart_memory_cosim has no rtl/<name>.sv and cannot run without host/sim_link.py
+# driving it (use `make cosim`), and fw_matmul needs a firmware image built by a
+# RISC-V cross gcc (use `make fw`). `make all` would only fail on either.
+TESTS := $(filter-out uart_memory_cosim fw_matmul,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
 
-.PHONY: sim wave list all clean uart echo mem bram cosim examples model
+.PHONY: sim wave list all clean uart echo mem bram cosim examples model fw fwsweep
 
 sim: $(TB) $(RTL)
 	$(IVERILOG) -o $(TOP).vvp $(RTL) $(TB)
@@ -137,6 +139,32 @@ HB     ?= 0
 
 model: $(UART_RTL) tpu_top_tb.sv run_model.sh
 	HB=$(HB) sh ./run_model.sh $(LAYERS)
+
+# The C firmware through the whole core: cpu_subsys.sv loads ../fw/$(FWPROG).hex
+# through FW_INIT and the PicoRV32 pushes the commands itself. Build the image
+# first (`make -C ../fw [PROG=...]`) -- that needs a RISC-V cross gcc, which is
+# why this is not in `make all`.
+#
+#   make fw                     ../fw/matmul.hex
+#   make fw FWPROG=matmul_loop  the software tile loop, same expectations
+#   make fw M=8 KTILES=16 NTILES=16   a different shape (rebuild ../fw with the
+#                                     SAME three numbers or the TB will mismatch)
+FWPROG ?= matmul
+M      ?=
+KTILES ?=
+NTILES ?=
+FWSHAPE := $(if $(M),-DFW_M=$(M)) $(if $(KTILES),-DFW_KT=$(KTILES)) \
+           $(if $(NTILES),-DFW_NT=$(NTILES))
+
+fw: $(UART_RTL) fw_matmul_tb.sv
+	$(IVERILOG) -DFW_HEX='"../fw/$(FWPROG).hex"' $(FWSHAPE) -o fw_matmul_tb.vvp \
+	            $(UART_RTL) fw_matmul_tb.sv
+	$(VVP) fw_matmul_tb.vvp
+
+# Both kernels over a range of shapes, tabulating what each costs the CPU.
+# Rebuilds the firmware per shape, so it needs the cross gcc like `make fw`.
+fwsweep: $(UART_RTL) fw_matmul_tb.sv run_fw_sweep.sh
+	sh ./run_fw_sweep.sh
 
 # Alias for `make TEST=uart_echo sim` (RTL_uart_echo above supplies the sources).
 echo:

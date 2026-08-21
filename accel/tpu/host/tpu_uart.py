@@ -18,10 +18,14 @@ CMD   byte   frame                                    reply
 
 * ``R``/``W`` addresses are 19-bit external-SRAM byte addresses; ``len`` is a
   byte count in ``1..65535``.
-* ``I`` addresses are *instruction word indices* (10-bit); ``len`` is still in
-  **bytes** and must be a multiple of 4. Each word is sent MSB first.
-* ``G`` carries no length and no payload — it pulses the scalar unit's run
-  trigger with ``run_pc = addr``.
+* ``I`` addresses are *instruction word indices* (13-bit); ``len`` is still in
+  **bytes** and must be a multiple of 4. Each word is sent MSB first. The top
+  bit (:data:`FW_BASE`) selects the producer: clear for the scalar unit's IMEM
+  (1024 words), set for the PicoRV32's firmware RAM (4096 words).
+* ``G`` carries no length and no payload — it starts whichever producer the
+  same top bit selects: the scalar unit at ``run_pc = addr``, or the CPU, which
+  always resets to firmware address 0 (``PROGADDR_RESET`` is fixed in the RTL,
+  so the rest of the address is ignored).
 * ``T`` is a single byte and cannot fail: it returns the scalar unit's
   run-length counter (``rtl/cycle_timer.sv``) as 4 bytes MSB first — the core
   clocks the last run took, or how far the current one has got.
@@ -114,8 +118,10 @@ IMEM_AW = 10               # scalar unit instruction memory word address
 # instruction memory, 1 = the PicoRV32 firmware RAM (tpu_top.sv `host_sel_fw`).
 FW_AW = 12                 # firmware RAM word address (16 KB)
 FW_BASE = 1 << FW_AW       # OR this into an 'I'/'G' address to reach the CPU
+HOST_AW = FW_AW + 1        # tpu_top.sv HOST_AW: the selector bit + the index
 MEM_LIMIT = 1 << MEM_ADDR_W
 IMEM_LIMIT = 1 << IMEM_AW
+HOST_LIMIT = 1 << HOST_AW
 
 MAX_LEN = 0xFFFF           # 16-bit length field
 MAX_IMEM_LEN = MAX_LEN & ~0x3   # 'I' payloads must be a multiple of 4 bytes
@@ -183,27 +189,43 @@ def _check_mem(addr: int, length: int) -> None:
         )
 
 
+def _producer(word_addr: int) -> tuple[str, int, int]:
+    """``(name, base, words)`` for a word address in the 'I'/'G' space.
+
+    The top bit (:data:`FW_BASE`) picks the target and the rest is an index
+    within it, so the two memories are checked against their own sizes. The RTL
+    validates the whole ``HOST_AW``-bit range against the *larger* of the two
+    and then truncates, so this is the stricter of the two rules — an address
+    past the end of the scalar unit's IMEM would otherwise be accepted by the
+    device and silently wrap.
+    """
+    if word_addr & FW_BASE:
+        return "firmware RAM", FW_BASE, 1 << FW_AW
+    return "IMEM", 0, IMEM_LIMIT
+
+
 def _check_imem(word_addr: int, length: int) -> None:
     if not 0 <= word_addr < ADDR_LIMIT:
         raise ValueError(f"address {word_addr:#x} does not fit the 24-bit field")
-    if word_addr >= IMEM_LIMIT:
+    if word_addr >= HOST_LIMIT:
         raise ValueError(
-            f"word address {word_addr:#x} outside the {IMEM_AW}-bit IMEM space"
+            f"word address {word_addr:#x} outside the {HOST_AW}-bit 'I' space"
         )
     if not 1 <= length <= MAX_LEN:
         raise ValueError(f"length {length} outside 1..{MAX_LEN}")
     if length % 4:
         raise ValueError(f"IMEM payload {length} bytes is not a multiple of 4")
-    if word_addr + length // 4 > IMEM_LIMIT:
+    name, base, words = _producer(word_addr)
+    if word_addr - base + length // 4 > words:
         raise ValueError(
-            f"{length // 4} words at {word_addr:#x} run past the end of IMEM "
-            f"({IMEM_LIMIT} words)"
+            f"{length // 4} words at {word_addr:#x} run past the end of {name} "
+            f"({words} words)"
         )
 
 
 def _check_pc(pc: int) -> None:
-    if not 0 <= pc < IMEM_LIMIT:
-        raise ValueError(f"boot PC {pc:#x} outside the {IMEM_AW}-bit IMEM space")
+    if not 0 <= pc < HOST_LIMIT:
+        raise ValueError(f"boot PC {pc:#x} outside the {HOST_AW}-bit 'G' space")
 
 
 def _header(cmd: int, addr: int, length: int | None = None) -> bytes:
@@ -683,10 +705,12 @@ class TPUUart:
             self._payload_cmd(CMD_WRITE, addr + off, chunk, _check_mem)
 
     def load_program(self, word_addr: int, words: Sequence[int] | bytes) -> None:
-        """``I`` — load instruction words into the scalar unit's IMEM.
+        """``I`` — load 32-bit words into one of the two instruction memories.
 
         ``words`` is a sequence of 32-bit ints (packed MSB first) or an already
-        packed big-endian byte string. ``word_addr`` is a *word* index.
+        packed big-endian byte string. ``word_addr`` is a *word* index, with
+        :data:`FW_BASE` set to address the CPU's firmware RAM instead of the
+        scalar unit's IMEM.
         """
         payload = words if isinstance(words, (bytes, bytearray)) else pack_words(words)
         if not payload:
@@ -717,7 +741,11 @@ class TPUUart:
                 raise
 
     def go(self, pc: int = 0) -> None:
-        """``G`` — start the scalar unit at ``pc`` (a 4-byte frame, no length).
+        """``G`` — start a producer at ``pc`` (a 4-byte frame, no length).
+
+        ``pc`` is the same word address ``'I'`` takes: below :data:`FW_BASE` it
+        is the scalar unit's boot PC, at or above it releases the CPU from
+        reset (which always starts at firmware address 0).
 
         Returns as soon as the device ACKs the launch; the program itself runs
         asynchronously and this link has no way to poll for completion.
@@ -863,10 +891,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ld = sub.add_parser("load", help="load instruction memory ('I')")
     ld.add_argument("file", help="$readmemh-style program (one hex word per line)")
-    ld.add_argument("--addr", type=_auto_int, default=0, help="IMEM word index")
+    ld.add_argument("--addr", type=_auto_int, default=0,
+                    help="word index; add 0x1000 for the CPU's firmware RAM")
     ld.add_argument("--go", action="store_true", help="run from --addr after loading")
 
-    g = sub.add_parser("go", help="start the scalar unit ('G')")
+    g = sub.add_parser("go", help="start the scalar unit, or the CPU ('G')")
     g.add_argument("pc", type=_auto_int, nargs="?", default=0)
 
     tm = sub.add_parser("timer", help="read the performance counters ('T')")

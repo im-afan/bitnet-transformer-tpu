@@ -28,11 +28,12 @@ the bit-exact ISS, and the golden-vector generator.
 | Path           | Contents                                                                        |
 | -------------- | ------------------------------------------------------------------------------- |
 | `rtl/`         | Synthesizable SystemVerilog: systolic array (`mxu.sv`), vector unit (`vpu.sv`), banked scratchpad, DMA + external SRAM controller, scalar unit, UART interface, and `tpu_top.sv` tying them together. There is no `rtl/luts/` any more — the VPU's activation ROMs went with the `gelu`/`exp` instructions ([docs/vpu.md §Removed ops](docs/vpu.md#removed-ops)), so the design reads no `$readmemh` file by default. |
-| `tb/`          | Icarus testbenches, one per block plus two end-to-end (`tpu_top_tb.sv` direct, `tpu_top_uart_tb.sv` over the serial link). `make` targets in `tb/Makefile`; `vectors*/` hold golden vectors from `../tpulang/gen_vectors.py`. |
+| `tb/`          | Icarus testbenches, one per block plus three end-to-end (`tpu_top_tb.sv` direct, `tpu_top_uart_tb.sv` over the serial link, `fw_matmul_tb.sv` running C firmware out of `FW_INIT` — `make fw`). `make` targets in `tb/Makefile`; `vectors*/` hold golden vectors from `../tpulang/gen_vectors.py`. |
 | `sim/`         | Placeholder for simulator artifacts (waveforms, logs — gitignored). Testbenches currently build and run in place under `tb/`. |
 | `constraints/` | Pin assignment and timing constraints, one `.xdc` per target board. |
 | `synth/`       | Vivado non-project build (`synth/vivado/build.tcl`), with per-board definitions and top-level wrappers under `synth/vivado/boards/<board>/`. Build output goes to `synth/build/` (gitignored). |
-| `host/`        | Python host driver: the UART protocol (`tpu_uart.py`), the end-to-end runner (`run_program.py`), and link self-tests. |
+| `fw/`          | C firmware for the PicoRV32 command producer (`rtl/cpu_subsys.sv`): the MMIO driver header, one `.c` per kernel, `start.S`, linker script and Makefile. Needs a RISC-V cross gcc — see [`fw/README.md`](fw/README.md). |
+| `host/`        | Python host driver: the UART protocol (`tpu_uart.py`), the end-to-end runners (`run_program.py` for `.tpu` programs, `run_fw_matmul.py` for the C firmware), and link self-tests. |
 | `docs/`        | Microarchitecture notes: ISA / command format, register + memory map, dataflow, numerics. Start at [`docs/README.md`](docs/README.md). |
 
 Four board targets are defined under `synth/vivado/boards/`: `cmod_a7` (the real design),

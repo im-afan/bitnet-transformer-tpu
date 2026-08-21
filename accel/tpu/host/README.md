@@ -13,6 +13,11 @@ runs standalone (`python accel/tpu/host/tpu_uart.py ...`) rather than as a
 tpulang program, preloads it and its tensors, runs it, reads the results back
 and checks them. See [Running a program](#running-a-program) below.
 
+`run_fw_matmul.py` — the same flow for the *other* producer: loads the C
+firmware built in [`../fw/`](../fw/README.md) into the PicoRV32's RAM, stages the
+operands, releases the core and checks the result. No assembler and no ISS in
+the loop.
+
 `test_uart_link.py` — self-checking tests for the link itself, no program and no
 toolchain involved. See [Testing the link](#testing-the-link) below.
 
@@ -31,9 +36,16 @@ separate bitstream that contains nothing but the UART blocks. See
 | `T` 0x54  | `read_timer()`            | `CMD`                                  | 4 counter bytes  |
 
 Address is 3 bytes big-endian, length 2 bytes big-endian **in bytes**. `R`/`W`
-address 19-bit SRAM bytes; `I` addresses 10-bit instruction *word* indices and
+address 19-bit SRAM bytes; `I` addresses 13-bit instruction *word* indices and
 its length must be a multiple of 4 (words packed MSB first); `G` has no length
-or payload and pulses the scalar unit's run trigger with `run_pc = addr`.
+or payload.
+
+`I` and `G` reach **two** memories. Bit 12 of the word address (`FW_BASE`)
+selects the producer: clear for the scalar unit's 1024-word IMEM, set for the
+PicoRV32's 4096-word firmware RAM (`tpu_top.sv` `host_sel_fw`). `G` below
+`FW_BASE` pulses the scalar unit's run trigger with `run_pc = addr`; at or above
+it, it releases the CPU from reset, which always starts at firmware address 0 —
+`PROGADDR_RESET` is fixed in the RTL, so the rest of that address is ignored.
 
 `T` is one byte and cannot fail. It returns the scalar unit's run-length counter
 (`rtl/cycle_timer.sv`) as 4 bytes MSB first: core clocks the last run took, or
@@ -150,6 +162,31 @@ Defaults to `tpulang/examples/tiled_matmul.tpu`; any example works, since the
 image builder is chosen from the program's own `.equ` constants exactly as
 `gen_vectors.py` chooses it. It needs the toolchain on disk (it imports
 `assembler` / `iss` / `gen_vectors` by path), unlike `tpu_uart.py` itself.
+
+## Running C firmware
+
+The same five commands, with the PicoRV32 as the producer instead of the scalar
+unit. Build the image first (`make -C accel/tpu/fw`, needs a RISC-V cross gcc —
+[`fw/README.md`](../fw/README.md)):
+
+```bash
+python accel/tpu/host/run_fw_matmul.py -p COM5
+python accel/tpu/host/run_fw_matmul.py --dry-run        # operands + reference, no board
+python accel/tpu/host/run_fw_matmul.py -p COM5 --fw ../fw/foo.hex
+make -C accel/tpu/fw run PORT=COM5                      # build then run
+```
+
+1. `I` the firmware into the CPU's RAM at `FW_BASE`, `W` the operands into DRAM;
+2. `G` at `FW_BASE` releases the core; the firmware pushes its own DMA and MXU
+   commands and raises `done` when it returns;
+3. wait for idle, `T` the counters, `R` the int32 result back and compare it to a
+   plain-Python matmul.
+
+`fw/matmul.c` runs the same `[8x32] @ [32x16]` problem as
+`tpulang/examples/tiled_matmul_hw.tpu`, at the same addresses, so the two
+producers can be compared directly. The simulation counterpart of this script is
+`cd accel/tpu/tb && make fw`, which loads the same image through `FW_INIT` and
+checks the same result without a board.
 
 ### Checking the kernel against PyTorch
 
