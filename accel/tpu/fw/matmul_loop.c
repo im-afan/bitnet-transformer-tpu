@@ -31,7 +31,7 @@
  * and flat is what makes this comparable to matmul.c.
  *
  *   A : M x K int8, row-major            arow = K
- *   W : K x N trits, col-major 2-bit      wcol = K*2/8
+ *   W : K x N int4, ROW-major 4-bit        wrow = N*4/8
  *   C : M x N int32                      crow = N*4
  */
 #include "tpu.h"
@@ -55,18 +55,22 @@
 #define N (NTILES * COLS)
 
 #define AROW K                  /* A row stride, bytes */
-#define WCOL ((K * 2) / 8)      /* W column stride, bytes */
+#define WROW ((N * 4) / 8)      /* W row stride, bytes (row-major int4) */
 #define CROW (N * 4)            /* C row stride, bytes (int32) */
 
 /* Per-tile steps. The hardware derives these from the tile indices; with the
  * counts pinned at 1 they are the loop's own address arithmetic. */
 #define AKSTEP ROWS             /* 8  — one k tile along A's row            */
-#define WKSTEP ((ROWS * 2) / 8) /* 2  — one k tile down a weight column     */
-#define WNSTEP (COLS * WCOL)    /* one n tile of whole weight columns       */
+/* Row-major weights swap these two relative to the column-major version: an
+ * n tile is a step *along* a weight row by one array width of nibbles, and a
+ * k tile is a step *down* ROWS whole rows. Same swap as mxu.sv's
+ * wgt_ntile_step / wgt_ktile_step. */
+#define WKSTEP (ROWS * WROW)    /* one k tile down ROWS whole weight rows   */
+#define WNSTEP ((COLS * 4) / 8) /* 4  — one n tile along a weight row       */
 #define CNSTEP (COLS * 4)       /* 32 — one n tile of int32 C               */
 
 #define A_BYTES (M * K)
-#define W_BYTES (N * WCOL)
+#define W_BYTES (K * WROW)
 #define C_BYTES (M * N * 4)
 
 /* Same value in DRAM and in the scratchpad, as in the .tpu examples. */
@@ -84,7 +88,7 @@ int main(void)
     tpu_wait(TPU_U_DMA);        /* the MXU queue is not ordered against the DMA's */
 
     /* Strides describe the whole matrix; the counts describe one array pass. */
-    tpu_mxu_geom(AROW, CROW, WCOL, 1u, 1u, M);
+    tpu_mxu_geom(AROW, CROW, WROW, 1u, 1u, M);
 
     /* n outer, k inner — the order the hardware loop uses, so the two paths
      * differ only in who walks the grid. No fence inside: one unit's queue is

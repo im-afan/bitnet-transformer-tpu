@@ -16,7 +16,6 @@ set RTL_DIR [file normalize [file join [file dirname [info script]] .. .. rtl]]
 
 set RTL_SRCS [list \
     [file join $RTL_DIR tpu_top.sv] \
-    [file join $RTL_DIR scalar_unit.sv] \
     [file join $RTL_DIR mxu.sv] \
     [file join $RTL_DIR vpu.sv] \
     [file join $RTL_DIR scratchpad.sv] \
@@ -43,8 +42,6 @@ set RTL_SRCS [list \
 # by every synthesis run; Vivado prunes unreferenced modules once -top is
 # elaborated, so carrying them costs nothing in the production build.
 #
-#   requant.sv     a leaf block nothing instantiates yet — move it up into
-#                  RTL_SRCS when it gets wired in.
 #   uart_echo.sv   the UART loopback self-test core (docs/uart_selftest.md). Not
 #                  part of tpu_top; it is the child of boards/cmod_a7_echo's top
 #                  level, which is why it lives here rather than in RTL_SRCS.
@@ -58,7 +55,6 @@ set RTL_SRCS [list \
 #   bram.sv        bram_controller — on-chip block RAM behind sram_controller's
 #                  user-side handshake. Only uart_bram.sv instantiates it.
 set RTL_UNUSED [list \
-    [file join $RTL_DIR requant.sv] \
     [file join $RTL_DIR uart_echo.sv] \
     [file join $RTL_DIR uart_memory.sv] \
     [file join $RTL_DIR uart_bram.sv] \

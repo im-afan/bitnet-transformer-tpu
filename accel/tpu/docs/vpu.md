@@ -40,7 +40,7 @@ What is left:
   in the shipped kernel. They are now on the [MXU](mxu.md), because K and V are
   **ternary activations**: the array multiplies an int8 activation by a ternary
   weight, so ternarizing the operand that lands on the weight side is all it took.
-  `TQUANT` is the op that does that. The output head followed — `Model.fc` is a
+  `QUANT4` is the op that does that. The output head followed — `Model.fc` is an
   `TernaryLinear` too — so `VECMATMUL` has **no caller in the shipped kernel at all**,
   and neither does `DOT`. Both are kept: an int8 × int8 matmul is one model shape away,
   and dropping them means dropping the whole reduction path (accumulator, fold, scalar
@@ -60,7 +60,7 @@ The op is selected by the 5-bit `vpu_op` field driven by the scalar unit, matchi
 | `10`     | `REQUANT`   | requant     | `src0`(int32), `scalar`  | `dst[i] = clip((src0[i]·m0 + rnd) >> n)`     |
 | `13`     | `VECMATMUL` | macro op    | `src0`, `src1`, geometry | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]`      |
 | `16`     | `DYT`       | requant     | `src0`(int32), `scalar`  | `dst[i] = clip±127((src0[i]·m0 + rnd) >> n)` |
-| `17`     | `TQUANT`    | requant     | `src0`(**int8**), `scalar` | `dst[i] = clip±1((src0[i]·m0 + rnd) >> n)`, 2 bits wide |
+| `17`     | `QUANT4`    | requant     | `src0`(**int8**), `scalar` | `dst[i] = clip[-8,7]((src0[i]·m0 + rnd) >> n)`, 4 bits wide |
 
 The gaps (`2`, `4`–`9`, `11`, `12`, `14`, `15`) are retired codes, not free encoding
 space — see [Removed ops](#removed-ops). They are left vacant so a stale binary decodes
@@ -166,38 +166,43 @@ Nothing checks that the output scale really is `1/127`. A `DYT` whose word
 targets some other scale is a rescale with an odd clip, not a hardtanh — the
 scale contract is the compiler's.
 
-### Ternary quantize (`TQUANT`)
+### int4 narrow + pack (`QUANT4`, formerly `TQUANT`)
 
 The third op on the same shifter, and the only one whose destination is not int8:
 
 ```
-dst[i] = clip_±1( (src0[i] * m0 + (1 << (n-1))) >> n )      # 2 bits per element
+dst[i] = clip_[-8,7]( (src0[i] * m0 + (1 << (n-1))) >> n )   # 4 bits per element
 ```
 
 Two differences from `REQUANT`, and both are the point:
 
-- **the source is int8**, not int32. `TQUANT` narrows an activation a requant already
+- **the source is int8**, not int32. `QUANT4` narrows an activation a requant already
   produced, so it does not read the accumulator width. It is the one op in the unit
   where `src0_is32` and `dst_is8` are genuinely independent predicates rather than two
   names for the same thing.
-- **the destination is 2 bits**, written in the MXU's own weight encoding
-  (`00` = 0, `01` = +1, `11` = −1 — [scratchpad.md](scratchpad.md) §2), four elements
-  to a byte. So the result is not "a ternary tensor that then needs packing"; it *is*
-  a packed weight block, addressable by `matmul_t` with no pass in between.
+- **the destination is 4 bits**, a bare two's-complement nibble in the MXU's packed
+  weight layout ([scratchpad.md](scratchpad.md) §2), two elements to a byte. So the
+  result is not "an int4 tensor that then needs packing"; it *is* a packed weight
+  block, addressable by `matmul_t` with no pass in between.
 
 That is what lets an **activation be a weight operand**, which is the whole reason the
-op exists. The array multiplies int8 × ternary and cannot multiply int8 × int8 at all,
-so attention's `Q @ K^T` and `P @ V` could only run on it once K and V were ternary.
-`accel/tpulang/examples/adder_model.tpu` ternarizes both, one `tquant` loop each, and
-in exchange both attention matmuls became `matmul_t` dispatches.
+op exists: the array reads weights packed and activations as bytes, so attention's
+`Q @ K^T` and `P @ V` can only run on it once K and V are in the packed layout.
+`accel/tpulang/examples/adder_model.tpu` packs both, one `quant4` loop each, and in
+exchange both attention matmuls became `matmul_t` dispatches.
+
+Since weights and activations are now the same width, the *value* is usually unchanged —
+whatever requant produced `src0` already clipped it to `[-8, 7]`, so `{m0,n} = {1,0}`
+makes this a pure repack. Under the old ternary encoding it was a genuine second narrow
+onto `{-1, 0, 1}`, and that rounding was real accuracy loss.
 
 Two constraints a kernel has to respect:
 
-- **`vlen` must be a multiple of 4.** The write strobe is per byte and a byte holds
-  four trits. A tail that does not fill its byte writes `00` — trit 0 — into the
-  remaining slots rather than preserving what was there.
-- **the destination pointer advances a quarter as fast as the source.** A `CHUNK`-long
-  pass reads `CHUNK` bytes and writes `CHUNK/4`.
+- **`vlen` must be a multiple of 2** (it was 4 when four trits shared a byte). The write
+  strobe is per byte and a byte holds two nibbles. A tail that does not fill its byte
+  writes nibble `0` into the remaining slot rather than preserving what was there.
+- **the destination pointer advances half as fast as the source.** A `CHUNK`-long pass
+  reads `CHUNK` bytes and writes `CHUNK/2`.
 
 Nothing checks that the multiplier is a sensible ternary threshold, exactly as with
 `DYT`. A word that is too large makes every element ±1 and a word that is too small

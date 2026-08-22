@@ -7,9 +7,14 @@ untouched; both paths push into the same queues.
 
 | File | Contents |
 | --- | --- |
-| `tpu.h` | the MMIO aperture and one builder per command. No abstraction — the fields are packed exactly as `cmd_mxu.sv` / `cmd_dma.sv` decode them |
+| `tpu.h` | the MMIO aperture and one builder per command. No abstraction — the fields are packed exactly as `cmd_mxu.sv` / `cmd_vpu.sv` / `cmd_dma.sv` decode them |
 | `matmul.c` | `C[8x16] = A[8x32] @ W[32x16]`, DMA in, one `matmul_t`, DMA out |
 | `matmul_loop.c` | the same product with the 4x2 tile grid walked in C — 8 single-tile dispatches, `.acc` across the contraction — instead of by the array |
+| `ffn.c` | the feed-forward block, `X@W1 → relu → requant → @W2`. The first kernel to issue a **VPU** command |
+| `mha.c` | one head of ReLU attention: all three DMA modes including the transposing spill, plus the `quant4` pack that turns an activation into a weight operand |
+| `adder.c` | **the whole shipped model** — four transformer layers and the output head, 518 commands, one run |
+| `adder_rq.h` | `adder.c`'s 16 requant `{m0,n}` words per layer. The checked-in copy is tuned for the synthetic operands; a real checkpoint overrides it (below) |
+| `mock/tpu_trace.c` | the host-side `tpu_push`/`tpu_wait`, so `-DTPU_TRACE` turns any kernel here into its own command-trace producer |
 | `start.S` | reset entry: `gp`/`sp`, zero `.bss`, `main`, then raise `done` |
 | `link.ld` | the 16 KB firmware RAM at address 0 |
 | `bin2hex.py` | `.bin` → one 32-bit word per line, for `'I'` and for `$readmemh` |
@@ -22,7 +27,9 @@ Makefile autodetects the prefix; override with `CROSS=`. Nothing else: the
 newlib the formula installs is never linked.
 
 Current sizes, all text, no `.data`/`.bss`: `matmul` 248 bytes (62 words),
-`matmul_loop` 352 (88), against 16 KB of firmware RAM.
+`matmul_loop` 352 (88), `adder` 1544 (386), against 16 KB of firmware RAM. The
+whole four-layer model is 1.5 KB of RISC-V because the per-layer body is a loop
+over a base register, not unrolled — depth costs no instructions at all.
 
 ```bash
 make -C accel/tpu/fw            # -> matmul.hex
@@ -67,6 +74,67 @@ cd accel/tpu/tb && make fwsweep                # the whole sweep, ~40 s
 clocks across a 205x range of array work; `matmul_loop.c` pays ~85 clocks per
 dispatch, of which only `max(0, 85 - MXU-clocks-per-tile)` is exposed — nothing
 at all once M is past ~24. Full table in §9.7.
+
+## `adder.c` — the whole model
+
+`model/transformer.py::adder_int4_vanilla` (`d=64`, `f=256`, `layers=4`,
+`q_heads=kv_heads=4`, `head_dim=16`, `vocab=13`, int4 weights *and* int4
+activations, no bias) as one program: **518 commands, 1544 bytes of firmware,
+439 917 clocks.**
+
+```bash
+cd accel/tpu/tb && make fw FWPROG=adder     # ~3 min, 526 879 checks, 0 errors
+```
+
+```
+counters: run=439916 mxu=206361 mload=33440 vpu=84352 dma=131168
+          idlec=18035 qfull=0 ovlap=0
+command trace: 518 commands, 518 expected
+```
+
+`idlec` — clocks with no unit busy at all — is **4.1%** of the run, which is what
+the CPU costs as a command producer on a real workload. `ovlap` is 0 because the
+kernel fences after every cross-unit dependency; nothing is overlapped yet.
+
+Two layout facts are the whole design, and both are the *opposite* of the
+retired ternary kernel's, because weights went row-major:
+
+- **`Q @ K^T` needs the transpose.** Its weight is `K^T[h][s]`, so row `h` must
+  be contiguous over `s` — that is K column-major, and K leaves its projection
+  row-major. It goes out through the DMA's `.t` spill and back in, as **bytes**,
+  because a packed int4 nibble is half of one; then `quant4` packs it.
+- **`P @ V` does not.** It contracts over keys, so its weight is `V[s][h]`, row
+  `s` contiguous over `h` — exactly how V left its projection. Free.
+
+Everything else worth knowing:
+
+| | |
+| --- | --- |
+| scratchpad | one 8 KB weight window refilled 4x per layer, everything else resident; top byte used is `0xDFFF` of 64 KB |
+| DRAM | 106 KB — `X0`, the mask, `W_fc`, the logits, and `0x2000 + L*0x6000` per layer |
+| the mask | int8 `0`/`-8`. S is already int4, so `S-8 <= -1` whatever `s_s` is and ReLU takes a masked entry to **exactly** zero |
+| `vlen` | 10 bits, so no VPU pass exceeds 1023 elements; every tensor here is a multiple of 512 and the one int32 temp stays 2 KB |
+| the head | 13 logits padded to a whole 16-wide tile, so the second output tile cannot land on the next token's row. Read 13 of every 16 int32 words back |
+| the host | the token embedding (no gather in the ISA) and the argmax (nothing returns an index). Nothing else |
+
+**The requant table is a compile-time input.** The `{m0,n}` word is a literal in
+the macro-op, so unlike the retired scalar ISA there is no path by which the
+device could fetch it from memory — the 16 words per layer have to be in the
+image. `adder_rq.h` is the checked-in default and is tuned for the *synthetic*
+operands `../../tpulang/fw_vectors.py` stages, so `make fw FWPROG=adder` is a
+self-contained datapath regression with no `.pt` involved. A real checkpoint
+goes through [`../../tpulang/adder_export.py`](../../tpulang/adder_export.py),
+which derives the table from the model's learned `ActQuant` scales, compiles the
+same `adder.c` against it, and runs the trace on `iss.py`:
+
+```bash
+python accel/tpulang/adder_export.py -n 256          # accuracy on the addition task
+python accel/tpulang/adder_export.py --dump-rq -n 0  # just the 16 words per layer
+```
+
+Measured on `model/saved/int4_d64_f256_l4.pt`, 256 problems: **100.00%
+exact-sequence, 100.00% token** — identical to the PyTorch QAT model it came
+from, with 0 of 4352 scored argmax positions differing.
 
 ## Run it on the board
 

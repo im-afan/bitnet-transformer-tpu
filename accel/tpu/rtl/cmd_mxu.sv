@@ -63,7 +63,7 @@ module cmd_mxu #(
     output logic                     mxu_tiled,
     output logic [ADDR_W-1:0]        mxu_a_row,
     output logic [ADDR_W-1:0]        mxu_c_row,
-    output logic [ADDR_W-1:0]        mxu_w_col,
+    output logic [ADDR_W-1:0]        mxu_w_row,
     output logic [7:0]               mxu_k_tiles,
     output logic [7:0]               mxu_n_tiles,
     output logic                     mxu_accumulate,
@@ -104,13 +104,13 @@ module cmd_mxu #(
     wire is_mm   = (c_op == MXU_MM);
 
     // ---- sticky geometry ----------------------------------------------------
-    logic [ADDR_W-1:0] g_arow, g_crow, g_wcol;
+    logic [ADDR_W-1:0] g_arow, g_crow, g_wrow;
     logic [7:0]        g_ktiles, g_ntiles;
     logic [5:0]        g_tlen;
 
     assign mxu_a_row   = g_arow;
     assign mxu_c_row   = g_crow;
-    assign mxu_w_col   = g_wcol;
+    assign mxu_w_row   = g_wrow;
     assign mxu_k_tiles = g_ktiles;
     assign mxu_n_tiles = g_ntiles;
     assign mxu_t_len   = g_tlen;
@@ -142,7 +142,7 @@ module cmd_mxu #(
             state    <= S_HEAD;
             g_arow   <= '0;
             g_crow   <= '0;
-            g_wcol   <= '0;
+            g_wrow   <= '0;
             g_ktiles <= '0;
             g_ntiles <= '0;
             g_tlen   <= '0;
@@ -153,7 +153,7 @@ module cmd_mxu #(
                         if (is_geom) begin
                             g_arow   <= w0[31:16];
                             g_crow   <= w1[15:0];
-                            g_wcol   <= w1[31:16];
+                            g_wrow   <= w1[31:16];
                             g_ktiles <= w2[7:0];
                             g_ntiles <= w2[15:8];
                             g_tlen   <= w2[21:16];

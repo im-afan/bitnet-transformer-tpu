@@ -8,7 +8,7 @@
 //   elementwise (int8 -> int32): ADD, RELU
 //   reduction   (int8 -> int32 scalar): DOT
 //   narrowing   (int32 -> int8): REQUANT, DYT
-//   ternarizing (int8  -> 2 bits): TQUANT
+//   int4 pack   (int8  -> 4 bits): QUANT4
 //
 // That is the whole unit now. The ops this TB used to cover as well — GELU,
 // EXP, SQUARE, ELEMENT_MUL, SCALAR_MUL/ADD/DIV, REDUCESUM, REDUCEMAX and the
@@ -19,16 +19,17 @@
 // inner primitive of VOP_VECMATMUL, whose row/column sequencing is covered at
 // the tpu_top level instead.
 //
-// REQUANT and DYT share a fixed point and differ only in the lower clip (-128
-// vs -127, DyT's hardtanh being odd), so `test_dyt_floor` asserts that one
-// input directly: a random spread hits the single value that separates them
+// Everything narrows to **int4** now, in an int8 container: REQUANT clips to
+// [-8, 7] and DYT to [-7, 7]. The two still share a fixed point and differ only
+// in the lower clip (DyT's hardtanh being odd), so `test_dyt_floor` asserts that
+// one input directly: a random spread hits the single value that separates them
 // almost never, and without it a DUT that routed `dyt` to requant8 would pass
 // everything else here.
 //
-// TQUANT is the only op whose destination is narrower than a byte: four trits
+// QUANT4 is the only op whose destination is narrower than a byte: two nibbles
 // share one byte and the write strobe is per byte, so its tests check the packed
-// *bytes*, not elements, and `test_tquant_pack` pins the encoding and the
-// bit order directly against a hand-written byte.
+// *bytes*, not elements, and `test_quant4_pack` pins the encoding and the
+// nibble order directly against hand-written bytes.
 //
 // Coverage includes multi-chunk streaming (vlen > LANES), an exact-boundary
 // vlen, and partial-tail vlen so the lane-active predicate / V_wstrb masking is
@@ -52,7 +53,7 @@ module vpu_tb;
     localparam logic [4:0]
         VOP_DOT       = 5'd0,  VOP_ADD       = 5'd1,  VOP_RELU = 5'd3,
         VOP_REQUANT   = 5'd10, VOP_VECMATMUL = 5'd13, VOP_DYT  = 5'd16,
-        VOP_TQUANT    = 5'd17;
+        VOP_QUANT4    = 5'd17;
 
     // ---- Scratchpad address map (generous spacing; int8 chunks over-read) ---
     localparam logic [ADDR_W-1:0] A_ADDR  = 16'h1000;  // src0
@@ -240,9 +241,9 @@ module vpu_tb;
         prod    = longint'(x) * longint'(m0);
         round   = (n == 0) ? 0 : (longint'(1) << (n - 1));
         shifted = (prod + round) >>> n;
-        if      (shifted >  127) return  127;
-        else if (shifted < -128) return -128;
-        else                     return int'(shifted);
+        if      (shifted >  7) return  7;
+        else if (shifted < -8) return -8;
+        else                   return int'(shifted);
     endfunction
 
     // Reference for DYT: the same rescale clipped symmetrically. Written out
@@ -254,9 +255,9 @@ module vpu_tb;
         prod    = longint'(x) * longint'(m0);
         round   = (n == 0) ? 0 : (longint'(1) << (n - 1));
         shifted = (prod + round) >>> n;
-        if      (shifted >  127) return  127;
-        else if (shifted < -127) return -127;
-        else                     return int'(shifted);
+        if      (shifted >  7) return  7;
+        else if (shifted < -7) return -7;
+        else                   return int'(shifted);
     endfunction
 
     // -------------------------------------------------------------------------
@@ -317,33 +318,33 @@ module vpu_tb;
     endtask
 
     // The one input that tells DYT and REQUANT apart: an accumulator that
-    // rescales to exactly -128. REQUANT must return -128, DYT must return -127.
+    // rescales below the int4 floor. REQUANT must return -8, DYT must return -7.
     // Without this, a DUT that routed `dyt` to requant8 would pass every test
     // above, because gen_i32's random spread hits that single value ~never.
     task automatic test_dyt_floor();
         int got_dyt, got_rq;
-        put32(A_ADDR, -128);
+        put32(A_ADDR, -8);
         put32(SC_ADDR, (0 << M0_W) | 1);        // {m0=1, n=0}: pass through
         run_op(VOP_DYT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, 1);
         got_dyt = $signed(mem[D_ADDR]);
-        exp8(D_ADDR, -127, "DYT-floor");
+        exp8(D_ADDR, -7, "DYT-floor");
         run_op(VOP_REQUANT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, 1);
         got_rq = $signed(mem[D_ADDR]);
-        exp8(D_ADDR, -128, "REQUANT-floor");
-        $display("[DYT-floor] -128 -> dyt %0d / requant %0d  (errors so far: %0d)",
+        exp8(D_ADDR, -8, "REQUANT-floor");
+        $display("[DYT-floor] -8 -> dyt %0d / requant %0d  (errors so far: %0d)",
                  got_dyt, got_rq, errors);
     endtask
 
-    // Reference for TQUANT: the same shifter clipped to +-1, returned as the
-    // MXU's 2-bit weight code (bit 0 = nonzero, bit 1 = sign).
-    function automatic logic [1:0] ref_tquant(input int x, input int m0, input int n);
+    // Reference for QUANT4: the same shifter clipped to [-8, 7], returned as a
+    // bare 4-bit two's-complement nibble — the MXU's packed weight element.
+    function automatic logic [3:0] ref_quant4(input int x, input int m0, input int n);
         longint prod, round, shifted;
         prod    = longint'(x) * longint'(m0);
         round   = (n == 0) ? 0 : (longint'(1) << (n - 1));
         shifted = (prod + round) >>> n;
-        if      (shifted >=  1) return 2'b01;
-        else if (shifted <= -1) return 2'b11;
-        else                    return 2'b00;
+        if      (shifted >  7) return 4'sd7;
+        else if (shifted < -8) return -4'sd8;
+        else                   return shifted[3:0];
     endfunction
 
     task automatic expbyte(input [ADDR_W-1:0] a, input logic [7:0] exp,
@@ -357,43 +358,47 @@ module vpu_tb;
         end
     endtask
 
-    // TQUANT: int8 in at stride 1, 2 bits out, four elements to a byte. Checked
+    // QUANT4: int8 in at stride 1, 4 bits out, two elements to a byte. Checked
     // a byte at a time, because that is the granularity the DUT can write.
-    task automatic test_tquant(input int vlen, input int m0, input int n,
+    task automatic test_quant4(input int vlen, input int m0, input int n,
                                input string tag);
         logic [7:0] exp;
         gen_i8(vlen);
         for (int i = 0; i < vlen; i++) put8(A_ADDR + i, tv_a[i]);
         put32(SC_ADDR, (n << M0_W) | m0);
         // Poison the destination so a byte the DUT fails to strobe is visible
-        // rather than reading back as a legitimate all-zero trit group.
-        for (int b = 0; b < (vlen + 3) / 4; b++) mem[D_ADDR + b] = 8'hA5;
-        run_op(VOP_TQUANT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
-        for (int b = 0; b < (vlen + 3) / 4; b++) begin
+        // rather than reading back as a legitimate all-zero nibble pair.
+        for (int b = 0; b < (vlen + 1) / 2; b++) mem[D_ADDR + b] = 8'hA5;
+        run_op(VOP_QUANT4, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, vlen);
+        for (int b = 0; b < (vlen + 1) / 2; b++) begin
             exp = '0;
-            for (int j = 0; j < 4; j++)
-                if (b*4 + j < vlen)
-                    exp[j*2 +: 2] = ref_tquant(tv_a[b*4 + j], m0, n);
+            for (int j = 0; j < 2; j++)
+                if (b*2 + j < vlen)
+                    exp[j*4 +: 4] = ref_quant4(tv_a[b*2 + j], m0, n);
             expbyte(D_ADDR + b, exp, tag);
         end
         $display("[%s] vlen=%0d m0=%0d n=%0d  (errors so far: %0d)", tag, vlen, m0, n, errors);
     endtask
 
-    // The encoding itself, against a byte written out by hand. Everything above
+    // The encoding itself, against bytes written out by hand. Everything above
     // compares the DUT to a reference that could share a misreading with it;
-    // this one cannot. {+1, 0, -1, +1} with {m0=1,n=0} must pack to
-    // 01 | 00<<2 | 11<<4 | 01<<6 = 8'b01_11_00_01 = 0x71.
-    task automatic test_tquant_pack();
-        put8(A_ADDR + 0,  1);
-        put8(A_ADDR + 1,  0);
-        put8(A_ADDR + 2, -5);       // clips to -1
-        put8(A_ADDR + 3, 99);       // clips to +1
+    // this one cannot. {+1, -1, -8, +7} with {m0=1,n=0} packs low nibble first:
+    //   byte0 = 0x1 | (0xF << 4) = 0xF1     (+1, -1)
+    //   byte1 = 0x8 | (0x7 << 4) = 0x78     (-8, +7)
+    // Both grid ends appear, which is where a sign-extension bug shows: -8 must
+    // encode as 0x8 and -1 as 0xF, not as saturated positives.
+    task automatic test_quant4_pack();
+        put8(A_ADDR + 0,   1);
+        put8(A_ADDR + 1,  -1);
+        put8(A_ADDR + 2, -99);      // clips to -8
+        put8(A_ADDR + 3,  99);      // clips to +7
         put32(SC_ADDR, (0 << M0_W) | 1);        // {m0=1, n=0}: pass through
-        mem[D_ADDR] = 8'hA5;
-        run_op(VOP_TQUANT, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, 4);
-        expbyte(D_ADDR, 8'h71, "TQUANT-pack");
-        $display("[TQUANT-pack] {+1,0,-1,+1} -> %02h  (errors so far: %0d)",
-                 mem[D_ADDR], errors);
+        mem[D_ADDR] = 8'hA5; mem[D_ADDR+1] = 8'hA5;
+        run_op(VOP_QUANT4, A_ADDR, B_ADDR, SC_ADDR, D_ADDR, 4);
+        expbyte(D_ADDR + 0, 8'hF1, "QUANT4-pack");
+        expbyte(D_ADDR + 1, 8'h78, "QUANT4-pack");
+        $display("[QUANT4-pack] {+1,-1,-8,+7} -> %02h %02h  (errors so far: %0d)",
+                 mem[D_ADDR], mem[D_ADDR+1], errors);
     endtask
 
     // -------------------------------------------------------------------------
@@ -437,15 +442,16 @@ module vpu_tb;
         test_dyt(20, 4095,  0, "DYT-noshift");
         test_dyt_floor();
 
-        // ---- TQUANT: requant's fixed point, clipped to a trit and packed ---
+        // ---- QUANT4: requant's fixed point, clipped to int4 and packed -----
         // 64 is four whole chunks (LANES = 16), 32 two, 20 one chunk plus a
         // 4-element tail — the case where the strobe must cover exactly one
         // extra byte. m0/n are chosen so the threshold lands inside int8's
         // range and all three codes appear.
-        test_tquant(64, 1, 5, "TQUANT");
-        test_tquant(32, 1, 6, "TQUANT-2chunk");
-        test_tquant(20, 3, 0, "TQUANT-tail");
-        test_tquant_pack();
+        test_quant4(64, 1, 5, "QUANT4");         // /32: lands inside the grid
+        test_quant4(32, 1, 6, "QUANT4-2chunk");
+        test_quant4(20, 3, 0, "QUANT4-tail");    // no shift: exercises the clip
+        test_quant4(18, 1, 4, "QUANT4-odd");     // partial final lane chunk
+        test_quant4_pack();
 
         // Summary.
         $display("==== done: %0d checks, %0d errors ====", checks, errors);

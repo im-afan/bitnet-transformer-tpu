@@ -47,7 +47,6 @@ module cmod_a7_top #(
     parameter int XLEN       = 32,
     parameter int IMEM_AW    = 10,
     parameter int CFG_AW     = 5,
-    parameter int REG_AW     = 5,
     parameter int M0_W       = 12,
     parameter int N_W        = 4,
 
@@ -123,7 +122,7 @@ module cmod_a7_top #(
 
     // =========================================================================
     // Status.
-    //   `done` is a level (scalar_unit: done = (state == S_HALT)), not a pulse,
+    //   `done` is a level (the CPU's firmware-done latch), not a pulse,
     //   so it drives the LED directly and stays lit until the next run.
     // =========================================================================
     logic busy, done;
@@ -146,7 +145,6 @@ module cmod_a7_top #(
         .XLEN            (XLEN),
         .M0_W            (M0_W),
         .N_W             (N_W),
-        .REG_AW          (REG_AW),
         .IMEM_AW         (IMEM_AW),
         .CFG_AW          (CFG_AW),
         .MEM_ADDR_W      (MEM_ADDR_W),

@@ -9,19 +9,28 @@ sequence model), plus custom hardware/backend accelerators for its core attentio
 The PyTorch model in `model/` is the **golden reference**; every accelerator in `accel/` is
 validated numerically against it.
 
-The current front line is the TPU: `accel/tpulang/examples/adder_model.tpu` runs the whole
-ternary adder model as one program, verified against PyTorch and the RTL. What that exposed —
-the model is not int8-quantizable *post-hoc* — is what the `no-layernorm` and then the `qat`
-branch reacted to. The `qat` branch settles it: with the quantizers in the graph during
-training, the same kernel scores 100% exact-sequence. See
-[The int8 finding](#the-int8-finding-and-why-the-model-keeps-changing).
+The current front line is the TPU, and it is **caught up with the model**.
+[`accel/tpu/fw/adder.c`](accel/tpu/fw/adder.c) runs the whole int4 adder model —
+four transformer layers plus the output head — as one firmware kernel, 518
+commands and 1544 bytes of RISC-V, verified against the ISS and the RTL and
+scored on the addition task:
 
-**`model/` has since moved to int4 and `accel/` has not.** `adder_int4_vanilla` (`d=64`,
-`f=256`, `layers=4`) uses int4 weights *and* int4 activations, which the MXU — ternary
-weight × int8 activation — cannot run. This is a training experiment: the question is
-only whether the model fits at 4 bits. Everything under `accel/`, plus `model/quant.py`
-and `model/calibrate.py`, still describes the ternary/int8 model and is stale against
-`model/transformer.py` until someone reconciles them.
+| | |
+| --- | --- |
+| `cd accel/tpu/tb && make fw FWPROG=adder` | 526 879 checks, **0 errors**, 439 917 clocks, 518/518 commands matched |
+| `python accel/tpulang/adder_export.py -n 256` | **100.00% exact-sequence, 100.00% token** on `model/saved/int4_d64_f256_l4.pt`, identical to the PyTorch QAT model |
+
+Everything is int4 now, weights *and* activations, on both sides: the RTL and
+`iss.py` take **int4 weights in a row-major 4-bit packed layout** and every
+narrow clips to `[-8, 7]`. Row-major inverted the attention transpose relative
+to the retired ternary kernel — `P@V`'s weight operand is now the free one and
+`Q@K^T`'s is the one needing the transposing DMA. `model/quant.py` and
+`model/calibrate.py` are the last things still describing the ternary/int8
+model and are stale against `model/transformer.py`.
+
+How the model got here — the model is not int8-quantizable *post-hoc*, and QAT
+is what fixed it — is [The int8
+finding](#the-int8-finding-and-why-the-model-keeps-changing).
 
 ## Commands
 
@@ -58,14 +67,16 @@ scale, so pinning to `s_x` clips 71% of `O` (92% at L3). This is `adder_kernel.m
 finding with a sharper mechanism: DyT bounds the residual stream but nothing bounds what is
 added to it.
 
-`model/saved/ternary_mha.pt` is the last QAT checkpoint (2 layers) and is still what
-`adder_export.py` / `run_adder.py` default to; it is untracked, and it **predates ternary
-K/V, the removal of the positional encoding, the ternary output head and `layers=4`**. It
-no longer loads at all: `fc.weight` is an unexpected key against a `TernaryLinear` head, so
-`adder_export.load_model` raises instead of silently scoring a half-random network. **The
-model needs retraining** before any accuracy number in this file or in `adder_kernel.md`
-means anything again — and there is currently **no ternary arch to retrain it with**:
-`adder_ternary_vanilla` was replaced by the int4 `adder_int4_vanilla`, so restoring the
+**`model/saved/int4_d64_f256_l4.pt` is the live checkpoint** — the `adder_int4_vanilla`
+retrain, QAT throughout, **100.00% exact-sequence / 100.00% token** over 256 problems both
+in PyTorch and through `accel/tpu/fw/adder.c` on the ISS. It is what
+`accel/tpulang/adder_export.py` defaults to. Untracked, like every checkpoint here.
+
+`model/saved/ternary_mha.pt` is the last *ternary* QAT checkpoint (2 layers) and
+**predates ternary K/V, the removal of the positional encoding, the ternary output head
+and `layers=4`**. It no longer loads at all: `fc.weight` is an unexpected key against a
+`TernaryLinear` head. There is also **no ternary arch to retrain it with** —
+`adder_ternary_vanilla` was replaced by `adder_int4_vanilla`, so restoring the
 ternary/int8 path means restoring that factory (git history) first.
 The three `colab_ternary_mha_small*.pt` are committed but **deleted in the working tree**, so
 any command naming one fails with `FileNotFoundError` until it is restored from git; the old
@@ -80,25 +91,25 @@ reference it defines inline — see the CUDA note below; it no longer matches th
 The venv is checked in at `.venv/` (Python 3.12). There is no requirements.txt; deps are just
 `torch` (+ jupyter for `model/notebook.ipynb`), plus `pyserial` for the FPGA host driver.
 
-TPU stack (these are plain scripts, not `-m` modules — each adds its own directory to
-`sys.path`, so run them by path from the repo root):
+TPU stack. **There is no assembler and no `.tpu` language any more** — the TPU has
+one command producer, PicoRV32 firmware in `accel/tpu/fw/`:
 
 ```bash
-python accel/tpulang/assembler.py accel/tpulang/examples/adder_model.tpu   # 226 words
-python accel/tpulang/gen_vectors.py -p accel/tpulang/examples/adder_model.tpu -o vectors_model
-python accel/tpulang/torch_ref.py                         # every example kernel: ISS vs PyTorch
-python accel/tpulang/adder_export.py -n 256 --iss-check   # real checkpoint → integers, accuracy
-python accel/tpu/host/run_program.py --dry-run            # toolchain only, no board
-python accel/tpu/host/run_adder.py --dry-run -n 32        # real checkpoint, host loop, ISS backend
-python accel/tpu/host/run_adder.py -p COM5 -n 64          # ...the same, on the FPGA
-make -C accel/tpu/fw                                      # C firmware -> matmul.hex (RISC-V gcc)
-python accel/tpu/host/run_fw_matmul.py --dry-run          # its operands + reference, no board
-cd accel/tpu/tb && make list                              # RTL testbenches (Icarus)
+make -C accel/tpu/fw                        # C firmware -> matmul.hex (RISC-V gcc)
+make -C accel/tpu/fw PROG=adder             # ...or mha / ffn / matmul_loop
+make -C accel/tpu/fw trace PROG=adder       # the kernel's command trace, host cc only
+python accel/tpulang/fw_vectors.py -t <trace> -o accel/tpu/tb/vectors_fw -k adder
+python accel/tpu/host/run_fw_matmul.py --dry-run   # operands + reference, no board
+cd accel/tpu/tb && make fw FWPROG=adder     # the kernel through the whole core (~3 min)
+cd accel/tpu/tb && make list                # RTL testbenches (Icarus)
+
+python accel/tpulang/adder_export.py -n 256          # accuracy on the addition task
+python accel/tpulang/adder_export.py --dump-rq -n 0  # the 16 requant words per layer
 ```
 
-`make` targets in `tb/`: `sim` (default TB), `uart` (`tpu_top_uart_tb`), `cosim` (host driver
-vs RTL over a simulated UART), `examples` (all ten kernels vs golden vectors), `model`
-(the adder kernel, `LAYERS=n`), `fw` / `fwsweep` (C firmware, needs a RISC-V gcc),
+`make` targets in `tb/`: `sim` (default TB), `cosim` (host driver vs RTL over a
+simulated UART), `fw` / `fwsweep` (C firmware; `fw` needs a RISC-V gcc, and
+regenerates golden vectors from the kernel's own native trace first),
 `echo`/`mem`/`bram` (bring-up images), `wave`, `list`, `all`.
 
 ## Architecture
@@ -165,14 +176,13 @@ what is in the tree, not what `model/README.md` describes (that file is stale �
   the source of truth for hyperparameters and are wired to the `--arch` choices in `train.py`.
   `adder_int4_vanilla` is `d=64, f=256, layers=4, q_heads=kv_heads=4` (so `head_dim=16`),
   `use_int4=True, use_bias=False`. The biases are off because the TPU's VPU has no
-  row-broadcast operand (see the comment on that factory and `accel/tpulang/tpunn.md`).
-  It replaced `adder_ternary_vanilla` (`d=128, f=128`, ternary weights, int8 activations) —
-  **the `accel/` stack has not followed.** The MXU takes a ternary weight and an int8
-  activation, so the shipped kernel cannot run this model at all; `adder_export.py`,
-  `gen_adder_model.py`, `torch_ref.py`, `examples/adder_model.tpu` and `model/quant.py`
-  all still describe the ternary/int8 shape, and `adder_export.py` / `model/calibrate.py`
-  now fail on the missing `adder_ternary_vanilla` rather than exporting something wrong.
-  This is deliberate: int4 is a **training experiment**, not a hardware change.
+  row-broadcast operand (see the comment on that factory).
+  It replaced `adder_ternary_vanilla` (`d=128, f=128`, ternary weights, int8 activations),
+  and **the `accel/` stack has followed**: the MXU multiplies an int4 weight by an int4
+  activation, `accel/tpu/fw/adder.c` is this exact shape, and
+  `accel/tpulang/adder_export.py` scores it. `model/quant.py` and `model/calibrate.py`
+  are the leftovers — both still describe the ternary/int8 model and both fail on the
+  missing `adder_ternary_vanilla` rather than exporting something wrong.
 
 **`model/numbers_data.py`** — synthetic dataset. Non-obvious invariants:
 
@@ -258,7 +268,12 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   single-tile dispatches, `.acc` across the contraction — the firmware analogue
   of `tiled_matmul.tpu` vs `tiled_matmul_hw.tpu`). `host/run_fw_matmul.py` loads
   either over `'I'` (word address bit 12 picks the CPU's RAM over IMEM) and
-  checks the result; `make -C accel/tpu/fw PROG=matmul_loop` builds the second.
+  checks the result; `make -C accel/tpu/fw PROG=matmul_loop` builds the second. Two more kernels
+  exercise the rest of the machine: **`ffn.c`** (X@W1 -> relu -> requant -> @W2)
+  is the first firmware to issue a **VPU** command at all, and **`mha.c`** (one
+  head of ReLU attention) adds the **transposing DMA** and the `quant4` pack.
+  Both pass through `make fw FWPROG=ffn|mha` and are checked against an
+  independent Python reference as well as the ISS.
   Both build with Homebrew `riscv64-elf-gcc` 16.2.0 and both **pass in
   simulation** — `cd accel/tpu/tb && make fw [FWPROG=matmul_loop]` runs the image
   out of `FW_INIT` through the whole core, 129 checks, 0 errors. **Not yet run on
@@ -318,22 +333,29 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   sign-extending, the testbenches' DRAM byte maps were sized off `ADDR_W` (so high expectations
   were *silently dropped* by `$readmemh`), and `tpu_top_tb`'s backdoor pokes truncated too.
   **When something addresses DRAM, check it is not using `ADDR_W`.**
-- **`tpulang/`** — the TPU's software stack: the `.tpu` assembly language + `assembler.py`,
-  `iss.py` (bit-exact with the RTL), `torch_ref.py`
-  (independent PyTorch checks), `gen_vectors.py` (golden vectors for `tpu/tb/`),
-  `adder_export.py` (real checkpoint → integers → accuracy), and `examples/`.
-- **`examples/adder_model.tpu` is not an example — it is the whole shipped model** (every layer
-  + the output head) in **226 words of 1024**, one program, one run. `.equ LAYERS` is the only
-  thing that moves when the model's depth changes — `gen_vectors.py`, `torch_ref.py` and
-  `host/run_adder.py` all read it out of the program's own `.equ` table. Its byte-level contract —
-  DRAM/scratchpad maps, the 13 requant `{m0,n}` words per layer and where their scales come
-  from, the ternary packing, the verification order — is `adder_kernel.md`. Read that before
-  touching the kernel or the host staging.
-- `pytpu.py` + `pytpu.md` replaced the old `pytpu/` package directory. `core.py` is an empty
-  placeholder.
+- **`tpulang/`** — three files, all that is left of the software stack after the
+  assembler and the `.tpu` language were deleted. `iss.py` (bit-exact with the RTL;
+  the instruction decoder is gone, `exec_command`/`run_trace` are the way in),
+  `fw_vectors.py` (a firmware kernel's command trace → golden DRAM images + the
+  expected command stream, plus the **one** definition of each kernel's synthetic
+  operands), and `adder_export.py` (real checkpoint → requant table → trace →
+  accuracy). The directory name is now a fossil.
+- **`fw/adder.c` is not an example — it is the whole shipped model** (four layers
+  + the output head) in **518 commands and 1544 bytes**, one program, one run.
+  `LAYERS` is the only thing that moves when the model's depth changes. Its
+  byte-level contract — DRAM/scratchpad maps, the 16 requant `{m0,n}` words per
+  layer, the row-major int4 packing, why K is transposed and V is not — is that
+  file's header and `accel/tpu/fw/README.md`. Read those before touching the
+  kernel or the host staging.
+  - **The requant table is a compile-time input**, because the `{m0,n}` word is a
+    literal in the macro-op and the CPU has no path to DRAM or the scratchpad.
+    `fw/adder_rq.h` is the checked-in default and is tuned for `fw_vectors.py`'s
+    synthetic operands, so the RTL regression needs no checkpoint;
+    `adder_export.py` generates a real one and compiles the kernel against it
+    with `-DADDER_RQ_H`.
 
-When touching attention numerics, keep the implementations in sync: `model/transformer.py`
-(reference), `torch_ref.adder_model`, `examples/adder_model.tpu` + `iss.py`, and the RTL.
+When touching attention numerics, keep the implementations in sync:
+`model/transformer.py` (reference), `fw/adder.c` + `iss.py`, and the RTL.
 
 ## The int8 finding, and why the model keeps changing
 
@@ -499,32 +521,23 @@ concluding anything from a board run.
 
 ## Long simulations
 
-A full-model `tpu_top_tb` run is ~691 k clocks (6.91 ms simulated at 100 MHz) and dumps
-hundreds of MB of waveform at the defaults, so it needs `-DWATCHDOG_NS=400000000 -DNO_VCD`
-(both are options on `tpu_top_tb.sv`, defaults unchanged). The command line is in
-`adder_kernel.md` §7.7.
+A full-model run is `make fw FWPROG=adder` in `accel/tpu/tb`: **439 917 clocks**, about
+**3 minutes** of Icarus, 526 879 checks. It regenerates the golden vectors from the
+kernel's own native trace first, so a stale image cannot silently be compared against
+the wrong expectations. `fw_matmul_tb.sv` does not dump a VCD at all, and the tb
+Makefile already passes the kernel a 60 ms watchdog (the 2 ms default is sized for the
+small kernels and would trip on this one while it worked perfectly).
 
-**It prints nothing until it halts, which makes "slow" and "deadlocked" look identical
-from outside — pass `+HEARTBEAT` (and `+HEARTBEAT_CLK=N`) for a periodic line with the PC,
-the unit busy flags and the queue levels.** A frozen PC with a unit stuck busy is a hang; a
-moving one is just a long run. Redirect the log to a file rather than piping it through
-`tail`/`head`, which buffer the whole stream. For an edit-run loop, a one-layer copy of the
-kernel (`sed 's/^\.equ LAYERS   4/.equ LAYERS   1/'`) exercises every code path in ~180 k
-clocks; `make examples` runs all ten example kernels against their golden vectors and is
-the fastest full-ISA check there is. At `layers=2` it was 1.23 M clocks before `sram.sv` became a range engine
-(`accel/tpu/docs/dma.md` §7), 542 k before ternary K/V moved the attention matmuls
-onto the MXU (`adder_kernel.md` §2.5), 367 k before the ternary output head followed
-them (§2.6), and 351 k after; `layers=4` then doubled the per-layer part. The split
-is now `mxu = 405 433`, `dma = 226 198`, `vpu = 52 160`.
-The ISS runs the same four-layer forward plus the PyTorch reference and the byte comparison in
-~19 s, so leg-B verification is an edit-run loop, not a batch job.
+The split is `mxu = 206 361`, `dma = 131 168`, `vpu = 84 352`, `idlec = 18 035` (4.1%,
+which is what the CPU costs as a command producer). `qfull` and `ovlap` are both 0:
+nothing overlaps yet, because the kernel fences after every cross-unit dependency.
 
-## Coding Practices
+For an edit-run loop, use the **ISS** rather than the RTL — one four-layer forward is
+**1.9 s**, so `python accel/tpulang/adder_export.py -n 4` is a ~10 s check that the
+kernel still computes the model. The RTL run is what proves the *hardware* agrees; it
+is not where you iterate. `make fw FWPROG=ffn` (or `mha`) is the ~5 s smoke test that
+the dispatch plane still works at all.
 
-- **Do**: read files to gain a good understanding of code, ask questions when design choices are unclear,
-and write code. Plan out anything in markdown files when it is a large task.
-Make comments & text summaries as concise as possible. I don't want fluff, just describe the code using simple language and that's it.
-Follow my requests exactly--do not write any extra code, unless I specifically ask an open-ended question that requests you to come up with a solution yourself. 
-Update every related doc whenever you make a change.
-- **Don't**: run code or any other commands (such as checking for packages, etc) unless otherwise told to do so.
-If extra context is needed about my development environment or feedback is needed for your code, please ask.
+**A long Icarus run prints nothing until it halts, which makes "slow" and "deadlocked"
+look identical from outside.** Redirect the log to a file rather than piping it through
+`tail`/`head`, which buffer the whole stream.

@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
-from torch.utils.cpp_extension import load
 
 import model.numbers_data as numbers_data
 

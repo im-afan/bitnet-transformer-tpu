@@ -116,7 +116,7 @@ module scratchpad #(
     parameter     MEM_STYLE = "BRAM",  // "BRAM" -> block RAM; "REG" -> flip-flops
     parameter int ADDR_W    = 16,      // byte-address width; storage = 2**ADDR_W bytes
     parameter int A_BYTES   = 128,     // A_rd  width (bytes): MXU activation column
-    parameter int W_BYTES   = 32,      // W_rd  width (bytes): packed ternary column
+    parameter int W_BYTES   = 32,      // W_rd  width (bytes): packed int4 weight row
     parameter int C_BYTES   = 512,     // C_rw  width (bytes): int32 result row
     parameter int V_BYTES   = 64,      // V_rw  width (bytes): VPU SIMD access (512b)
     parameter int S_BYTES   = 4,       // S_rw  width (bytes): scalar word (int32)

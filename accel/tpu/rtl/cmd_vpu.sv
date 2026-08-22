@@ -12,12 +12,12 @@
 //
 // The split is cheaper here than on the MXU: a plain pointwise op fits in 128
 // bits with room to spare, and only `vecmatmul` reads the geometry at all.
-// Nothing in the shipped adder kernel issues `vecmatmul` — ternary K/V moved
+// Nothing in the shipped adder kernel issues `vecmatmul` — int4 K/V moved
 // both attention matmuls onto the array — so in practice the VPU sees a single
 // command type and GEOM never appears.
 //
 // `src1` and the requant word occupy different fields even though no op uses
-// both: requant/dyt/tquant used to pass the {m0,n} *address* in the src1 slot
+// both: requant/dyt/quant4 used to pass the {m0,n} *address* in the src1 slot
 // (scalar_unit.sv's `vpu_scalar = r_src1`). Now that the word is a literal there
 // is no reason to overlap them, and keeping them apart means the decode does not
 // depend on the opcode.

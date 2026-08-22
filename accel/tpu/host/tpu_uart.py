@@ -976,3 +976,115 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# =============================================================================
+# Board-session helpers.
+#
+# These moved here from the deleted `run_program.py` when the tpulang toolchain
+# was retired. Nothing about them was tpulang-specific — they are the generic
+# "talk to a Cmod A7 over the UART" layer that any host script needs, and
+# `run_fw_matmul.py` is now their only caller.
+# =============================================================================
+
+# Idle probe: any valid read works, so use a small one at address 0. Two bytes,
+# not one — a 1-byte read cannot tell a NAK (0x15) from a data byte of 0x15.
+PROBE_ADDR, PROBE_LEN = 0x0, 2
+
+# A NAK'd read answers with one byte and then silence, so the driver only learns
+# it was rejected once the reply times out — i.e. every busy probe costs a full
+# timeout. Keep the probe's own timeout short (the real reply takes ~0.2 ms of
+# wire time plus USB latency) so the wait loop stays responsive.
+PROBE_TIMEOUT = 0.3
+
+
+def contiguous_runs(img: dict) -> list:
+    """Collapse a sparse ``{addr: byte}`` image into ``[(addr, bytes), ...]``.
+
+    One UART command per run keeps the frame count (and the 6-byte header tax)
+    down; the tensors are laid out densely, so this is a handful of frames.
+    """
+    runs: list = []
+    start: int | None = None
+    buf = bytearray()
+    for addr in sorted(img):
+        if start is not None and addr != start + len(buf):
+            runs.append((start, bytes(buf)))
+            start, buf = None, bytearray()
+        if start is None:
+            start = addr
+        buf.append(img[addr] & 0xFF)
+    if start is not None:
+        runs.append((start, bytes(buf)))
+    return runs
+
+
+def autodetect_port() -> str:
+    """Find the board's USB-serial port (the Cmod A7's FT2232 UART channel)."""
+    try:
+        from serial.tools import list_ports
+    except ImportError as exc:  # pragma: no cover
+        raise SystemExit("pyserial is required: pip install pyserial") from exc
+
+    cands = [p for p in list_ports.comports() if (p.vid, p.pid) == (0x0403, 0x6010)]
+    if not cands:  # any FTDI part, then
+        cands = [p for p in list_ports.comports() if p.vid == 0x0403]
+    if not cands:
+        raise SystemExit("no FTDI serial port found — pass --port explicitly")
+    if len(cands) > 1:
+        names = ", ".join(f"{p.device} ({p.description})" for p in cands)
+        raise SystemExit(f"several candidate ports, pass --port: {names}")
+    print(f"port    : {cands[0].device} ({cands[0].description}) [autodetected]")
+    return cands[0].device
+
+
+def probe_idle(tpu: TPUUart) -> bool:
+    """True if the core is idle — i.e. it answers a read instead of NAK'ing it."""
+    saved, tpu.timeout = tpu.timeout, PROBE_TIMEOUT
+    try:
+        tpu.read_mem(PROBE_ADDR, PROBE_LEN)
+        return True
+    except NakError:
+        return False
+    finally:
+        tpu.timeout = saved
+
+
+def wait_until_idle(tpu: TPUUart, limit: float, interval: float) -> float:
+    """Block until the core stops NAK'ing commands. Returns seconds waited."""
+    t0 = time.monotonic()
+    while True:
+        if probe_idle(tpu):
+            return time.monotonic() - t0
+        waited = time.monotonic() - t0
+        if waited >= limit:
+            raise SystemExit(
+                f"core still busy {waited:.1f}s after 'G' — it never halted "
+                f"(check led[1]/done), or the link is out of sync"
+            )
+        time.sleep(interval)
+
+
+def report_run_time(tpu: TPUUart, clk_mhz: float) -> int | None:
+    """Print how many core clocks the run took, per the device's own timer.
+
+    This is the only honest measure of the kernel's cost: the wall-clock wait
+    above is dominated by the poll interval and USB latency, and says nothing
+    about the hardware. The device's counter block times the core's own
+    ``busy`` interval, so it is exactly 'G' to done and nothing else.
+
+    Non-fatal if the device does not answer: 'T' is newer than the other four
+    commands, and a bitstream flashed before it existed NAKs the byte as an
+    unknown command instead (``synth/build/`` is not rebuilt by ``mode=program``
+    — check its mtime). The run's results are unaffected either way.
+    """
+    try:
+        ctr = tpu.read_counters()
+    except ProtocolError as exc:
+        print(f"timer   : unavailable — {exc}")
+        print("          (bitstream predates the 'T' command? reflash board=cmod_a7)")
+        return None
+    cycles = ctr["run"]
+    print(f"timer   : {cycles} core clocks ({cycles / clk_mhz:.1f} us @ {clk_mhz:g} MHz)")
+    print(format_counters(ctr))
+    return cycles

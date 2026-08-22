@@ -27,7 +27,7 @@ Built and passing (`tb/` 13/13, `make cosim` 11/11, `torch_ref.py` all kernels):
 | --- | --- | --- |
 | Per-run performance counters | `rtl/perf_counters.sv` (replaces `cycle_timer.sv`) | `tpu_top_uart_tb` structural + per-program checks |
 | `setcfgr` (register → config) | `scalar_unit.sv` `0x1C` | `examples/setcfgr.tpu` |
-| MXU config strides | `mxu.sv` `a_row`/`c_row`/`w_col` | `examples/strided_matmul.tpu` |
+| MXU config strides | `mxu.sv` `a_row`/`c_row`/`w_row` | `examples/strided_matmul.tpu` |
 | `matmul_t` hardware tile loop | `mxu.sv` `0x1D` | `examples/tiled_matmul_hw.tpu` |
 | `vecmatmul` | `vpu.sv` `VOP_VECMATMUL`, opcode `0x1E` | `examples/vecmatmul.tpu` |
 | ~~`softmax`~~ | *removed* — was `vpu.sv` `VOP_SOFTMAX`/`VOP_SM_EXP`, opcode `0x20` | *(was `vpu_tb` + `examples/softmax_rows.tpu`; both deleted)* |
@@ -110,7 +110,7 @@ Both have room; check this before adding anything else.
 | 5 | `ntiles` | 8 | output tiles = `N / COLS` |
 | 6 | `arow` | 16 | activation row stride in bytes (`= K`) |
 | 7 | `crow` | 16 | result row stride in bytes (`= N*4`, or `N` when requantizing) |
-| 8 | `wcol` | 16 | weight column stride in bytes (`= K*2/8`) |
+| 8 | `wrow` | 16 | weight **row** stride in bytes (`= N*4/8`) |
 | 9 | ~~`vscalar`~~ | — | **retired** with `softmax`, the only op that read it. Index left vacant so 10–17 keep their meaning |
 | 10 | `vrows` | 16 | `vecmatmul` **query** rows |
 | 11 | `vcols` | 16 | `vecmatmul` **key** rows — the second, independent count |

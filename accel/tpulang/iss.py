@@ -14,15 +14,16 @@ input tensors, run this simulator, and the final scratchpad image is what the
 hardware must reproduce byte-for-byte.
 
 Numerics are kept bit-exact with the RTL:
-  * MXU matmul: int8 activations x ternary weights, int32 accumulate, optional
-    ``clip((acc*m0 + round) >> n)`` requantize on store (mxu.sv requant8).
+  * MXU matmul: int4 activations (in int8 containers) x **row-major int4**
+    weights, int32 accumulate, optional ``clip((acc*m0 + round) >> n)``
+    requantize on store (mxu.sv requant8, clipping to [-8, 7]).
   * VPU ops: int8 operands, int32 accumulate, int32 writeback; VOP_REQUANT
-    narrows int32->int8 with the same fixed-point rescale (vpu.sv requant8),
-    and VOP_DYT does the same with a symmetric +-127 clip (vpu.sv dyt8) — that
-    clip is DyT's hardtanh, not an approximation of it. VOP_TQUANT is the same
-    rescale clipped to +-1 and written in the MXU's 2-bit weight encoding, four
-    elements per byte (vpu.sv tquant2), which is how an int8 activation becomes
-    a ternary weight operand without a round trip through the host.
+    narrows int32->int4 with the same fixed-point rescale (vpu.sv requant8),
+    and VOP_DYT does the same with a symmetric +-7 clip (vpu.sv dyt8) — that
+    clip is DyT's hardtanh, not an approximation of it. VOP_QUANT4 is the same
+    rescale written as a 4-bit two's-complement nibble, two elements per byte
+    (vpu.sv quant4), which is how an activation becomes a weight operand
+    without a round trip through the host.
 
 DMA (rdmem/wrmem) is modelled as a real byte copy between a separate external
 **DRAM** space and the on-chip scratchpad, over ``cfg 'len'`` bytes — matching the
@@ -55,22 +56,18 @@ from dataclasses import dataclass, field
 # old binary decodes to an unknown opcode rather than to a different
 # instruction. `vecdot` (0x01) stayed: it is vecmatmul's inner primitive, so its
 # datapath is not optional.
-OP_MATMUL, OP_VECDOT, OP_VECADD = 0x00, 0x01, 0x03
-OP_RELU, OP_WRMEM, OP_RDMEM = 0x04, 0x06, 0x07
-OP_WRNEIGH, OP_REQUANT = 0x08, 0x09
-OP_ADDS, OP_SUBS, OP_MULS, OP_CMPS = 0x10, 0x11, 0x12, 0x13
-OP_LIS, OP_SETCFG, OP_LOADS, OP_STORES = 0x14, 0x15, 0x16, 0x17
-OP_BRANCH, OP_JMP, OP_WAIT, OP_HALT = 0x18, 0x19, 0x1A, 0x1F
-OP_SETCFGR = 0x1C
-OP_MATMUL_T = 0x1D
+# The VPU op selectors the op bodies branch on. These used to be tpulang opcodes
+# decoded from a 32-bit instruction word; with that front end gone they are just
+# an internal enum, and `TPU._VOP_TO_OP` maps the hardware's VOP_* onto them.
+OP_VECDOT, OP_VECADD = 0x01, 0x03
+OP_RELU, OP_REQUANT = 0x04, 0x09
 OP_VECMM = 0x1E
 OP_DYT = 0x21
-OP_TQUANT = 0x22
+OP_QUANT4 = 0x22
 
-# --- named config registers (scalar_unit.sv CFG_*) ----------------------------
 CFG_TLEN, CFG_VLEN, CFG_LEN, CFG_SCALAR = 0, 1, 2, 3
 # MXU hardware-tiling geometry (docs/macro_ops.md §3)
-CFG_KTILES, CFG_NTILES, CFG_AROW, CFG_CROW, CFG_WCOL = 4, 5, 6, 7, 8
+CFG_KTILES, CFG_NTILES, CFG_AROW, CFG_CROW, CFG_WROW = 4, 5, 6, 7, 8
 # VPU macro-op geometry
 # CFG_VSCALAR (9) is retired with OP_SOFTMAX, the only op that read it; the
 # index is kept so 10..17 do not shift under every existing program.
@@ -81,6 +78,11 @@ CFG_TCOLS, CFG_TSROW, CFG_TDROW = 15, 16, 17
 
 # --- branch condition codes (scalar_unit.sv C_*) ------------------------------
 C_EQ, C_NE, C_LT, C_GE = 0b00, 0b01, 0b10, 0b11
+
+
+# The int4 grid: mxu.sv ACT_QMIN/ACT_QMAX, vpu.sv Q4_MIN/Q4_MAX, and
+# model/transformer.py INT4_QMIN/INT4_QMAX are all this pair.
+Q4_MIN, Q4_MAX = -8, 7
 
 
 def s8(b: int) -> int:
@@ -121,7 +123,6 @@ class TPU:
 
     mem: bytearray = field(init=False)      # on-chip scratchpad
     dram: bytearray = field(init=False)     # external DRAM (DMA source/destination)
-    regs: list = field(init=False)          # 32 x int32 (r0 hardwired 0)
     cfg: list = field(init=False)           # 32 x int32 (CFG_AW = 5)
     written: set = field(init=False)        # scratchpad byte addrs a compute/store wrote
     dram_written: set = field(init=False)   # DRAM byte addrs a wrmem spilled (host output)
@@ -131,11 +132,11 @@ class TPU:
         self.dram_depth = 1 << self.mem_addr_w
         self.mem = bytearray(self.depth)
         self.dram = bytearray(self.dram_depth)
-        self.regs = [0] * 32
         self.cfg = [0] * 32
         self.written = set()
         self.dram_written = set()
-        self.wcol_bytes = (self.rows * 2) // 8   # packed ternary column bytes
+        # Weights are row-major int4: one array row is COLS nibbles.
+        self.wrow_bytes = (self.cols * 4) // 8   # packed int4 weight-row bytes
 
     # ---- scratchpad access (addresses wrap mod depth, like the RTL) ----------
     def _a(self, addr: int) -> int:
@@ -231,179 +232,82 @@ class TPU:
                 col += 1
                 dst_col_off = (dst_col_off + drow) & 0xFFFF
 
-    # ---- register file (r0 == 0) ---------------------------------------------
-    def rreg(self, field8: int) -> int:
-        idx = field8 & 0x1F
-        return 0 if idx == 0 else self.regs[idx]
-
-    def wreg(self, field8: int, val: int) -> None:
-        idx = field8 & 0x1F
-        if idx != 0:
-            self.regs[idx] = s32(val)
-
     # ---- requant: clip((acc*m0 + round) >> n) to int8 (mxu.sv/vpu.sv) ---------
     def requant8(self, acc: int, m0: int, n: int) -> int:
         prod = acc * m0                         # m0 is a positive scale
         rnd = 0 if n == 0 else (1 << (n - 1))
         shifted = (prod + rnd) >> n             # Python >> floors == Verilog >>>
-        if shifted > 127:
-            return 127
-        if shifted < -128:
-            return -128
+        if shifted > Q4_MAX:
+            return Q4_MAX
+        if shifted < Q4_MIN:
+            return Q4_MIN
         return shifted
 
     # ---- DyT: the same rescale, clipped symmetrically (vpu.sv dyt8) ----------
     def dyt8(self, acc: int, m0: int, n: int) -> int:
-        """``clip_pm127((acc*m0 + round) >> n)`` — DyT / hardtanh.
+        """``clip_pm7((acc*m0 + round) >> n)`` — DyT / hardtanh.
 
         Identical to :meth:`requant8` except for the lower bound. ``hardtanh``
         is an odd function, so its floor has to be the negative of its ceiling;
-        int8's -128 would put the saturated end at -128/127 = -1.0079. The
-        multiplier carries ``alpha * s_in * 127``, which is what makes the clip
-        coincide with the hardtanh rather than merely resemble it.
+        int4's -8 would put the saturated end at -8/7 = -1.143. The multiplier
+        carries ``alpha * s_in * 7``, which is what makes the clip coincide with
+        the hardtanh rather than merely resemble it.
         """
         rnd = 0 if n == 0 else (1 << (n - 1))
         shifted = (acc * m0 + rnd) >> n         # Python >> floors, like >>>
-        if shifted > 127:
-            return 127
-        if shifted < -127:
-            return -127
+        if shifted > Q4_MAX:
+            return Q4_MAX
+        if shifted < -Q4_MAX:
+            return -Q4_MAX
         return shifted
 
-    # ---- tquant: the same rescale, clipped to a trit (vpu.sv tquant2) -------
-    def tquant2(self, acc: int, m0: int, n: int) -> int:
-        """``clip_pm1((acc*m0 + round) >> n)`` — int8 in, one trit out.
+    # ---- quant4: the same rescale, clipped to int4 (vpu.sv quant4) ----------
+    def quant4(self, acc: int, m0: int, n: int) -> int:
+        """``clip_[-8,7]((acc*m0 + round) >> n)`` — int8 in, one int4 out.
 
-        Identical to :meth:`requant8` bar the clip. The caller packs the result
-        with :meth:`_trit_code`; the two together are one VOP_TQUANT element.
+        Identical to :meth:`requant8` bar nothing at all now that requant also
+        lands int4: the two differ only in *destination width*, which is the
+        caller's business. The caller packs the result with :meth:`_nib_code`;
+        the two together are one VOP_QUANT4 element.
         """
         rnd = 0 if n == 0 else (1 << (n - 1))
         shifted = (acc * m0 + rnd) >> n         # Python >> floors, like >>>
-        if shifted > 1:
-            return 1
-        if shifted < -1:
-            return -1
+        if shifted > Q4_MAX:
+            return Q4_MAX
+        if shifted < Q4_MIN:
+            return Q4_MIN
         return shifted
 
     @staticmethod
-    def _trit_code(t: int) -> int:
-        """A trit in the MXU's weight encoding: bit0 = nonzero, bit1 = sign."""
-        return 0b00 if t == 0 else (0b11 if t < 0 else 0b01)
+    def _nib_code(v: int) -> int:
+        """An int4 value as the 4-bit two's-complement nibble the MXU reads."""
+        return v & 0xF
 
-    # ---- ternary weight decode (scratchpad.md §2: 00=0, 01=+1, 11=-1) --------
+    # ---- int4 weight decode (scratchpad.md §2: 4-bit two's complement) -------
     @staticmethod
-    def _trit(colint: int, i: int) -> int:
-        code = (colint >> (2 * i)) & 0b11
-        if not (code & 0b01):        # bit0 = nonzero flag
-            return 0
-        return -1 if (code >> 1) & 1 else 1   # bit1 = sign
+    def _nib(rowint: int, j: int) -> int:
+        code = (rowint >> (4 * j)) & 0xF
+        return code - 16 if code >= 8 else code
 
     # =========================================================================
     # Execution.
     # =========================================================================
-    def run(self, words: list, boot_pc: int = 0, max_steps: int = 100_000) -> None:
-        pc = boot_pc
-        flag_eq = flag_lt = False
-        addr_mask = self.depth - 1              # scratchpad: ADDR_W bits
-        dram_mask = self.dram_depth - 1         # DRAM: MEM_ADDR_W bits
-
-        for _ in range(max_steps):
-            if pc >= len(words):
-                raise ISSError(f"pc={pc} ran off the end of the program (no HALT?)")
-            w = words[pc] & 0xFFFFFFFF
-
-            opc = (w >> 26) & 0x3F
-            f_dst = (w >> 18) & 0xFF
-            f_src0 = (w >> 10) & 0xFF
-            f_src1 = (w >> 2) & 0xFF
-            flags = w & 0x3
-            imm16 = (w >> 2) & 0xFFFF
-
-            r_src0 = self.rreg(f_src0)
-            r_src1 = self.rreg(f_src1)
-            r_dst = self.rreg(f_dst)
-
-            next_pc = pc + 1
-
-            if opc == OP_HALT:
-                return
-
-            elif opc in (OP_MATMUL, OP_MATMUL_T):
-                self._matmul(r_dst & addr_mask, r_src0 & addr_mask,
-                             r_src1 & addr_mask, accumulate=bool(flags & 0b01),
-                             requant=bool(flags & 0b10),
-                             tiled=(opc == OP_MATMUL_T))
-
-            elif opc == OP_VECMM:
-                self._vecmatmul(r_dst & addr_mask, r_src0 & addr_mask,
-                                r_src1 & addr_mask)
-
-            elif opc in (OP_VECDOT, OP_VECADD, OP_RELU, OP_REQUANT, OP_DYT,
-                         OP_TQUANT):
-                self._vpu(opc, r_dst & addr_mask, r_src0 & addr_mask,
-                          r_src1 & addr_mask)
-
-            # Each operand is truncated in its own space, matching
-            # scalar_unit.sv's split of dma_scratch_addr (ADDR_W) from
-            # dma_dram_addr (MEM_ADDR_W).
-            elif opc == OP_RDMEM:    # fill: DRAM(src0) -> scratchpad(dst)
-                self._dma(dst=r_dst & addr_mask, src=r_src0 & dram_mask,
-                          to_scratch=True, transpose=bool(flags & 0b01))
-            elif opc == OP_WRMEM:    # spill: scratchpad(src0) -> DRAM(src1)
-                self._dma(dst=r_src1 & dram_mask, src=r_src0 & addr_mask,
-                          to_scratch=False, transpose=bool(flags & 0b01))
-            elif opc == OP_WRNEIGH:
-                pass  # no LINK engine attached in tpu_top.sv — completing no-op
-
-            elif opc == OP_ADDS:
-                self.wreg(f_dst, r_src0 + r_src1)
-            elif opc == OP_SUBS:
-                self.wreg(f_dst, r_src0 - r_src1)
-            elif opc == OP_MULS:
-                self.wreg(f_dst, r_src0 * r_src1)
-            elif opc == OP_LIS:
-                # Zero-extended (scalar_unit.sv OP_LIS). Sign extension made
-                # `li r, 0x8000` alias to 0x78000 once DRAM addresses stopped
-                # being truncated to 16 bits; see that file for the argument.
-                self.wreg(f_dst, imm16)
-            elif opc == OP_SETCFG:
-                self.cfg[f_dst & 0x1F] = imm16          # zero-extended
-            elif opc == OP_SETCFGR:
-                # Register -> config, full 32 bits with no extension. Consumers
-                # mask to their own field width, matching scalar_unit.sv.
-                self.cfg[f_dst & 0x1F] = r_src0 & 0xFFFFFFFF
-            elif opc == OP_LOADS:
-                self.wreg(f_dst, self.rd_i32(r_src0 & addr_mask))
-            elif opc == OP_STORES:
-                self.wr_i32(r_src0 & addr_mask, r_src1)
-            elif opc == OP_CMPS:
-                flag_eq = (s32(r_src0) == s32(r_src1))
-                flag_lt = (s32(r_src0) < s32(r_src1))
-            elif opc == OP_BRANCH:
-                taken = {C_EQ: flag_eq, C_NE: not flag_eq,
-                         C_LT: flag_lt, C_GE: not flag_lt}[flags]
-                if taken:
-                    next_pc = imm16
-            elif opc == OP_JMP:
-                next_pc = imm16
-            elif opc == OP_WAIT:
-                pass  # issue-and-wait: dispatch already ran atomically above
-            else:
-                raise ISSError(f"pc={pc}: unknown opcode 0x{opc:02x} (word 0x{w:08x})")
-
-            pc = next_pc
-
-        raise ISSError(f"exceeded {max_steps} steps without HALT")
-
     # ---- MXU matmul (mxu.sv) -------------------------------------------------
     def _matmul(self, out_a: int, act_a: int, wgt_a: int, *,
-                accumulate: bool, requant: bool, tiled: bool = False) -> None:
+                accumulate: bool, requant: bool, tiled: bool = False,
+                rq_word: int = None) -> None:
         t_len = self.cfg[CFG_TLEN] & 0x3F
         if t_len == 0:
             return
         rq_m0 = rq_n = 0
         if requant:
-            word = self.rd_u32(self.cfg[CFG_SCALAR] & (self.depth - 1))
+            # `rq_word` is the literal the *command* carries. The tpulang path
+            # passes None because its ISA names a scratchpad address instead,
+            # and the scalar unit reads it over the S port before packing the
+            # command (scalar_unit.sv's S_RQRD shim). Both arrive here as the
+            # same 16 bits; only who dereferenced them differs.
+            word = (rq_word if rq_word is not None
+                    else self.rd_u32(self.cfg[CFG_SCALAR] & (self.depth - 1)))
             rq_m0 = word & ((1 << self.m0_w) - 1)
             rq_n = (word >> self.m0_w) & ((1 << self.n_w) - 1)
 
@@ -416,7 +320,7 @@ class TPU:
         # therefore steps c_row/4, so `.acc.rq` uses both in one op.
         a_row = (tiled and (self.cfg[CFG_AROW] & 0xFFFF)) or self.rows
         c_row = (tiled and (self.cfg[CFG_CROW] & 0xFFFF)) or (self.cols * 4)
-        w_col = (tiled and (self.cfg[CFG_WCOL] & 0xFFFF)) or self.wcol_bytes
+        w_row = (tiled and (self.cfg[CFG_WROW] & 0xFFFF)) or self.wrow_bytes
         c_row_rq = c_row >> 2
 
         # Tile counts. Zero reads as 1, matching mxu.sv, so an unset config
@@ -436,23 +340,27 @@ class TPU:
 
             for k in range(kt):
                 act_k = act_a + k * self.rows
-                wgt_k = wgt_a + n * self.cols * w_col + k * self.wcol_bytes
+                # Row-major weights: an n-tile steps *along* a row by one array
+                # width of nibbles (a constant), a k-tile steps *down* ROWS whole
+                # rows (which is what needs the stride). Column-major had the two
+                # the other way round — mxu.sv wgt_ntile_step / wgt_ktile_step.
+                wgt_k = wgt_a + n * self.wrow_bytes + k * self.rows * w_row
 
-                # Ternary weight columns for this tile (col-major, 2-bit packed).
-                # Only wcol_bytes of each column are consumed — one tile's worth
-                # of rows — even when w_col strides past a taller column.
-                wcol = []
-                for j in range(self.cols):
-                    base = wgt_k + j * w_col
-                    colint = sum(self.mem[self._a(base + b)] << (8 * b)
-                                 for b in range(self.wcol_bytes))
-                    wcol.append([self._trit(colint, i) for i in range(self.rows)])
+                # int4 weight rows for this tile (row-major, 4-bit packed). Only
+                # wrow_bytes of each row are consumed — one tile's worth of
+                # columns — even when w_row strides past a wider row.
+                wrow = []
+                for i in range(self.rows):
+                    base = wgt_k + i * w_row
+                    rowint = sum(self.mem[self._a(base + b)] << (8 * b)
+                                 for b in range(self.wrow_bytes))
+                    wrow.append([self._nib(rowint, j) for j in range(self.cols)])
 
                 for t in range(t_len):
                     arow = [self.rd_i8(act_k + t * a_row + i)
                             for i in range(self.rows)]
                     for j in range(self.cols):
-                        res[t][j] += sum(arow[i] * wcol[j][i]
+                        res[t][j] += sum(arow[i] * wrow[i][j]
                                          for i in range(self.rows))
 
             for t in range(t_len):
@@ -496,12 +404,14 @@ class TPU:
                 self.wr_i32(dst + t * crow + s * 4, s32(acc))
 
     # ---- VPU (vpu.sv) --------------------------------------------------------
-    def _vpu(self, opc: int, dst: int, src0: int, src1: int) -> None:
+    def _vpu(self, opc: int, dst: int, src0: int, src1: int,
+             rq_word: int = None) -> None:
         vlen = self.cfg[CFG_VLEN] & 0x3FF
         if vlen == 0:
             return
-        # src1 doubles as the {m0,n} word address for the two narrowing ops.
-        scalar = self.rd_i32(src1)
+        # src1 doubles as the {m0,n} word address for the narrowing ops — in the
+        # tpulang ISA. A command carries the literal instead (see _matmul).
+        scalar = self.rd_i32(src1) if rq_word is None else rq_word
 
         # The two narrowing ops: int32 in at stride 4, int8 out at stride 1,
         # {m0,n} from the third operand. They differ only in the clip.
@@ -514,24 +424,24 @@ class TPU:
                 self.wr_i8(dst + i, narrow(a32, m0, n))
             return
 
-        # The ternary narrow: int8 in at stride 1, **2 bits** out, so one
-        # output byte per four input elements. The packing order is the weight
-        # encoding `_trit` decodes, which is what makes the result a legal
-        # `matmul_t` weight operand with no rearrangement in between. A vlen
-        # that is not a multiple of 4 leaves the unfilled slots of the last
-        # byte at 0 rather than preserving them — the RTL's write strobe is
-        # per byte, so there is nothing finer to preserve with.
-        if opc == OP_TQUANT:
+        # The int4 narrow: int8 in at stride 1, **4 bits** out, so one output
+        # byte per two input elements. The packing order is the weight encoding
+        # `_nib` decodes, which is what makes the result a legal `matmul_t`
+        # weight operand with no rearrangement in between. A vlen that is not a
+        # multiple of 2 leaves the unfilled slot of the last byte at 0 rather
+        # than preserving it — the RTL's write strobe is per byte, so there is
+        # nothing finer to preserve with.
+        if opc == OP_QUANT4:
             m0 = scalar & ((1 << self.m0_w) - 1)
             n = (scalar >> self.m0_w) & ((1 << self.n_w) - 1)
-            for b in range((vlen + 3) // 4):
+            for b in range((vlen + 1) // 2):
                 byte = 0
-                for j in range(4):
-                    i = 4 * b + j
+                for j in range(2):
+                    i = 2 * b + j
                     if i >= vlen:
                         break
-                    t = self.tquant2(self.rd_i8(src0 + i), m0, n)
-                    byte |= self._trit_code(t) << (2 * j)
+                    v = self.quant4(self.rd_i8(src0 + i), m0, n)
+                    byte |= self._nib_code(v) << (4 * j)
                 self.wr_i8(dst + b, byte)
             return
 
@@ -554,3 +464,138 @@ class TPU:
                 raise ISSError(f"unhandled VPU opcode 0x{opc:02x}")
             self.wr_i32(dst + i * 4, s32(r))
 
+
+    # =========================================================================
+    # Command front end (docs/picorv32_migration.md §8, phase 3).
+    #
+    # The second way into this model. `run()` above decodes 32-bit tpulang
+    # instructions; this decodes the 128-bit macro-ops that both producers push,
+    # exactly as cmd_{mxu,vpu,dma}.sv decode them, and calls the *same* op bodies
+    # underneath. That is the whole of the re-fronting: the numerics are not
+    # duplicated, forked or re-derived, so a command trace and a .tpu program
+    # that mean the same thing produce byte-identical images by construction.
+    #
+    # Sticky geometry (MXU_GEOM / VPU_GEOM) lands in the `cfg` file because that
+    # is where the op bodies already read it from. It is not the old global
+    # config file coming back: nothing else writes these, and a command stream
+    # carries its geometry in its own order, which is the property cmd_mxu.sv's
+    # header is about.
+    # =========================================================================
+
+    U_MXU, U_VPU, U_DMA = 0, 1, 2
+
+    # Command opcodes, from cmd_{mxu,vpu,dma}.sv.
+    MXU_GEOM, MXU_MM = 0x01, 0x02
+    VPU_CMD_OP, VPU_CMD_GEOM = 0x01, 0x02
+    DMA_MOVE = 0x01
+
+    # vpu.sv VOP_* -> the tpulang opcode `_vpu` dispatches on. Two encodings for
+    # one op set is a wart of keeping both producers alive through phase 4; the
+    # map is here rather than in the caller so there is exactly one of it.
+    _VOP_TO_OP = {0: OP_VECDOT, 1: OP_VECADD, 3: OP_RELU, 10: OP_REQUANT,
+                  13: OP_VECMM, 16: OP_DYT, 17: OP_QUANT4}
+
+    def exec_command(self, unit: int, w0: int, w1: int, w2: int, w3: int) -> None:
+        """Execute one 128-bit macro-op. Mirrors the RTL decoders field for field.
+
+        An unknown opcode is *discarded*, not an error — cmd_{mxu,vpu,dma}.sv
+        pop it with a `$display` and carry on, and a model that raised instead
+        would disagree with the hardware about a malformed stream.
+        """
+        op = w0 & 0xFF
+
+        if unit == self.U_MXU:
+            if op == self.MXU_GEOM:
+                self.cfg[CFG_AROW] = (w0 >> 16) & 0xFFFF
+                self.cfg[CFG_CROW] = w1 & 0xFFFF
+                self.cfg[CFG_WROW] = (w1 >> 16) & 0xFFFF
+                self.cfg[CFG_KTILES] = w2 & 0xFF
+                self.cfg[CFG_NTILES] = (w2 >> 8) & 0xFF
+                self.cfg[CFG_TLEN] = (w2 >> 16) & 0x3F
+            elif op == self.MXU_MM:
+                self._matmul((w0 >> 16) & 0xFFFF, w1 & 0xFFFF, (w1 >> 16) & 0xFFFF,
+                             accumulate=bool(w0 & (1 << 8)),
+                             requant=bool(w0 & (1 << 9)),
+                             tiled=bool(w0 & (1 << 10)),
+                             rq_word=w2 & ((1 << (self.m0_w + self.n_w)) - 1))
+
+        elif unit == self.U_VPU:
+            if op == self.VPU_CMD_GEOM:
+                self.cfg[CFG_VROWS] = (w0 >> 16) & 0xFFFF
+                self.cfg[CFG_VCOLS] = w1 & 0xFFFF
+                self.cfg[CFG_VROW0] = (w1 >> 16) & 0xFFFF
+                self.cfg[CFG_VROW1] = w2 & 0xFFFF
+                self.cfg[CFG_VCROW] = (w2 >> 16) & 0xFFFF
+            elif op == self.VPU_CMD_OP:
+                vop = (w0 >> 8) & 0x1F
+                if vop not in self._VOP_TO_OP:
+                    return
+                opc = self._VOP_TO_OP[vop]
+                dst, src0 = (w0 >> 16) & 0xFFFF, w1 & 0xFFFF
+                src1 = (w1 >> 16) & 0xFFFF
+                self.cfg[CFG_VLEN] = w2 & 0x3FF
+                rq = (w2 >> 16) & ((1 << (self.m0_w + self.n_w)) - 1)
+                if opc == OP_VECMM:
+                    self._vecmatmul(dst, src0, src1)
+                else:
+                    self._vpu(opc, dst, src0, src1, rq_word=rq)
+
+        elif unit == self.U_DMA:
+            if op == self.DMA_MOVE:
+                spad = (w0 >> 16) & 0xFFFF
+                write = bool(w0 & (1 << 8))       # 1 = spill (scratchpad -> DRAM)
+                transpose = bool(w0 & (1 << 9))
+                dram = w1 & (self.dram_depth - 1)
+                self.cfg[CFG_LEN] = w2 & 0xFFFF
+                self.cfg[CFG_TCOLS] = (w2 >> 16) & 0xFFFF
+                self.cfg[CFG_TSROW] = w3 & 0xFFFF
+                self.cfg[CFG_TDROW] = (w3 >> 16) & 0xFFFF
+                if write:
+                    self._dma(dst=dram, src=spad, to_scratch=False,
+                              transpose=transpose)
+                else:
+                    self._dma(dst=spad, src=dram, to_scratch=True,
+                              transpose=transpose)
+
+    def run_trace(self, records) -> list:
+        """Execute a producer's command trace; return the commands, in order.
+
+        `records` is the parsed output of a `-DTPU_TRACE` firmware build (see
+        `fw/mock/tpu_trace.c`): ``("CMD", unit, w0, w1, w2, w3)`` and
+        ``("WAIT", unit)``.
+
+        WAIT is a no-op here, and deliberately so. This model has no
+        concurrency: it retires every command completely before looking at the
+        next, which is the strongest ordering any barrier placement can produce.
+        So a firmware that *omits* a needed cross-unit barrier still gets correct
+        golden images out of this — and then diverges on the RTL, where the three
+        queues really are independent. Keeping the images a statement about
+        intent, and letting the RTL run be the thing that tests ordering, is what
+        makes a mismatch mean something specific.
+        """
+        cmds = []
+        for rec in records:
+            if rec[0] != "CMD":
+                continue
+            _, unit, w0, w1, w2, w3 = rec
+            self.exec_command(unit, w0, w1, w2, w3)
+            cmds.append((unit, w0, w1, w2, w3))
+        return cmds
+
+
+def parse_trace(text: str) -> list:
+    """Parse `fw/mock/tpu_trace.c` output into records for :meth:`TPU.run_trace`."""
+    out = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        f = line.split()
+        if f[0] == "CMD" and len(f) == 6:
+            out.append(("CMD", int(f[1], 16) if f[1].startswith("0x") else int(f[1]),
+                        *(int(x, 16) for x in f[2:6])))
+        elif f[0] == "WAIT" and len(f) == 2:
+            out.append(("WAIT", int(f[1])))
+        else:
+            raise ISSError(f"trace line {lineno}: cannot parse {line!r}")
+    return out

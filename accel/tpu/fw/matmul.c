@@ -6,7 +6,7 @@
  * DMA, so the host only ever touches DRAM.
  *
  *   A : M x K int8, row-major            arow = K
- *   W : K x N trits, col-major 2-bit      wcol = K*2/8
+ *   W : K x N int4, ROW-major 4-bit        wrow = N*4/8
  *   C : M x N int32                      crow = N*4
  *
  * The MXU walks the 4x2 tile grid itself (n outer, k inner), so the int32
@@ -36,11 +36,11 @@
 #define N (NTILES * COLS)
 
 #define AROW K                  /* A row stride, bytes */
-#define WCOL ((K * 2) / 8)      /* W column stride, bytes */
+#define WROW ((N * 4) / 8)      /* W row stride, bytes (row-major int4) */
 #define CROW (N * 4)            /* C row stride, bytes (int32) */
 
 #define A_BYTES (M * K)
-#define W_BYTES (N * WCOL)
+#define W_BYTES (K * WROW)
 #define C_BYTES (M * N * 4)
 
 /* Same value in DRAM and in the scratchpad, as in the .tpu examples. The bases
@@ -58,7 +58,7 @@ int main(void)
     tpu_wait(TPU_U_DMA);        /* the MXU queue is not ordered against the DMA's */
 
     /* the contraction */
-    tpu_mxu_geom(AROW, CROW, WCOL, KTILES, NTILES, M);
+    tpu_mxu_geom(AROW, CROW, WROW, KTILES, NTILES, M);
     tpu_mxu_mm(C_ADDR, A_ADDR, W_ADDR, TPU_MM_TILED, 0u);
     tpu_wait(TPU_U_MXU);
 

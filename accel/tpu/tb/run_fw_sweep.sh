@@ -25,7 +25,7 @@
 
 set -u
 
-RTL="../rtl/tpu_top.sv ../rtl/scalar_unit.sv ../rtl/mxu.sv ../rtl/vpu.sv
+RTL="../rtl/tpu_top.sv ../rtl/mxu.sv ../rtl/vpu.sv
      ../rtl/scratchpad.sv ../rtl/dma.sv ../rtl/sram.sv
      ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv
      ../rtl/perf_counters.sv
@@ -56,15 +56,31 @@ for s in $SHAPES; do
     make -C ../fw clean >/dev/null 2>&1
     if ! make -C ../fw M="$m" KTILES="$kt" NTILES="$nt" >/dev/null 2>&1 ||
        ! make -C ../fw PROG=matmul_loop M="$m" KTILES="$kt" NTILES="$nt" \
-              >/dev/null 2>&1; then
+              >/dev/null 2>&1 ||
+       ! make -C ../fw matmul.trace matmul_loop.trace \
+              M="$m" KTILES="$kt" NTILES="$nt" >/dev/null 2>&1; then
         printf '%-12s BUILD FAILED\n' "${m}x$((kt*8))x$((nt*8))"
         fail=$((fail + 1))
         continue
     fi
 
     for p in matmul matmul_loop; do
+        # Golden vectors are per shape *and* per kernel now: they come from that
+        # kernel's own command trace (docs/picorv32_migration.md §8.1), and the
+        # trace differs between matmul and matmul_loop even though the answer
+        # does not. Regenerate before every run or the trace check compares a
+        # kernel against the other one's expectations.
+        mkdir -p vectors_fw
+        if ! ../fw/"$p".trace > vectors_fw/"$p".trace.txt 2>/dev/null ||
+           ! python ../../tpulang/fw_vectors.py -t vectors_fw/"$p".trace.txt \
+                 -o vectors_fw -M "$m" --ktiles "$kt" --ntiles "$nt" \
+                 >/dev/null 2>&1; then
+            printf '%-12s %-12s VECTORS FAILED\n' "${m}x$((kt*8))x$((nt*8))" "$p"
+            fail=$((fail + 1)); continue
+        fi
+
         iverilog -g2012 -DWATCHDOG_NS="$WATCHDOG" \
-            -DFW_HEX="\"../fw/$p.hex\"" \
+            -DFW_HEX="\"../fw/$p.hex\"" -DFW_VEC_DIR='"vectors_fw"' \
             -DFW_M="$m" -DFW_KT="$kt" -DFW_NT="$nt" \
             -o fw_sweep.vvp $RTL fw_matmul_tb.sv 2>/dev/null
 

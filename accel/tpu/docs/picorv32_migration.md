@@ -1,31 +1,41 @@
 # Migrating the scalar unit to PicoRV32 + macro-op dispatch
 
-**Status: the RTL is built and passing. Phases 0-2 and 4 are in the tree; 3 and
-5-6 (the Python toolchain and the retirement of the old front end) are not.**
+**Status: phases 0-5 are done, including the model. The scalar unit,
+`assembler.py`, `gen_vectors.py`, `torch_ref.py`, `pytpu.py` and every
+`examples/*.tpu` have been deleted — the CPU is the only producer, and
+[`../fw/adder.c`](../fw/adder.c) is the whole four-layer int4 model in 518
+commands and 1544 bytes of RISC-V. `adder_export.py` came back as the firmware
+kernel's host: it derives the requant table from a checkpoint, compiles the
+kernel natively against it, and scores the trace on `iss.py`. Phase 6 (a second
+architecture as a new `.c` file) is the remaining one.**
 
 | Phase | State |
 | --- | --- |
 | 0 | **done** - counters reworked (§9.5); `swait` supplemented by `idlec`/`qfull`/`ovlap` |
 | 1 | **done** - `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv`; `scalar_unit.sv` packs its config registers into commands and pushes them |
 | 2 | **done** - scratchpad grants, VPU stall, DMA skid buffer + `sram.sv` backpressure, queue depth 8 |
-| 3 | not started - the RV32IM interpreter, `iss.py`'s trace front end, `gen_vectors.py` rewiring |
+| 3 | **done** - no interpreter (§8.1): `fw/tpu.h` gains `-DTPU_TRACE`, `fw/mock/` emits the trace from a native build, `iss.py` gains `exec_command`/`run_trace`, `fw_vectors.py` turns a trace into golden images + an expected command trace, and `fw_matmul_tb.sv` monitors `p_cmd_*` and diffs both |
 | 4 | **done (RTL)** - `cpu_subsys.sv`: PicoRV32 + AXI4-Lite + the MMIO command aperture, alongside the scalar unit. The C toolchain now exists too (`../fw/`, §8): `matmul.c` (hardware tile walk) and `matmul_loop.c` (the same product, tile grid walked in C) are the kernels and `host/run_fw_matmul.py` runs either. Both **build** (Homebrew `riscv64-elf-gcc` 16.2.0, 248 and 352 bytes of the 16 KB) and both **pass in simulation** through `tb/fw_matmul_tb.sv` (`make fw`) — see §9.6. Not yet run on the board. |
-| 5-6 | not started - retiring `scalar_unit.sv`/`assembler.py`/`.tpu`, then a second architecture |
+| 4 (rest) | **done** - `tpu.h` has builders for all three units (VPU + transposing DMA), and the model is written against them: `ffn.c`, `mha.c`, then `adder.c` — four transformer layers and the output head, 518 commands, 439 917 clocks, byte-exact against the ISS through `make fw FWPROG=adder`. Row-major weights swapped which attention operand needs the transpose; see that file's header |
+| 5 | **done** - `scalar_unit.sv` and the whole tpulang toolchain deleted; `tpu_top.sv` has one producer, one S-port requester and no imem/cfg path; `iss.py` kept for its op bodies with the instruction decoder stripped |
+| 6 | not started - a second architecture as a new `.c` file and no RTL change |
 
 What passes today, on the tree as it stands:
 
 | Test | Result |
 | --- | --- |
-| `make TEST=mxu` / `vpu` / `scratchpad` / `sram` | 168 / 318 / 50 / 4872 checks, 0 errors |
+| `make TEST=mxu` / `vpu` / `scratchpad` / `sram` | 208 / 357 / 50 / 4872 checks, 0 errors |
 | `make cosim` (the real host driver against the RTL) | 11 of 11 |
 | `make TEST=dma` (incl. new contention tests) | 16 737 checks, 0 errors |
 | `make TEST=cmd_queue` (new) | 123 checks, 0 errors |
-| `make examples` (new) - all ten example kernels vs. their golden vectors | **10 passed, 0 failed** |
+| ~~`make examples`~~ | **gone with phase 5** - the ten `.tpu` kernels and the assembler that built them were deleted. `make fw FWPROG=...` over the four C kernels is what covers the dispatch plane now |
 | `make uart` (two programs, one link, no reset between) | 469 checks, 0 errors |
 | `make TEST=cpu_smoke` (new) | 68 checks, 0 errors - PicoRV32 boots, pushes two DMA commands, 64-byte round trip byte-exact |
-| `make fw` (new) - the C firmware through `tpu_top`, image via `FW_INIT` | **129 checks, 0 errors** on both kernels; `matmul` halts after 2 120 clocks, `matmul_loop` after 2 508. First exercise of the CPU -> MXU path |
-| `make model` - the adder model at `layers=1` through `tpu_top_tb` | **14 336 checks, 0 errors**, halts at pc=225 after 181 898 clocks |
-| `make model LAYERS=4` - the shipped kernel | **26 624 checks, 0 errors**, halts at pc=225 after 693 107 clocks |
+| `make fw` - the C firmware through `tpu_top`, image via `FW_INIT`, golden vectors + expected command trace from the kernel's own native trace (§8.1) | **539 / 574 checks, 0 errors** on `matmul` / `matmul_loop`; halts after 2 210 / 2 587 clocks. Checks the DRAM image *and* the command stream, 5 / 12 commands matched |
+| `make fw FWPROG=ffn` / `mha` | 0 errors - the feed-forward block and one attention head, the first VPU and transposing-DMA commands from firmware |
+| `make fw FWPROG=adder` - **the whole model** | **526 879 checks, 0 errors**, halts after 439 917 clocks; 518 of 518 commands matched |
+| ~~`make model [LAYERS=n]`~~ | **gone with phase 5** - `tpu_top_tb.sv` drove the scalar unit. `make fw FWPROG=adder` replaces it and checks strictly more (the command stream as well as the image) |
+| `make fwsweep` - both kernels over 11 shapes, vectors regenerated per shape | 22 of 22, 0 failures (largest: 260 commands) |
 | `make all` | 15 of 15 |
 
 `make examples` is the one that matters most: between them the ten kernels cover
@@ -401,13 +411,15 @@ be modelled by `assembler.py` + `iss.py` as they stand.
 macro-op trace — the ordered list of 128-bit commands per unit — becomes the ISA boundary.
 Three producers must agree on it:
 
-1. **Firmware under a Python RV32IM interpreter.** MMIO stores are captured as commands.
-   ~400 lines, well-trodden, no external dependency; it replaces `assembler.py`'s 618. (An
-   external simulator — `spike`, `renode` — is the alternative if a dependency is acceptable.)
+1. **The firmware kernel, compiled natively against a mock `tpu.h`.** Not an RV32IM
+   interpreter — see §8.1. `tpu.h` already funnels every MMIO access through two inline
+   functions, so `-DTPU_TRACE` swaps those for a trace emitter and the *actual* `.c` source
+   becomes the producer, with its real control flow, compiled by the host compiler.
 2. **`iss.py`, re-fronted.** Its `_matmul` / `_vpu` / `_dma` bodies are the golden numerics and
    are kept **verbatim**; only the decode front end changes, from 32-bit words to 128-bit
    commands. The scratchpad/DRAM images it produces are unchanged in meaning.
-3. **RTL.** A sim-only monitor on each command FIFO write dumps the trace from `tpu_top_tb`.
+3. **RTL.** A sim-only monitor on the arbitrated command write (`tpu_top.sv`'s `p_cmd_*`,
+   which is where both producers converge) dumps the trace from the testbench.
 
 `gen_vectors.py` becomes 1 → 2 → expected images, as before. `tpu_top_tb` then checks *two*
 things instead of one: the memory image, and 3 against 1. That second check is strictly new
@@ -416,6 +428,50 @@ which is a better debug loop than the current one, not a worse one.
 
 `torch_ref.py` and `adder_export.py` are unaffected: they compare final tensors, not
 instructions.
+
+### 8.1 Why there is no RV32IM interpreter
+
+The original plan here was a ~400-line Python RV32IM interpreter that would run the firmware
+image and capture its MMIO stores. It was dropped, and the reasoning is worth keeping because
+it applies to anything else that wants to "model the CPU".
+
+**The interpreter solves a problem you only have if you insist the producer must be a
+binary.** The command stream is a pure function of the kernel's control flow, and that control
+flow is ordinary C — `matmul.c` is integer arithmetic and five builder calls. Every
+target-specific thing in the whole firmware lives in two inline functions:
+
+| `tpu.h` | native build does |
+| --- | --- |
+| `tpu_push` (four volatile stores) | append `(unit, w0, w1, w2, w3)` to a trace |
+| `tpu_wait` (two volatile loads + spin) | emit a barrier marker |
+| `TPU_DONE` | nothing |
+
+Everything else — `tpu_dma`, `tpu_mxu_geom`, `tpu_mxu_mm`, and every builder added later — is
+plain arithmetic over `uint32_t` and comes along for free. `uint32_t` wraps identically on
+x86-64 and RV32, and device addresses are `uint32_t` rather than pointers, so the arithmetic
+matches without an ABI argument.
+
+**A hand-written Python mirror of each kernel was considered and rejected** for the same
+reason the interpreter was: it puts a transcription between the source and the test. Two
+implementations maintained by one person drift, and if the mirror is written by reading the C
+then a misunderstanding of intent is duplicated into both — the two "independent" producers
+agree on the bug and the test passes. Compiling the real `.c` has the simplicity of the mirror
+with none of the drift, and it preserves phase 6's promise: a new architecture stays *one* new
+`.c` file, not a `.c` plus a `.py`.
+
+**What this gives up**, honestly: RV32-specific execution semantics. A `div` under
+`ENABLE_DIV(0)`, a stack overflow, a linker-script mistake — native compilation runs all of
+those happily where the core faults. Every one is loud in the RTL run (a trap halts the core,
+a bad image fails the compare), so they are *detected*; they are just localized less precisely
+than an interpreter would. That is the trade: sharp diagnosis of rare bugs, for deleting 400
+lines and a class of drift.
+
+**What must not be dropped with it** is producer 3. The interpreter's real payoff was never
+"run the firmware" — it was the command-by-command diff that localizes a failure to
+producer-vs-datapath. That benefit is orthogonal to how the reference trace is produced, so it
+survives here for free, but only if the RTL monitor is built and the reference emits a
+*trace*, not just final images. A reference that emits images only puts you back in the
+pre-phase-3 debug loop: image mismatch, no idea which command.
 
 What dies: `assembler.py` (618 lines), `pytpu.py` (528), the `.tpu` language, every
 `examples/*.tpu` and its golden vectors, and `isa.md` §§3–6 and A.2–A.4. That is the honest
@@ -690,6 +746,51 @@ Three consequences:
   (`ovlap = 0`). That is §9.3's 1.45x, still unclaimed and still the largest single item
   on the table.
 
+### 9.8 The whole model on the C producer, measured
+
+`make fw FWPROG=adder` — four transformer layers plus the output head, 518
+commands, `tb/fw_matmul_tb.sv` checking every DRAM byte *and* every command word
+against `iss.py`:
+
+| | clocks | share |
+| --- | ---: | ---: |
+| whole run | 439 917 | 100% |
+| MXU | 206 361 | 46.9% |
+| DMA | 131 168 | 29.8% |
+| VPU | 84 352 | 19.2% |
+| **`idlec` = CPU issuing commands** | **18 035** | **4.1%** |
+
+**Do not read this against §0's 690 705.** That baseline is a *different model* —
+the ternary `d=128, f=128` kernel on the scalar unit — and this is the int4
+`d=64, f=256` one on the CPU. The only number that transfers is the last row.
+
+**Issue overhead is 4.1%**, against §9's estimate of ≈2.7% for the CPU producer.
+The gap is not a surprise and is not the command format: §9.7 measured ~85
+clocks to build and push one command, and 518 × 85 = 44 030 clocks of *CPU*
+time, of which only 18 035 is exposed — the rest hides under array work. It sits
+above the estimate because this kernel's average dispatch is much smaller than
+the sweep's: 96 of the 128 commands per layer are VPU passes over 512 elements
+(32 clocks of work each), so the CPU is genuinely the critical path across the
+elementwise stretches and genuinely idle across the matmuls.
+
+Two things follow for anyone trying to shrink it, and neither is the queue:
+
+- **`qfull` and `ovlap` are both 0.** Nothing is overlapped, because the kernel
+  fences after every cross-unit dependency — `tpu_wait` before each of the four
+  weight refills, around the K transpose, and between the array and the vector
+  unit at each attention step. Every one of those is a real dependency, so
+  removing them needs double-buffering (a second weight window, a second int32
+  temp), not a looser barrier.
+- **The VPU is 19.2% of the run**, against 7.6% on the retired ternary kernel,
+  and its cost tracks element count almost exactly: 196 608 elements over 84 352
+  clocks is 0.43 clocks each, i.e. ~7 clocks per 16-lane chunk with per-command
+  overhead a rounding error. The FFN's `relu → requant` pair is **a third** of
+  that traffic on its own — 32 commands and 16 384 elements per layer to compute
+  a ReLU — and it is that size only because `relu` writes int32 and nothing
+  narrows on the writeback path (vpu.md). A fused `relu.rq` would delete half
+  those commands and all of the int32 traffic, worth ~6% of the whole run: the
+  largest item on this table that is a *design* choice rather than arithmetic.
+
 ---
 
 ## 10. Area and timing
@@ -723,7 +824,7 @@ Each phase leaves the tree green, and the first two deliver value with **no CPU 
 | 0 | Add `starved`/`qfull`/`overlap` counters; re-measure the baseline | pure addition, as `macro_ops.md` phase 0 was |
 | 1 | Command decoders + queues in front of MXU/VPU/DMA. `scalar_unit` **packs its config registers into commands** and pushes them, still waiting after each. | behavior identical; same golden vectors, same ISS, same `.tpu` programs. The command interface is validated before anything else moves. |
 | 2 | Scratchpad grant handshake + DMA skid buffer (§5); queue depth > 1; a `push`-without-wait instruction flag; double-buffer the weight window | **this is where the 1.45× lands**, still on the existing scalar unit and existing toolchain |
-| 3 | Python RV32IM interpreter; `iss.py` re-fronted onto command traces; RTL command-trace monitor; `gen_vectors.py` rewired | the trace contract is proven against the *existing* scalar unit's commands before a CPU exists |
+| 3 | Mock `tpu.h` (`-DTPU_TRACE`) so the real `.c` compiles natively into a command trace (§8.1); `iss.py` re-fronted onto command traces; RTL command-trace monitor; `gen_vectors.py` rewired | the trace contract is proven against the *existing* scalar unit's commands before a CPU exists |
 | 4 | PicoRV32 + firmware BRAM + AXI4-Lite, arbitrated onto the same command ports **alongside** `scalar_unit`. Port `adder_model` to C; check its command trace against the `.tpu` version's, command for command. | both producers live; the `.tpu` suite is still a regression. Costs 1 076 LUTs of duplication, affordable at 64%. |
 | 5 | Retire `scalar_unit`, `assembler.py`, `pytpu.py`, `examples/*.tpu`; rewrite `isa.md` around the command format | only after 4 has been byte-identical for a while |
 | 6 | The point of the exercise: a second architecture (GQA with `heads_per_q > 1`, or KV-cache decode) as a new `.c` file and no RTL change | — |

@@ -59,7 +59,6 @@ module cpu_smoke_tb;
     localparam int XLEN       = 32;
     localparam int M0_W       = 12;
     localparam int N_W        = 4;
-    localparam int REG_AW     = 5;
     localparam int IMEM_AW    = 10;
     localparam int CFG_AW     = 5;
     localparam int FW_AW      = 12;
@@ -89,8 +88,7 @@ module cpu_smoke_tb;
 
     tpu_top #(
         .ROWS(ROWS), .COLS(COLS), .VPU_BYTES(VPU_BYTES), .ADDR_W(ADDR_W),
-        .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W),
-        .REG_AW(REG_AW), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
+        .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
         .FW_AW(FW_AW), .FW_INIT("fw_smoke.hex"),
         .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W)
     ) dut (

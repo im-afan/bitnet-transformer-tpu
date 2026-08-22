@@ -1,5 +1,16 @@
 # Accelerators
 
+> **The scalar unit and tpulang are gone.** The TPU has **one** command
+> producer: PicoRV32 firmware in `accel/tpu/fw/`, pushing 128-bit macro-ops
+> through the MMIO aperture. `scalar_unit.sv`, `assembler.py`, `gen_vectors.py`,
+> `torch_ref.py`, `pytpu.py`, `adder_export.py`, every `examples/*.tpu`, the
+> `.tpu` testbenches and `isa.md` were deleted; `iss.py` survives as the golden
+> numerics behind `fw_vectors.py`'s command front end. Anything below that
+> describes a `.tpu` program, an assembler or the scalar unit is history.
+> See `docs/picorv32_migration.md` §11.
+
+
+
 Hardware/backend implementations of the operations in the `../model` reference. Each backend
 is validated against the PyTorch golden model.
 

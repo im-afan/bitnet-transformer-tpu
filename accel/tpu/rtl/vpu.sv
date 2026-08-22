@@ -4,21 +4,21 @@
 //
 // Implements the block described in accel/tpu/docs/vpu.md: LANES int32 lanes fed
 // from a single wide scratchpad read/modify/write port (V_rw), computing every
-// pointwise / reduction op that is not a ternary-weight matmul.
+// pointwise / reduction op that is not an int4-weight matmul.
 //
 // SCOPE. This unit implements exactly the ops
 // accel/tpulang/examples/adder_model.tpu issues, and nothing else:
 //
-//     VOP_DOT  VOP_ADD  VOP_RELU  VOP_REQUANT  VOP_DYT  VOP_TQUANT
+//     VOP_DOT  VOP_ADD  VOP_RELU  VOP_REQUANT  VOP_DYT  VOP_QUANT4
 //     VOP_VECMATMUL
 //
 // VOP_DOT is the odd one out: no shipped kernel issues `vecdot`, but it is the
 // inner primitive VOP_VECMATMUL runs once per (row, col) pair, so its datapath
 // is not optional and keeping the opcode costs nothing.
 //
-// **VOP_VECMATMUL now has no caller either.** Ternarizing K and V (VOP_TQUANT)
-// moved both attention matmuls onto the MXU, and making Model.fc a
-// TernaryLinear moved the output head — its last caller — with them. The pair
+// **VOP_VECMATMUL now has no caller either.** Packing K and V to int4
+// (VOP_QUANT4) moved both attention matmuls onto the MXU, and making Model.fc an
+// Int4Linear moved the output head — its last caller — with them. The pair
 // is kept because a model shape that needs an int8 x int8 matmul is one
 // checkpoint away, and because removing them is a real area decision rather
 // than a deletion: VOP_DOT is the reduction path (the accumulator, the fold and
@@ -43,40 +43,52 @@
 //
 // Numerics / requant. Compute ops read int8 operands, accumulate in int32, and
 // write their **int32** result straight to scratchpad — the VPU no longer
-// narrows on the writeback path. Going int32 -> int8 is an *explicit*
-// instruction, VOP_REQUANT, which applies the BitNet fixed-point rescale
-// `clip((acc*m0 + round) >> n)` (the same math as requant.sv) with a per-tensor
-// {m0, n} read from the scalar operand. This lets the scalar unit keep the
-// residual stream wide and requantize only where an int8 activation is actually
-// needed (e.g. before feeding the MXU).
+// narrows on the writeback path. Going int32 -> int4 is an *explicit*
+// instruction, VOP_REQUANT, which applies the fixed-point rescale
+// `clip((acc*m0 + round) >> n)` with a per-tensor {m0, n} read from the scalar
+// operand. This lets the scalar unit keep the residual stream wide and
+// requantize only where a narrow activation is actually needed (e.g. before
+// feeding the MXU).
+//
+// **The narrow lands int4, in an int8 container.** REQUANT and DYT still write
+// one byte per element and every activation buffer is still byte-per-element;
+// only the value range narrows, to [-8, 7] and [-7, 7] respectively. Clipping
+// there rather than at int8 is what keeps mxu.sv's PSUM_W bound true — see the
+// numerics note in that file.
 //
 // DyT (VOP_DYT). Dynamic tanh — `hardtanh(alpha*x, -1, 1)`, arxiv 2503.10622 —
 // is the normalization model/transformer.py uses in place of LayerNorm, and on
-// an int8 datapath it is *the same instruction as a requant with a different
-// clip*. If the output scale is pinned to 1/127 then a saturating narrow from
-// int32 already computes the hardtanh: the multiplier `m0/2**n` carries
-// `alpha * s_in * 127`, and every value the clip catches is exactly one that
+// a narrow integer datapath it is *the same instruction as a requant with a
+// different clip*. If the output scale is pinned to 1/7 then a saturating narrow
+// from int32 already computes the hardtanh: the multiplier `m0/2**n` carries
+// `alpha * s_in * 7`, and every value the clip catches is exactly one that
 // hardtanh would have flattened to +-1. The only difference from VOP_REQUANT is
-// the *lower* bound, -127 instead of int8's -128: hardtanh is an odd function,
-// so a floor of -128/127 = -1.0079 would be off-spec at one end only. One
+// the *lower* bound, -7 instead of int4's -8: hardtanh is an odd function,
+// so a floor of -8/7 = -1.143 would be off-spec at one end only. One
 // comparison constant is the whole cost of the op, and having it be an op at
 // all is what lets a kernel say "this is a normalization" instead of "this is a
 // rescale that happens to clip". See accel/tpulang/adder_kernel.md §4.
 //
-// Ternary quantize (VOP_TQUANT). The third op sharing that fixed point, and the
-// only one whose *destination* is not int8: it clips to +-1 and writes the trit
-// in the MXU's 2-bit weight encoding (00 = 0, 01 = +1, 11 = -1), four elements
-// per byte. That is what makes the result directly addressable as a `matmul_t`
-// weight column, with no repacking pass and no host round trip — and therefore
-// what lets an *activation* be a weight operand. The shipped kernel ternarizes
-// K and V with it, which is how attention's Q@K^T and P@V left VOP_VECMATMUL
-// (one serial int8 dot product per output element) for the array.
+// int4 narrow + pack (VOP_QUANT4, opcode 0x22, formerly `tquant`). The third op
+// sharing that fixed point, and the only one whose *destination* is not int8: it
+// clips to [-8, 7] and writes a bare 4-bit two's-complement nibble, two elements
+// per byte, which is the MXU's packed weight layout. That is what makes the
+// result directly addressable as a `matmul_t` weight row, with no repacking pass
+// and no host round trip — and therefore what lets an *activation* be a weight
+// operand. The shipped kernel packs K and V with it, which is how attention's
+// Q@K^T and P@V left VOP_VECMATMUL (one serial dot product per output element)
+// for the array.
 //
-// Its write strobe is per byte, so `vpu_vlen` must be a multiple of 4; a partial
-// final byte writes 0 (trit 0) into the slots the tail did not fill rather than
-// preserving what was there.
+// Now that weights and activations are the same width this is usually a pure
+// repack — the source was already clipped to [-8, 7] by whatever requant
+// produced it, so `{m0,n} = {1,0}` is lossless. Under the ternary encoding it
+// was a genuine second narrow onto {-1, 0, 1}.
 //
-// The scalar operand. VOP_REQUANT, VOP_DYT and VOP_TQUANT are the only ops that
+// Its write strobe is per byte, so `vpu_vlen` must be a multiple of 2 (it was 4
+// when four trits shared a byte); a partial final byte writes nibble 0 into the
+// slot the tail did not fill rather than preserving what was there.
+//
+// The scalar operand. VOP_REQUANT, VOP_DYT and VOP_QUANT4 are the only ops that
 // use `vpu_rq_word`, and all three use the same thing: one {m0, n} pair, latched
 // at dispatch and held for the whole vector. It used to be a scratchpad address
 // that cost a two-state fetch over the V port before the first chunk; it is now
@@ -111,11 +123,11 @@ module vpu #(
     input  logic [4:0]           vpu_op,
     input  logic [ADDR_W-1:0]    vpu_src0,
     input  logic [ADDR_W-1:0]    vpu_src1,
-    // REQUANT / DYT / TQUANT {n,m0} as a LITERAL, carried in the dispatch
+    // REQUANT / DYT / QUANT4 {n,m0} as a LITERAL, carried in the dispatch
     // rather than fetched from the scratchpad (docs/picorv32_migration.md §3).
     // M0_W + N_W = 16 bits, the same width as the address it replaces. The two
     // states that used to fetch it (S_RDS/S_RDSD) are gone with it, so every
-    // requant/dyt/tquant dispatch is two clocks and one scratchpad read shorter.
+    // requant/dyt/quant4 dispatch is two clocks and one scratchpad read shorter.
     input  logic [M0_W+N_W-1:0]  vpu_rq_word,
     input  logic [ADDR_W-1:0]    vpu_dst,
     input  logic [9:0]           vpu_vlen,     // vector length in elements
@@ -180,7 +192,7 @@ module vpu #(
         VOP_DYT         = 5'd16,
         // dst = 2-bit trit codes, 4 per byte, from int8 inputs. The same
         // fixed point again, clipped to +-1; see the header note.
-        VOP_TQUANT      = 5'd17;
+        VOP_QUANT4      = 5'd17;
 
     // -------------------------------------------------------------------------
     // Op-class helpers.
@@ -194,8 +206,15 @@ module vpu #(
         return (o == VOP_DOT);
     endfunction
 
-    // int32 -> int8 requantize: clip((acc*m0 + round) >> n). Mirrors requant.sv,
-    // extended to signed accumulators and int8 clip.
+    // The int4 grid. Activations are int4 *values* in int8 containers, so these
+    // are the clips, not the container's. Matches mxu.sv ACT_QMIN/ACT_QMAX and
+    // model/transformer.py INT4_QMIN/INT4_QMAX; `dyt` clips symmetrically at
+    // +-QMAX because hardtanh is odd, exactly as it used to at +-127.
+    localparam int Q4_MIN = -8;
+    localparam int Q4_MAX =  7;
+
+    // int32 -> int4 requantize: clip((acc*m0 + round) >> n), sign-extended into
+    // an int8 container.
     function automatic logic [7:0] requant8(input logic signed [ACC_W-1:0] acc32,
                                             input logic [M0_W-1:0]         m0,
                                             input logic [N_W-1:0]          n);
@@ -203,9 +222,9 @@ module vpu #(
         prod    = acc32 * $signed({1'b0, m0});          // m0 is a positive scale
         round   = (n == 0) ? '0 : (RQ_W'(1) <<< (n - 1));
         shifted = (prod + round) >>> n;                 // arithmetic (signed) shift
-        if (shifted >  127)      requant8 =  8'sd127;
-        else if (shifted < -128) requant8 = -8'sd128;
-        else                     requant8 = shifted[7:0];
+        if (shifted > Q4_MAX)      requant8 = 8'(signed'(Q4_MAX));
+        else if (shifted < Q4_MIN) requant8 = 8'(signed'(Q4_MIN));
+        else                       requant8 = shifted[7:0];
     endfunction
 
     // DyT / hardtanh: the same rescale, clipped **symmetrically**. Sharing the
@@ -219,26 +238,30 @@ module vpu #(
         prod    = acc32 * $signed({1'b0, m0});
         round   = (n == 0) ? '0 : (RQ_W'(1) <<< (n - 1));
         shifted = (prod + round) >>> n;
-        if (shifted >  127)      dyt8 =  8'sd127;
-        else if (shifted < -127) dyt8 = -8'sd127;   // hardtanh is odd: no -128
-        else                     dyt8 = shifted[7:0];
+        if (shifted >  Q4_MAX)      dyt8 = 8'(signed'(Q4_MAX));
+        else if (shifted < -Q4_MAX) dyt8 = 8'(signed'(-Q4_MAX));  // odd: no -8
+        else                        dyt8 = shifted[7:0];
     endfunction
 
-    // Ternary quantize: the same rescale clipped to a single level per sign,
-    // returned already encoded as the MXU's 2-bit weight code (bit 0 = nonzero,
-    // bit 1 = sign — scratchpad.md §2). Returning the *code* rather than a
-    // signed trit is deliberate: the encoding is the only reason this op exists,
-    // so it belongs beside the arithmetic and not in the writeback muxing.
-    function automatic logic [1:0] tquant2(input logic signed [ACC_W-1:0] acc32,
-                                           input logic [M0_W-1:0]         m0,
-                                           input logic [N_W-1:0]          n);
+    // int4 narrow + pack (VOP_QUANT4, formerly `tquant`). The same rescale as
+    // requant8, returned as a bare 4-bit two's-complement nibble for the MXU's
+    // packed weight layout — two per byte, where the trit code was four.
+    //
+    // With the model's weights and activations both int4 this is *usually* an
+    // identity on the value: whatever produced the source already clipped to
+    // [-8, 7], so `{m0,n} = {1,0}` makes this a pure repack. The rescale is kept
+    // because it costs one shifter that already exists and because a repack that
+    // cannot also requantize would force a second pass wherever a scale changes.
+    function automatic logic [3:0] quant4(input logic signed [ACC_W-1:0] acc32,
+                                          input logic [M0_W-1:0]         m0,
+                                          input logic [N_W-1:0]          n);
         logic signed [RQ_W-1:0] prod, round, shifted;
         prod    = acc32 * $signed({1'b0, m0});
         round   = (n == 0) ? '0 : (RQ_W'(1) <<< (n - 1));
         shifted = (prod + round) >>> n;
-        if (shifted >= 1)      tquant2 = 2'b01;   // +1
-        else if (shifted <= -1) tquant2 = 2'b11;  // -1
-        else                    tquant2 = 2'b00;  //  0
+        if (shifted > Q4_MAX)      quant4 = 4'(signed'(Q4_MAX));
+        else if (shifted < Q4_MIN) quant4 = 4'(signed'(Q4_MIN));
+        else                       quant4 = shifted[3:0];
     endfunction
 
     // -------------------------------------------------------------------------
@@ -273,15 +296,15 @@ module vpu #(
     // Element widths are per-op, and the two are independent: ADD/RELU/DOT read
     // int8 and write int32; REQUANT and DYT read int32 and write int8. src1 is
     // always an int8 vector (binary ops).
-    // VOP_TQUANT is the one op that reads int8 *and* writes narrower than int8,
+    // VOP_QUANT4 is the one op that reads int8 *and* writes narrower than int8,
     // so the two predicates are genuinely independent rather than two names for
     // one thing.
     wire src0_is32   = (op_r == VOP_REQUANT) || (op_r == VOP_DYT);
-    wire dst_is2     = (op_r == VOP_TQUANT);
+    wire dst_is4     = (op_r == VOP_QUANT4);
     wire dst_is8     = (op_r == VOP_REQUANT) || (op_r == VOP_DYT);
     wire [ADDR_W-1:0] src0_stride = src0_is32 ? ADDR_W'(LANES*4) : ADDR_W'(LANES);
     wire [ADDR_W-1:0] src1_stride = ADDR_W'(LANES);
-    wire [ADDR_W-1:0] dst_stride  = dst_is2 ? ADDR_W'(LANES/4)
+    wire [ADDR_W-1:0] dst_stride  = dst_is4 ? ADDR_W'(LANES/2)
                                   : dst_is8 ? ADDR_W'(LANES)
                                             : ADDR_W'(LANES*4);
 
@@ -333,7 +356,7 @@ module vpu #(
     logic                    lane_active [0:LANES-1];
     logic signed [ACC_W-1:0] res32 [0:LANES-1];   // int32 elementwise result
     logic        [7:0]       res8  [0:LANES-1];    // int8 requant result
-    logic        [1:0]       res2  [0:LANES-1];    // 2-bit trit code (TQUANT)
+    logic        [3:0]       res4  [0:LANES-1];    // 4-bit int4 nibble (QUANT4)
     logic signed [ACC_W-1:0] red_val [0:LANES-1];  // per-lane value into reduction
 
     logic signed [7:0]       a8;
@@ -348,7 +371,7 @@ module vpu #(
             lane_active[l] = (l < chunk_active);
             res32[l] = '0;
             res8[l]  = '0;
-            res2[l]  = '0;
+            res4[l]  = '0;
             red_val[l] = '0;
             unique case (op_r)
                 VOP_ADD:         res32[l] = ACC_W'(a8) + ACC_W'(b8);
@@ -357,7 +380,7 @@ module vpu #(
                 VOP_DYT:         res8[l]  = dyt8(a32, rq_m0, rq_n);
                 // int8 source, unlike the two above: this narrows an activation
                 // that a requant already produced.
-                VOP_TQUANT:      res2[l]  = tquant2(ACC_W'(a8), rq_m0, rq_n);
+                VOP_QUANT4:      res4[l]  = quant4(ACC_W'(a8), rq_m0, rq_n);
                 VOP_DOT:         red_val[l] = a8 * b8;
                 default: ;
             endcase
@@ -379,7 +402,7 @@ module vpu #(
     // -------------------------------------------------------------------------
     // Writeback payload + byte strobe (elementwise / requant chunk).
     // int32 dst: 4 bytes per lane; int8 dst (REQUANT/DYT): 1 byte per lane;
-    // 2-bit dst (TQUANT): 1 byte per *four* lanes.
+    // 4-bit dst (QUANT4): 1 byte per *two* lanes.
     // -------------------------------------------------------------------------
     logic [SCRATCHPAD_W*8-1:0] wb_data;
     logic [SCRATCHPAD_W-1:0]   wb_strb;
@@ -387,12 +410,12 @@ module vpu #(
         wb_data = '0;
         wb_strb = '0;
         for (int l = 0; l < LANES; l++) begin
-            if (dst_is2) begin
-                // Four trits share a byte, so the strobe cannot be per lane;
-                // it is asserted below, once per group. An inactive lane
-                // contributes code 00 (= trit 0), which is why the tail of a
-                // vlen that is not a multiple of 4 zero-fills.
-                if (lane_active[l]) wb_data[l*2 +: 2] = res2[l];
+            if (dst_is4) begin
+                // Two nibbles share a byte, so the strobe cannot be per lane;
+                // it is asserted below, once per pair. An inactive lane
+                // contributes nibble 0, which is why the tail of a vlen that is
+                // not a multiple of 2 zero-fills.
+                if (lane_active[l]) wb_data[l*4 +: 4] = res4[l];
             end else if (dst_is8) begin
                 wb_data[l*8 +: 8] = res8[l];
                 if (lane_active[l]) wb_strb[l] = 1'b1;
@@ -401,9 +424,9 @@ module vpu #(
                 if (lane_active[l]) wb_strb[l*4 +: 4] = 4'b1111;
             end
         end
-        if (dst_is2) begin
-            for (int b = 0; b < LANES/4; b++) begin
-                if (lane_active[b*4]) wb_strb[b] = 1'b1;
+        if (dst_is4) begin
+            for (int b = 0; b < LANES/2; b++) begin
+                if (lane_active[b*2]) wb_strb[b] = 1'b1;
             end
         end
     end

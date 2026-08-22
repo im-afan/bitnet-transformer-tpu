@@ -5,22 +5,27 @@
 // Stitches the four implemented blocks into one core, per the README §1 block
 // diagram:
 //
-//     scalar_unit  (control processor / ISA sequencer, scalar_unit.sv)
-//        │  issue-and-wait dispatch (start → busy/done)
-//        ├──────────────► mxu   (weight-stationary ternary systolic array)
+//     cpu_subsys   (PicoRV32 + AXI4-Lite MMIO command aperture, cpu_subsys.sv)
+//        │  128-bit macro-ops pushed into per-unit queues
+//        ├──────────────► mxu   (weight-stationary int4 systolic array)
 //        └──────────────► vpu   (SIMD vector unit)
 //                                 │           │
 //     scratchpad (BRAM working memory, scratchpad.sv) ◄── all three units
-//        A_rd / W_rd / C_rw (MXU) · V_rw (VPU) · S_rw (scalar)
+//        A_rd / W_rd / C_rw (MXU) · V_rw (VPU) · DMA port
 //
-// The scalar unit fetches a program from its own instruction BRAM, does the
-// scalar math (loop counters, address arithmetic, requant scalars), and
-// dispatches OP_MATMUL to the MXU and the VPU ops to the VPU, blocking on each
-// unit's `done` before the next dependent op (scalar_unit.md §2). Every math
-// instruction names scratchpad byte addresses; the scratchpad is the single
-// owner of the on-chip storage and every unit drives it on the same-named typed
-// ports it already exposes (scratchpad.md §6), so integration here is almost
-// entirely name-matched wiring.
+// Firmware running on the PicoRV32 does the control flow (loop counters,
+// address arithmetic, requant scalars) and pushes one 128-bit macro-op per
+// dispatch through the MMIO aperture into that unit's queue. Commands name
+// scratchpad byte addresses; the scratchpad is the single owner of the on-chip
+// storage and every unit drives it on the same-named typed ports it already
+// exposes (scratchpad.md §6), so integration here is almost entirely
+// name-matched wiring.
+//
+// **The scalar unit and its tpulang ISA are gone.** They were the original
+// producer and are retired: everything they could express, firmware can, and
+// keeping two producers meant two toolchains, two golden-vector paths and a
+// shim in the dispatch path for the requant word. See
+// docs/picorv32_migration.md §11 (phase 5).
 //
 // Memory. The top-level working memory is FPGA BRAM: the scratchpad is
 // instantiated with MEM_STYLE="BRAM" (scratchpad.md §6). External DRAM is the
@@ -33,15 +38,14 @@
 // which silently confined every program to the low 64 KB of a 512 KB part.)
 //
 // Deliberately left out (see notes at the stub tie-off below):
-//   * comms / inter-TPU LINK — the scalar unit's WriteNeighbor dispatch is
-//     stubbed (`nb_done` tied high) so a LINK op is a completing no-op. Wiring a
-//     real comms block (comms.md) is a later step.
+//   * comms / inter-TPU LINK — there is no command for it yet. Wiring a real
+//     comms block (comms.md) is a later step.
 //
 // Everything is parameterized off the systolic array size (ROWS/COLS), the VPU
-// port width, and the scalar datapath; the scratchpad's per-port byte widths are
+// port width, and the CPU's word size; the scratchpad's per-port byte widths are
 // *derived* from those below so the whole core has a single source of truth for
-// the bus widths (A = ROWS int8, W = ROWS trits, C = COLS int32, V = VPU port,
-// S = scalar word). With the defaults (128×128 array, 512-bit VPU) these resolve
+// the bus widths (A = ROWS int8, W = COLS int4, C = COLS int32, V = VPU port,
+// S = CPU word). With the defaults (128×128 array, 512-bit VPU) these resolve
 // to exactly the scratchpad.sv defaults.
 // -----------------------------------------------------------------------------
 
@@ -56,9 +60,11 @@ module tpu_top #(
     parameter int N_W      = 4,     // requant shift width
 
     // ---- Scalar unit sizing -------------------------------------------------
-    parameter int REG_AW   = 5,     // scalar register file: 2**REG_AW regs
-    parameter int IMEM_AW  = 10,    // instruction memory depth = 2**IMEM_AW
-    parameter int CFG_AW   = 5,     // config register file: 2**CFG_AW regs
+    // Retained for port-width compatibility with the host and the testbenches:
+    // `pc_dbg` and the `imem_*` / `cfg_*` load ports keep their widths even
+    // though the only instruction memory left is the CPU's firmware RAM.
+    parameter int IMEM_AW  = 10,    // width of pc_dbg / imem_waddr
+    parameter int CFG_AW   = 5,     // width of cfg_waddr (unused)
 
     // ---- Macro-op dispatch (docs/picorv32_migration.md) ---------------------
     parameter int CMD_DEPTH = 8,    // command queue entries per unit
@@ -83,7 +89,9 @@ module tpu_top #(
 
     // ---- Derived scratchpad byte widths (do not override) -------------------
     parameter int A_BYTES   = ROWS,          // A_rd  : ROWS int8 activation column
-    parameter int W_BYTES   = (ROWS * 2) / 8, // W_rd  : ROWS trits, 2-bit packed
+    // Weights are row-major int4, so a W_rd is one array *row*: COLS nibbles.
+    // For a square array this is the same width the ROWS-trit column was.
+    parameter int W_BYTES   = (COLS * 4) / 8, // W_rd  : COLS int4, 4-bit packed
     parameter int C_BYTES   = COLS * 4,      // C_rw  : COLS int32 result row
     parameter int V_BYTES   = VPU_BYTES,     // V_rw  : VPU SIMD access
     parameter int S_BYTES   = XLEN / 8,      // S_rw  : scalar word
@@ -92,11 +100,10 @@ module tpu_top #(
     input  logic clk,
     input  logic rst_n,
 
-    // ---- Host control: program run + status (scalar_unit host ports) --------
-    input  logic                 host_run,     // pulse: start program at boot_pc
-    // HOST_AW bits, not IMEM_AW: the top bit selects which producer to start —
-    // 0 = the scalar unit at this word address, 1 = the PicoRV32 firmware. Same
-    // encoding the UART 'G' command uses, so the two host paths stay symmetric.
+    // ---- Host control: firmware run + status --------------------------------
+    input  logic                 host_run,     // pulse: release the CPU from reset
+    // HOST_AW bits wide for wire compatibility: the top bit used to select
+    // between two producers and is now ignored (there is only the firmware).
     input  logic [FW_AW:0]       boot_pc,
     output logic                 busy,         // program executing
     output logic                 done,         // HALT reached
@@ -114,8 +121,8 @@ module tpu_top #(
 
     // ---- External DRAM pins: async SRAM chip interface ----------------------
     //      Driven by the on-chip DMA engine (while a program runs) or the UART
-    //      host (while idle) through the shared sram_controller. The scalar unit's
-    //      Read/WriteMemory ops move data over this port when running.
+    //      host (while idle) through the shared sram_controller. The firmware's
+    //      DMA commands move data over this port when running.
     output logic [MEM_ADDR_W-1:0] sram_addr,
     inout  wire  [MEM_DATA_W-1:0] sram_data,   // inout must be a net, not a var
     output logic                  sram_we,
@@ -140,7 +147,7 @@ module tpu_top #(
     logic [M0_W+N_W-1:0] mxu_rq_word;
     logic [5:0]          mxu_t_len;
     logic                mxu_tiled;
-    logic [ADDR_W-1:0]   mxu_a_row, mxu_c_row, mxu_w_col;
+    logic [ADDR_W-1:0]   mxu_a_row, mxu_c_row, mxu_w_row;
     logic [7:0]          mxu_k_tiles, mxu_n_tiles;
     logic                mxu_accumulate, mxu_requant;
     logic                mxu_busy, mxu_done;
@@ -157,14 +164,14 @@ module tpu_top #(
     logic                vpu_mm_busy;   // VPU busy on a vecmatmul (perf only)
 
     // ---- macro-op command plane ---------------------------------------------
-    //   Two producers (the scalar unit running tpulang, the CPU running
+    //   One producer (the CPU running
     //   firmware) share one push port; three consumers each own a queue.
     localparam logic [1:0] U_MXU = 2'd0, U_VPU = 2'd1, U_DMA = 2'd2, U_LINK = 2'd3;
 
-    logic         su_cmd_we,  cpu_cmd_we;
-    logic [1:0]   su_cmd_unit, cpu_cmd_unit;
-    logic [127:0] su_cmd_data, cpu_cmd_data;
-    logic         su_cmd_full, cpu_cmd_full;
+    logic         cpu_cmd_we;
+    logic [1:0]   cpu_cmd_unit;
+    logic [127:0] cpu_cmd_data;
+    logic         cpu_cmd_full;
 
     logic         p_cmd_we, p_cmd_full;
     logic [1:0]   p_cmd_unit;
@@ -182,10 +189,6 @@ module tpu_top #(
     logic                s_re, s_we, s_rgnt, s_wgnt;
     logic [ADDR_W-1:0]   s_addr;
     logic [XLEN-1:0]     s_wdata, s_rdata;
-
-    logic                su_s_re, su_s_we, su_s_rgnt, su_s_wgnt;
-    logic [ADDR_W-1:0]   su_s_addr;
-    logic [XLEN-1:0]     su_s_wdata;
 
     logic                cpu_s_re, cpu_s_we, cpu_s_rgnt, cpu_s_wgnt;
     logic [ADDR_W-1:0]   cpu_s_addr;
@@ -218,7 +221,7 @@ module tpu_top #(
     logic [V_BYTES-1:0]  V_wstrb;
     logic                V_rgnt, V_wgnt;
 
-    // ---- scalar_unit → DMA dispatch -----------------------------------------
+    // ---- DMA dispatch --------------------------------------------------------
     logic                dma_start, dma_write;
     logic [ADDR_W-1:0]     dma_scratch_addr;
     logic [MEM_ADDR_W-1:0] dma_dram_addr;   // the DRAM side is the wider space
@@ -276,22 +279,19 @@ module tpu_top #(
     logic [NPERF-1:0]      perf_ev;
     logic [NPERF*32-1:0]   perf_counts;   // counter i at [i*32 +: 32]
     logic [NPERF*32-1:0]   perf_wire;     // same, reordered for transmission
-    logic                  su_wait_active, mxu_load_active;
+    logic                  mxu_load_active;
 
     // ---- Host program/run path: external host ports OR'd with the UART host --
-    //   Both paths write instruction memory and pulse host_run; they are used
-    //   only while the core is idle, so a simple priority-mux is safe.
-    logic                  su_host_run;
-    logic [IMEM_AW-1:0]    su_boot_pc;
-    logic                  su_imem_we;
-    logic [IMEM_AW-1:0]    su_imem_waddr;
-    logic [31:0]           su_imem_wdata;
-    logic                  su_busy, su_done;
-
-    // Which producer the host is addressing. The 'I' and 'G' commands carry a
-    // HOST_AW-bit word address whose top bit selects: 0 = the scalar unit's
-    // instruction memory (its own 2**IMEM_AW words), 1 = the CPU's firmware RAM
-    // (2**FW_AW words). No new command byte, and the host side is one constant.
+    //   Both paths write firmware memory and pulse host_run; they are used only
+    //   while the core is idle, so a simple priority-mux is safe.
+    //
+    //   There is **one producer** now. The scalar unit and its tpulang ISA were
+    //   retired once the PicoRV32 path could express every kernel, so the 'I'
+    //   and 'G' word address no longer selects between two instruction
+    //   memories — it is just the firmware RAM. HOST_AW keeps its extra bit so
+    //   the wire protocol and host/tpu_uart.py are unchanged, and a stale host
+    //   that still sets it lands in the same place rather than silently
+    //   addressing a unit that no longer exists.
     localparam int HOST_AW = FW_AW + 1;
 
     logic                  fw_we;
@@ -299,39 +299,23 @@ module tpu_top #(
     logic [31:0]           fw_wdata;
     logic                  cpu_run, cpu_busy, cpu_done, cpu_trap;
 
-    wire host_sel_fw = uart_imem_waddr[FW_AW];
-    wire host_run_fw = uart_run_pc[FW_AW];
-
-    wire par_run_fw = boot_pc[FW_AW];
-
-    assign su_host_run   = (host_run       && !par_run_fw) |
-                           (uart_run_start && !host_run_fw);
-    assign su_boot_pc    = uart_run_start ? uart_run_pc[IMEM_AW-1:0]
-                                          : boot_pc[IMEM_AW-1:0];
-    assign su_imem_we    = imem_we | (uart_imem_we && !host_sel_fw);
-    assign su_imem_waddr = uart_imem_we ? uart_imem_waddr[IMEM_AW-1:0] : imem_waddr;
-    assign su_imem_wdata = uart_imem_we ? uart_imem_wdata : imem_wdata;
-
-    assign fw_we    = uart_imem_we && host_sel_fw;
-    assign fw_waddr = uart_imem_waddr[FW_AW-1:0];
-    assign fw_wdata = uart_imem_wdata;
+    assign fw_we    = imem_we | uart_imem_we;
+    assign fw_waddr = uart_imem_we ? uart_imem_waddr[FW_AW-1:0] : imem_waddr[FW_AW-1:0];
+    assign fw_wdata = uart_imem_we ? uart_imem_wdata : imem_wdata;
 
     // The CPU runs as a level, not a pulse: 'G' releases it from reset and it is
-    // held there until the firmware signals done (or traps). This is the same
-    // "busy defines the window" contract the scalar unit's HALT gives, so the
-    // host protocol, the SRAM arbitration and the perf counters are unchanged.
+    // held there until the firmware signals done (or traps). "busy defines the
+    // window" is what the host protocol, the SRAM arbitration and the perf
+    // counters all key off.
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)                                       cpu_run <= 1'b0;
-        else if (uart_run_start && host_run_fw)           cpu_run <= 1'b1;
-        else if (host_run       && par_run_fw)            cpu_run <= 1'b1;
-        else if (cpu_run && cpu_done)                     cpu_run <= 1'b0;
+        if (!rst_n)                       cpu_run <= 1'b0;
+        else if (uart_run_start)          cpu_run <= 1'b1;
+        else if (host_run)                cpu_run <= 1'b1;
+        else if (cpu_run && cpu_done)     cpu_run <= 1'b0;
     end
 
-    // Core-level busy/done are the OR of the two producers: exactly one is ever
-    // running, and everything downstream (host arbitration, perf window, the
-    // 'G'/status handshake) only cares that *something* is.
-    assign busy = su_busy  | cpu_busy;
-    assign done = su_done  | cpu_done;
+    assign busy = cpu_busy;
+    assign done = cpu_done;
 
     // ---- SRAM arbitration: the core has priority ----------------------------
     //   While a program runs (`busy`) the DMA engine owns the controller; while
@@ -348,7 +332,7 @@ module tpu_top #(
     assign mem_din       = busy ? dma_mem_din       : uart_mem_din;
     assign mem_din_valid = busy ? dma_mem_din_valid : 1'b1;
 
-    // ---- scalar_unit → LINK dispatch (comms left out — stubbed below) -------
+    // ---- LINK dispatch (comms left out — not implemented) --------------------
     logic                nb_start;
     logic [1:0]          nb_dir;
     logic [ADDR_W-1:0]   nb_src_addr, nb_dst_addr;
@@ -357,48 +341,6 @@ module tpu_top #(
     // =========================================================================
     // Scalar unit — control processor / ISA sequencer.
     // =========================================================================
-    scalar_unit #(
-        .XLEN       (XLEN),
-        .REG_AW     (REG_AW),
-        .IMEM_AW    (IMEM_AW),
-        .ADDR_W     (ADDR_W),
-        .MEM_ADDR_W (MEM_ADDR_W),
-        .CFG_AW     (CFG_AW),
-        .M0_W       (M0_W),
-        .N_W        (N_W)
-    ) u_scalar (
-        .clk   (clk),
-        .rst_n (rst_n),
-
-        .host_run   (su_host_run),
-        .boot_pc    (su_boot_pc),
-        .busy        (su_busy),
-        .done        (su_done),
-        .pc_dbg      (pc_dbg),
-        .wait_active (su_wait_active),
-        .imem_we    (su_imem_we),
-        .imem_waddr (su_imem_waddr),
-        .imem_wdata (su_imem_wdata),
-        .cfg_we     (cfg_we),
-        .cfg_waddr  (cfg_waddr),
-        .cfg_wdata  (cfg_wdata),
-
-        // Scratchpad scalar port (muxed with the CPU's window below)
-        .s_re    (su_s_re),
-        .s_we    (su_s_we),
-        .s_addr  (su_s_addr),
-        .s_wdata (su_s_wdata),
-        .s_rdata (s_rdata),
-        .s_rgnt  (su_s_rgnt),
-        .s_wgnt  (su_s_wgnt),
-
-        // Macro-op command push
-        .cmd_we    (su_cmd_we),
-        .cmd_unit  (su_cmd_unit),
-        .cmd_data  (su_cmd_data),
-        .cmd_full  (su_cmd_full),
-        .unit_idle (unit_idle)
-    );
 
     // =========================================================================
     // Command plane.
@@ -408,21 +350,24 @@ module tpu_top #(
     // of them is out of reset at a time ('G' picks). The mux exists so that stays
     // true by construction rather than by convention.
     // =========================================================================
-    assign p_cmd_we   = su_cmd_we | cpu_cmd_we;
-    assign p_cmd_unit = su_cmd_we ? su_cmd_unit : cpu_cmd_unit;
-    assign p_cmd_data = su_cmd_we ? su_cmd_data : cpu_cmd_data;
+    // One producer, so the arbiter is a rename. It stays as `p_cmd_*` because
+    // that is the name the sim-only command-trace monitor in the testbenches
+    // probes (docs/picorv32_migration.md §8.1), and because a second producer
+    // — a DMA descriptor engine, a second core — would reintroduce a mux here
+    // and nowhere else.
+    assign p_cmd_we   = cpu_cmd_we;
+    assign p_cmd_unit = cpu_cmd_unit;
+    assign p_cmd_data = cpu_cmd_data;
 
     always_comb begin
         unique case (p_cmd_unit)
             U_MXU:   p_cmd_full = mxu_cmd_full;
             U_VPU:   p_cmd_full = vpu_cmd_full;
-            U_DMA:   p_cmd_full = dma_cmd_full;
-            default: p_cmd_full = 1'b0;      // LINK: no queue, never backs up
+            default: p_cmd_full = dma_cmd_full;
         endcase
     end
 
-    assign su_cmd_full  = p_cmd_full;
-    assign cpu_cmd_full = p_cmd_full | su_cmd_we;   // loses arbitration => retry
+    assign cpu_cmd_full = p_cmd_full;
 
     assign mxu_cmd_we = p_cmd_we && (p_cmd_unit == U_MXU);
     assign vpu_cmd_we = p_cmd_we && (p_cmd_unit == U_VPU);
@@ -446,7 +391,7 @@ module tpu_top #(
         .mxu_tiled       (mxu_tiled),
         .mxu_a_row       (mxu_a_row),
         .mxu_c_row       (mxu_c_row),
-        .mxu_w_col       (mxu_w_col),
+        .mxu_w_row       (mxu_w_row),
         .mxu_k_tiles     (mxu_k_tiles),
         .mxu_n_tiles     (mxu_n_tiles),
         .mxu_accumulate  (mxu_accumulate),
@@ -521,15 +466,16 @@ module tpu_top #(
     );
 
     // ---- S port mux. Scalar unit first; the CPU re-presents when it loses. ---
-    assign s_re    = su_s_re | cpu_s_re;
-    assign s_we    = su_s_we | cpu_s_we;
-    assign s_addr  = (su_s_re || su_s_we) ? su_s_addr  : cpu_s_addr;
-    assign s_wdata = su_s_we              ? su_s_wdata : cpu_s_wdata;
+    // The scalar port has one requester now (the CPU's scratchpad window), so
+    // this is a straight connection rather than a priority mux.
+    assign s_re    = cpu_s_re;
+    assign s_we    = cpu_s_we;
+    assign s_addr  = cpu_s_addr;
+    assign s_wdata = cpu_s_wdata;
 
-    assign su_s_rgnt  = s_rgnt && su_s_re;
-    assign su_s_wgnt  = s_wgnt && su_s_we;
-    assign cpu_s_rgnt = s_rgnt && cpu_s_re && !su_s_re;
-    assign cpu_s_wgnt = s_wgnt && cpu_s_we && !su_s_we;
+    assign cpu_s_rgnt = s_rgnt;
+    assign cpu_s_wgnt = s_wgnt;
+
 
     // nb_* dispatch outputs are intentionally unconnected: no comms block is
     // integrated yet. Its `nb_done` input is tied high above so a program that
@@ -537,7 +483,7 @@ module tpu_top #(
     // now wired to the real DMA engine below.
 
     // =========================================================================
-    // MXU — weight-stationary ternary systolic matrix unit.
+    // MXU — weight-stationary int4 systolic matrix unit.
     // =========================================================================
     mxu #(
         .ROWS   (ROWS),
@@ -558,7 +504,7 @@ module tpu_top #(
         .tiled       (mxu_tiled),
         .a_row       (mxu_a_row),
         .c_row       (mxu_c_row),
-        .w_col       (mxu_w_col),
+        .w_row       (mxu_w_row),
         .k_tiles     (mxu_k_tiles),
         .n_tiles     (mxu_n_tiles),
         .accumulate  (mxu_accumulate),
@@ -860,7 +806,7 @@ module tpu_top #(
         perf_ev[PERF_MLOAD]  = mxu_load_active;
         perf_ev[PERF_VPU]    = vpu_busy;
         perf_ev[PERF_DMA]    = dma_busy;
-        perf_ev[PERF_SWAIT]  = su_wait_active;
+        perf_ev[PERF_SWAIT]  = 1'b0;   // was the scalar unit's issue-and-wait stall
         perf_ev[PERF_VMM]    = vpu_mm_busy;
         perf_ev[PERF_IDLEC]  = (n_busy == 2'd0);
         perf_ev[PERF_QFULL]  = p_cmd_we & p_cmd_full;
@@ -946,12 +892,12 @@ module tpu_top #(
         .sram_busy  (mem_busy),
         .sram_done  (mem_done),
 
-        // instruction-memory write → scalar unit (OR'd into su_imem_* above)
+        // instruction-memory write → firmware RAM (OR'd into fw_* above)
         .imem_we    (uart_imem_we),
         .imem_waddr (uart_imem_waddr),
         .imem_wdata (uart_imem_wdata),
 
-        // run trigger → scalar unit (OR'd into su_host_run above)
+        // run trigger → CPU (releases cpu_run above)
         .run_start (uart_run_start),
         .run_pc    (uart_run_pc),
 

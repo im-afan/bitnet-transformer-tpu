@@ -3,10 +3,12 @@ from typing import List, Tuple
 import torch
 
 VOCAB = {str(i): i for i in range(10)}
-INV_VOCAB = {v: k for k, v in VOCAB.items()}
 PAD_TOKEN = 'N'
 PAD_ID = 12
 VOCAB.update({'+': 10, '=': 11, 'N': PAD_ID})
+# After the update, not before it: built from the ten digits alone, `detokenize`
+# raised KeyError on every '+', '=' and 'N' it was handed.
+INV_VOCAB = {v: k for k, v in VOCAB.items()}
 MAX_INTEGER = 99999
 MIN_TOKEN_LENGTH = 5  # e.g. "0+0=0"
 EQUALS_POS = 15

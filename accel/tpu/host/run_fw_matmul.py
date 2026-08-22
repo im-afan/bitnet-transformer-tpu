@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """run_fw_matmul.py — run a C firmware matmul (``../fw/*.c``) on the board.
 
-Same shape as :mod:`run_program`, but the producer is the PicoRV32 rather than
-the scalar unit, so there is no assembler and no ISS in the loop:
+The board-side counterpart of `make -C ../tb fw`: the PicoRV32 is the producer,
+so there is no assembler and no ISS in the loop:
 
   1. read the built firmware image (``fw/matmul.hex``, one word per line);
   2. build the A and W operands and a plain-Python reference for ``A @ W``;
@@ -16,7 +16,7 @@ the scalar unit, so there is no assembler and no ISS in the loop:
      result back and compare it to the reference.
 
 The geometry below must match ``fw/matmul.c``; it is the same problem
-``../../tpulang/examples/tiled_matmul_hw.tpu`` runs, so the two paths can be
+the retired ``tiled_matmul_hw.tpu`` ran, so historical numbers can be
 compared directly.
 
 ``fw/matmul_loop.c`` is the same problem with the tile grid walked in firmware
@@ -41,13 +41,10 @@ for _p in (HERE, TPULANG_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from gen_vectors import pack_wcol                             # noqa: E402
-from run_program import (                                     # noqa: E402
-    autodetect_port, contiguous_runs, probe_idle, report_run_time,
-    wait_until_idle,
-)
+from fw_vectors import a_val, operand_image, w_val            # noqa: E402
 from tpu_uart import (                                        # noqa: E402
-    FW_AW, FW_BASE, ProtocolError, TPUUart, parse_hex_program,
+    FW_AW, FW_BASE, ProtocolError, TPUUart, autodetect_port, contiguous_runs,
+    parse_hex_program, probe_idle, report_run_time, wait_until_idle,
 )
 
 DEFAULT_FW = os.path.normpath(os.path.join(HERE, "..", "fw", "matmul.hex"))
@@ -57,17 +54,17 @@ DEFAULT_FW = os.path.normpath(os.path.join(HERE, "..", "fw", "matmul.hex"))
 # another one (`make -C accel/tpu/fw M=... KTILES=... NTILES=...`).
 ROWS, COLS = 8, 8
 M, KTILES, NTILES = 8, 4, 2
-K = N = AROW = WCOL = CROW = C_BYTES = 0        # filled in by set_shape()
+K = N = AROW = WROW = CROW = C_BYTES = 0        # filled in by set_shape()
 
 A_ADDR, W_ADDR, C_ADDR = 0x0000, 0x2000, 0x4000
 
 
 def set_shape(m: int, ktiles: int, ntiles: int) -> None:
-    global M, KTILES, NTILES, K, N, AROW, WCOL, CROW, C_BYTES
+    global M, KTILES, NTILES, K, N, AROW, WROW, CROW, C_BYTES
     M, KTILES, NTILES = m, ktiles, ntiles
     K, N = KTILES * ROWS, NTILES * COLS
     AROW = K              # A row stride, bytes
-    WCOL = (K * 2) // 8   # W column stride, bytes (2-bit trits)
+    WROW = (N * 4) // 8   # W row stride, bytes (row-major int4)
     CROW = N * 4          # C row stride, bytes (int32)
     C_BYTES = M * N * 4
 
@@ -78,20 +75,14 @@ set_shape(M, KTILES, NTILES)
 def build_operands() -> tuple[dict, list, list]:
     """DRAM image ``{addr: byte}`` plus the two matrices, as plain lists.
 
-    ``w_full[n][k]`` is W[k][n] — the weights are column-major on the wire
-    because the array loads a whole contraction column per clock.
+    The image comes from `fw_vectors.operand_image`, which is also what the
+    simulation vectors are built from — one definition of the layout, so a board
+    run and `make fw` cannot be staging different bytes. ``w_full[n][k]`` is
+    W[k][n]; the *wire* layout is row-major int4 and lives in that function.
     """
-    a_full = [[((m * 3 + k * 5) % 9) - 4 for k in range(K)] for m in range(M)]
-    w_full = [[((k + 3 * n) % 3) - 1 for k in range(K)] for n in range(N)]
-
-    img: dict[int, int] = {}
-    for m in range(M):
-        for k in range(K):
-            img[A_ADDR + m * AROW + k] = a_full[m][k] & 0xFF
-    for n in range(N):
-        for b, byte in enumerate(pack_wcol(w_full[n], WCOL)):
-            img[W_ADDR + n * WCOL + b] = byte & 0xFF
-    return img, a_full, w_full
+    a_full = [[a_val(m, k) for k in range(K)] for m in range(M)]
+    w_full = [[w_val(k, n) for k in range(K)] for n in range(N)]
+    return operand_image(M, K, N), a_full, w_full
 
 
 def reference(a_full: list, w_full: list) -> list:

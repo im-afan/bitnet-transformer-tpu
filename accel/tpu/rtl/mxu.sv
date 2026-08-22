@@ -1,13 +1,21 @@
 `timescale 1ns/1ps
 // -----------------------------------------------------------------------------
-// mxu.sv — TPU weight-stationary ternary systolic matrix unit
+// mxu.sv — TPU weight-stationary int4 systolic matrix unit
 //
 // Implements the block described in accel/tpu/docs/mxu.md: a ROWS x COLS
-// systolic array that computes the transformer's ternary-weight x int8-activation
+// systolic array that computes the transformer's int4-weight x int4-activation
 // projection GEMMs (Wq/Wk/Wv/Wo, FF fc1/fc2). Weights are stationary in the PEs;
-// int8 activations stream left->right; int32 partial sums flow top->bottom. With
-// ternary weights w in {-1,0,+1} each PE is a select+conditional-negate add, not a
-// multiplier (mxu.md §2) — see `ternary_product` below.
+// activations stream left->right; partial sums flow top->bottom.
+//
+// **Weights are int4, not ternary.** Each element is a 4-bit two's-complement
+// value in [-8, 7], two per byte — so a PE is a real signed multiply, not the
+// select+conditional-negate the ternary encoding allowed (mxu.md §2). See
+// `weight_product` below.
+//
+// Activations keep their **int8 container** even though the model's values are
+// int4: the A port, the DMA and every scratchpad activation buffer stay
+// byte-per-element, and only the *range* narrows. `requant8` below is what
+// enforces that range on store.
 //
 // Dispatched by the scalar unit (scalar_unit.sv OP_MATMUL) with the issue-and-wait
 // handshake: pulse `start` with {act_addr, weight_addr, out_addr, t_len,
@@ -16,8 +24,11 @@
 //   Matmul:  C[T x COLS] = A[T x d] @ W[d x COLS],   d = ROWS
 //
 // Phases (mxu.md §4), sequenced by the FSM:
-//   LOAD  stream the d x COLS ternary tile into the PE weight registers, one
-//         array-column (ROWS trits, 2-bit packed = W_rd width) per clock.
+//   LOAD  stream the ROWS x COLS int4 tile into the PE weight registers, one
+//         array-**row** (COLS nibbles, 4-bit packed = W_rd width) per clock.
+//         Weights are stored **row-major** (see the layout note below); for a
+//         square array this is the same port width and the same ROWS clocks the
+//         old column-major load took, only the fill order transposes.
 //   RUN   feed one activation token vector (d int8 = A_rd width) per clock into
 //         the array, injected staggered across rows by the input-skew buffer
 //         (row i delayed i cycles) so every contribution to an output element
@@ -29,12 +40,18 @@
 //         existing int32 partials are read back and summed first (contraction
 //         tiling, mxu.md §6).
 //
-// Numerics (mxu.md §5). Accumulate in int32 — worst case d*127 ~= 16k is well
-// inside int32, no mid-accumulate saturation. The store path optionally
-// **requantizes on store** (BitNet int32 -> int8): when `requant` is asserted the
-// final int32 element is rescaled by the fixed-point pair {M0, N} as
-// `clip((acc*M0 + round) >> N)` (the same math as requant.sv / vpu.sv
-// VOP_REQUANT) and written as int8; the {M0, N} word arrives in
+// Numerics (mxu.md §5). PSUM_W = 16 and the bound is `ROWS * |a|max * |w|max`.
+// With int4 on both sides that is ROWS*8*8 = 8192 at ROWS=128, comfortably
+// inside int16 — and *smaller* than the ternary array's ROWS*127*1 = 16256,
+// because narrowing the activation buys more than widening the weight costs.
+// The precondition is that activations really are int4: full int8 activations
+// against int4 weights would need ROWS <= 32, and every requant below clips to
+// [-8, 7] precisely so nothing in a chain of matmuls can violate it.
+//
+// The store path optionally **requantizes on store** (int32 -> int4 in an int8
+// container): when `requant` is asserted the final element is rescaled by the
+// fixed-point pair {M0, N} as `clip((acc*M0 + round) >> N)` (the same math as
+// vpu.sv VOP_REQUANT) and written as one byte; the {M0, N} word arrives in
 // the dispatch's own `rq_word` field. When `requant` is clear the MXU writes int32 as
 // before — this is the mode intermediate contraction tiles use so `accumulate`
 // can keep running int32 partials in the result bank (mxu.md §6); the final tile
@@ -45,7 +62,7 @@
 // Memory / scratchpad ports (scratchpad.md §4). Synchronous reads: address/enable
 // presented one cycle, data valid the next (same contract as vpu.sv / scalar_unit).
 //   A_rd : one activation token vector per clock  (ROWS x int8  = ROWS*8 bits)
-//   W_rd : one weight array-column per clock       (ROWS trits  = ROWS*2 bits)
+//   W_rd : one weight array-row per clock          (COLS int4   = COLS*4 bits)
 //   C_rw : one int32 result row per clock          (COLS x int32 = COLS*32 bits)
 //          The doc lists C as a write port (C_wr); the accumulate/tiling path
 //          reads back the running partial, so it is exposed here as a read/write
@@ -53,14 +70,22 @@
 //
 // Scratchpad tile layouts assumed by the address arithmetic below:
 //   Activations  row-major  A[t][i] at act_addr    + t*ROWS + i           (int8)
-//   Weights      col-major  W[i][j] at weight_addr + j*(ROWS*2/8), 2-bit
-//                packed within the column: row i in bits [i*2 +: 2] (col-major so a
-//                whole array-column loads in one W_rd). Encoding (scratchpad.md §2):
-//                00 = 0, 01 = +1, 11 = -1.
+//   Weights      ROW-major  W[i][j] at weight_addr + i*(COLS*4/8), 4-bit
+//                packed within the row: col j in bits [j*4 +: 4], plain two's
+//                complement. A whole array-**row** loads in one W_rd.
 //   Results      row-major  C[t][j] at out_addr     + t*(COLS*4) + j*4     (int32)
 //
-// Validate bit-exactly against TernaryLinear in model/transformer.py: the array
-// computes the integer product A_int @ W_ternary (mxu.md §5); the model's absmean
+// **Weights were column-major and are now row-major.** For a square array the two
+// are interchangeable — same W_rd width, same ROWS==COLS clocks, the load loop
+// just fills the PE grid by row instead of by column — and row-major is the
+// layout the tooling naturally produces, so it removes a transpose rather than
+// adding one. The k/n tile steps swap roles accordingly (see wgt_ktile_step /
+// wgt_ntile_step). Nothing here assumes ROWS==COLS *except* that the W port is
+// sized off COLS while the load runs for ROWS clocks, which is the correct
+// generalization: a non-square array simply reads a COLS-wide row ROWS times.
+//
+// Validate bit-exactly against Int4Linear in model/transformer.py: the array
+// computes the integer product A_int @ W_int4 (mxu.md §5); the model's absmax/7
 // scale is folded in by the separate requant step.
 //
 // Skew note (mxu.md §8 open question): the input stagger uses dedicated triangular
@@ -82,7 +107,7 @@ module mxu #(
     // ---- Dispatch from the scalar unit (mxu.md §7) --------------------------
     input  logic              start,
     input  logic [ADDR_W-1:0] act_addr,     // activation tile base
-    input  logic [ADDR_W-1:0] weight_addr,  // ternary weight tile base
+    input  logic [ADDR_W-1:0] weight_addr,  // int4 weight tile base
     input  logic [ADDR_W-1:0] out_addr,     // result base (int32, or int8 if requant)
     // Requant {M0, N} as a LITERAL, not a scratchpad address. It is M0_W + N_W
     // = 16 bits, exactly the width of the address that used to point at it, so
@@ -104,7 +129,7 @@ module mxu #(
     //
     // `tiled` SELECTS THEM. With `tiled` low the strides are ignored outright
     // and the single-tile constants apply (a_row=ROWS, c_row=COLS*4,
-    // w_col=ROWS*2/8), which is exactly the behaviour they replaced. That is not
+    // w_row=COLS*4/8), which is exactly the behaviour they replaced. That is not
     // just for backward compatibility: config registers survive across runs (no
     // reset between programs), so a plain matmul keyed off "the strides happen
     // to be zero" would silently inherit whatever the *previous* program left in
@@ -122,7 +147,9 @@ module mxu #(
     input  logic              tiled,        // use the config strides below
     input  logic [ADDR_W-1:0] a_row,        // activation row stride, bytes (= K)
     input  logic [ADDR_W-1:0] c_row,        // int32 result row stride, bytes (= N*4)
-    input  logic [ADDR_W-1:0] w_col,        // weight column stride, bytes (= K*2/8)
+    // Row-major weights, so this is the stride between weight *rows* — the full
+    // matrix's output width, N*4/8 — where it used to be the column stride K*2/8.
+    input  logic [ADDR_W-1:0] w_row,        // weight row stride, bytes (= N*4/8)
 
     // ---- Tile counts (config; only with `tiled`) ----------------------------
     // How many array-sized tiles the operands span. With both 1 (or 0, which is
@@ -150,10 +177,10 @@ module mxu #(
     output logic [ADDR_W-1:0]   A_raddr,
     input  logic [ROWS*8-1:0]   A_rdata,     // valid the cycle after A_re
 
-    // ---- Scratchpad W_rd port (weight load, ROWS x 2-bit) -------------------
+    // ---- Scratchpad W_rd port (weight load, COLS x 4-bit) -------------------
     output logic                W_re,
     output logic [ADDR_W-1:0]   W_raddr,
-    input  logic [ROWS*2-1:0]   W_rdata,     // valid the cycle after W_re
+    input  logic [COLS*4-1:0]   W_rdata,     // valid the cycle after W_re
 
     // ---- Scratchpad C_rw port (int32 result row, COLS x int32) --------------
     // Also carries the accumulate readback and the one-shot requant {M0, N}
@@ -171,18 +198,27 @@ module mxu #(
     // -------------------------------------------------------------------------
     // Local widths / derived constants.
     // -------------------------------------------------------------------------
-    localparam int ACT_W         = 8;                 // activation element, int8
-    localparam int WT_W          = 2;                 // weight element, packed trit
-    localparam int PSUM_W        = 16;                // partial-sum accumulator, int32
+    localparam int ACT_W         = 8;                 // activation element, int8 container
+    localparam int WT_W          = 4;                 // weight element, int4 two's complement
+    localparam int PSUM_W        = 16;                // partial-sum accumulator
     localparam int TOK_W         = 5;                 // EXPERIMENT: 32 token slots
     localparam int MAX_TOKENS    = (1 << TOK_W);      // result-buffer token depth
-    localparam int WGT_COL_BYTES = (ROWS * WT_W) / 8; // bytes per packed weight column
+    localparam int WGT_ROW_BYTES = (COLS * WT_W) / 8; // bytes per packed weight row
     localparam int RES_ROW_BYTES = COLS * 4;          // bytes per int32 result row
     localparam int RQ_ROW_BYTES  = COLS;              // bytes per int8 (requant) result row
     localparam int REQUANT_W     = 48;                // requant intermediate width (headroom)
 
-    // int32 -> int8 requantize: clip((acc*m0 + round) >> n). Mirrors requant.sv /
-    // vpu.sv requant8 (signed accumulator, int8 clip). m0 is a positive scale.
+    // The int4 activation range every requant lands in. Not the int8 container's
+    // range: an activation that left this unit at 100 would be a legal byte and
+    // an illegal operand, and the next matmul would overflow PSUM_W rather than
+    // saturate. Clipping here is what makes the accumulator bound above true by
+    // construction, and it is the same clip model/transformer.py's ActQuant
+    // applies (INT4_QMIN / INT4_QMAX).
+    localparam int ACT_QMIN      = -8;
+    localparam int ACT_QMAX      = 7;
+
+    // int32 -> int4 requantize: clip((acc*m0 + round) >> n), written into an int8
+    // container (sign-extended). Mirrors vpu.sv requant8. m0 is a positive scale.
     function automatic logic [7:0] requant8(input logic signed [PSUM_W-1:0] acc_i32,
                                             input logic [M0_W-1:0]          mult_m0,
                                             input logic [N_W-1:0]           shift_n);
@@ -190,20 +226,20 @@ module mxu #(
         product    = acc_i32 * $signed({1'b0, mult_m0});
         round_bias = (shift_n == 0) ? '0 : (REQUANT_W'(1) <<< (shift_n - 1));
         shifted    = (product + round_bias) >>> shift_n;  // arithmetic (signed) shift
-        if (shifted >  127)      requant8 =  8'sd127;
-        else if (shifted < -128) requant8 = -8'sd128;
-        else                     requant8 = shifted[7:0];
+        if (shifted > ACT_QMAX)      requant8 = 8'(signed'(ACT_QMAX));
+        else if (shifted < ACT_QMIN) requant8 = 8'(signed'(ACT_QMIN));
+        else                         requant8 = shifted[7:0];
     endfunction
 
-    // Ternary product: select + conditional negate, no multiplier (mxu.md §2).
-    // wt[0] = nonzero flag, wt[1] = sign. Encoding 00 = 0, 01 = +1, 11 = -1.
-    function automatic logic signed [PSUM_W-1:0] ternary_product(
+    // int4 weight x int8 activation. A real signed multiply — the ternary
+    // encoding's select+conditional-negate is gone with the encoding (mxu.md §2),
+    // and this is the one place the int4 migration costs area rather than saving
+    // it. Both operands are sign-extended to PSUM_W and the product is exact:
+    // |a|max * |w|max = 127*8 fits in 11 bits, so no intermediate width is lost.
+    function automatic logic signed [PSUM_W-1:0] weight_product(
             input logic signed [ACT_W-1:0] act,
-            input logic [1:0]              wt);
-        logic signed [PSUM_W-1:0] act_ext;
-        act_ext = PSUM_W'(act);
-        if (!wt[0]) ternary_product = '0;
-        else        ternary_product = wt[1] ? -act_ext : act_ext;
+            input logic signed [WT_W-1:0]  wt);
+        weight_product = PSUM_W'(act) * PSUM_W'(wt);
     endfunction
 
     // -------------------------------------------------------------------------
@@ -227,7 +263,7 @@ module mxu #(
     // then match the rest of the latched dispatch state.
     logic [ADDR_W-1:0] act_row_stride;   // bytes between activation rows
     logic [ADDR_W-1:0] res_row_stride;   // bytes between int32 result rows
-    logic [ADDR_W-1:0] wgt_col_stride;   // bytes between packed weight columns
+    logic [ADDR_W-1:0] wgt_row_stride;   // bytes between packed weight rows
     // int8 store stride for a requantized writeback: res_row_stride/4 (see the
     // port comment). Only meaningful when requant_mode.
     wire  [ADDR_W-1:0] res_row_stride_i8 = res_row_stride >> 2;
@@ -238,10 +274,15 @@ module mxu #(
     // Running operand bases, stepped at tile boundaries rather than recomputed
     // with a multiplier per access.
     logic [ADDR_W-1:0] act_tile_base;    // act_base + k_tile_idx*ROWS
-    logic [ADDR_W-1:0] wgt_ntile_base;   // wgt_base + n_tile_idx*COLS*w_col (n-tile origin)
-    logic [ADDR_W-1:0] wgt_tile_base;    // wgt_ntile_base + k_tile_idx*WGT_COL_BYTES
+    // Row-major weights swap what the two tile axes cost. An n-tile is a step
+    // *along* a row (COLS more elements = WGT_ROW_BYTES, a constant); a k-tile is
+    // a step *down* ROWS whole rows (ROWS*w_row, which needs the stride). Under
+    // the old column-major layout it was exactly the other way round.
+    logic [ADDR_W-1:0] wgt_ntile_base;   // wgt_base + n_tile_idx*WGT_ROW_BYTES (n-tile origin)
+    logic [ADDR_W-1:0] wgt_tile_base;    // wgt_ntile_base + k_tile_idx*ROWS*w_row
     logic [ADDR_W-1:0] out_tile_base;    // out_base + n_tile_idx*COLS*(4 or 1)
-    logic [ADDR_W-1:0] wgt_ntile_step;   // COLS*wgt_col_stride, computed once at dispatch
+    logic [ADDR_W-1:0] wgt_ntile_step;   // WGT_ROW_BYTES
+    logic [ADDR_W-1:0] wgt_ktile_step;   // ROWS*wgt_row_stride, computed once at dispatch
     logic [ADDR_W-1:0] out_ntile_step;   // COLS*4 (int32) or COLS (requant int8)
 
     // Stride selection, as combinational wires so the dispatch latch and the
@@ -250,8 +291,8 @@ module mxu #(
         (!tiled || a_row == '0) ? ADDR_W'(ROWS)           : a_row;
     wire [ADDR_W-1:0] res_row_stride_sel =
         (!tiled || c_row == '0) ? ADDR_W'(RES_ROW_BYTES)  : c_row;
-    wire [ADDR_W-1:0] wgt_col_stride_sel =
-        (!tiled || w_col == '0) ? ADDR_W'(WGT_COL_BYTES)  : w_col;
+    wire [ADDR_W-1:0] wgt_row_stride_sel =
+        (!tiled || w_row == '0) ? ADDR_W'(WGT_ROW_BYTES)  : w_row;
 
     wire k_tile_last = (k_tile_idx == k_tile_count - 8'd1);
     wire n_tile_last = (n_tile_idx == n_tile_count - 8'd1);
@@ -339,8 +380,8 @@ module mxu #(
 
         unique case (state)
             S_LOAD: begin
-                W_re    = (wgt_req_cnt < COLS);
-                W_raddr = wgt_tile_base + ADDR_W'(wgt_req_cnt * wgt_col_stride);
+                W_re    = (wgt_req_cnt < ROWS);
+                W_raddr = wgt_tile_base + ADDR_W'(wgt_req_cnt * wgt_row_stride);
             end
             S_RUN: begin
                 A_re    = (act_req_cnt < {10'b0, tok_count});
@@ -384,7 +425,7 @@ module mxu #(
                          if (t_len == 0) state_n = S_DONE;
                          else            state_n = S_LOAD;
                      end
-            S_LOAD:  if (wgt_rcv_cnt == COLS) state_n = S_RUN;
+            S_LOAD:  if (wgt_rcv_cnt == ROWS) state_n = S_RUN;
             // End of a contraction tile. If more remain, go straight back to
             // LOAD for the next weight tile with the partials still sitting in
             // result_buf — the scratchpad is not touched between tiles. Only
@@ -424,7 +465,7 @@ module mxu #(
     logic [TOK_W-1:0]         in_tok;    // token id riding along with in_act
     logic                     in_valid;  // in_act carries a real activation
     logic signed [PSUM_W-1:0] in_psum;   // from the row above (0 at the top row)
-    logic signed [PSUM_W-1:0] out_psum;  // in_psum + this PE's ternary product
+    logic signed [PSUM_W-1:0] out_psum;  // in_psum + this PE's int4 product
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -454,7 +495,7 @@ module mxu #(
                     requant_mode   <= requant;
                     act_row_stride <= act_row_stride_sel;
                     res_row_stride <= res_row_stride_sel;
-                    wgt_col_stride <= wgt_col_stride_sel;
+                    wgt_row_stride <= wgt_row_stride_sel;
 
                     // Tile loop. A count of 0 reads as 1 so an unset config
                     // register is a plain single-tile matmul rather than a
@@ -467,8 +508,10 @@ module mxu #(
                     wgt_ntile_base <= weight_addr;
                     wgt_tile_base  <= weight_addr;
                     out_tile_base  <= out_addr;
-                    // Per-output-tile steps: one array width along each axis.
-                    wgt_ntile_step <= ADDR_W'(COLS) * wgt_col_stride_sel;
+                    // Per-tile steps: one array width along each axis. Both are
+                    // resolved here so neither address path carries a multiplier.
+                    wgt_ntile_step <= ADDR_W'(WGT_ROW_BYTES);
+                    wgt_ktile_step <= ADDR_W'(ROWS) * wgt_row_stride_sel;
                     out_ntile_step <= requant ? ADDR_W'(RQ_ROW_BYTES)
                                               : ADDR_W'(RES_ROW_BYTES);
                     expected_completions <= 16'(t_len) * 16'(COLS);
@@ -484,14 +527,17 @@ module mxu #(
                 end
 
                 // -------------------------------------------------------------
-                // Weight load: one array-column (ROWS trits) per clock.
+                // Weight load: one array-row (COLS int4) per clock. The counter
+                // walks ROWS now, and the received word scatters across the
+                // *columns* of one PE row — the transpose of the column-major
+                // load, and the only thing the layout change costs.
                 S_LOAD: begin
-                    if (wgt_req_cnt < COLS) wgt_req_cnt <= wgt_req_cnt + 16'd1;
-                    wgt_rd_inflight <= (wgt_req_cnt < COLS);
+                    if (wgt_req_cnt < ROWS) wgt_req_cnt <= wgt_req_cnt + 16'd1;
+                    wgt_rd_inflight <= (wgt_req_cnt < ROWS);
                     if (wgt_rd_inflight) begin
-                        for (row_i = 0; row_i < ROWS; row_i++)
-                            pe_weight[row_i][wgt_rcv_cnt[$clog2(COLS)-1:0]]
-                                <= W_rdata[row_i*WT_W +: WT_W];
+                        for (col_j = 0; col_j < COLS; col_j++)
+                            pe_weight[wgt_rcv_cnt[$clog2(ROWS)-1:0]][col_j]
+                                <= W_rdata[col_j*WT_W +: WT_W];
                         wgt_rcv_cnt <= wgt_rcv_cnt + 16'd1;
                     end
                 end
@@ -534,8 +580,8 @@ module mxu #(
                                                     : pe_act_valid[row_i][col_j-1];
                             in_psum  = (row_i == 0) ? '0
                                                     : pe_psum[row_i-1][col_j];
-                            out_psum = in_psum + ternary_product(in_act,
-                                                                 pe_weight[row_i][col_j]);
+                            out_psum = in_psum + weight_product(in_act,
+                                                                pe_weight[row_i][col_j]);
 
                             pe_act[row_i][col_j]       <= in_act;
                             pe_tok[row_i][col_j]       <= in_tok;
@@ -564,7 +610,7 @@ module mxu #(
                     if (completions == expected_completions && !k_tile_last) begin
                         k_tile_idx    <= k_tile_idx    + 8'd1;
                         act_tile_base <= act_tile_base + ADDR_W'(ROWS);
-                        wgt_tile_base <= wgt_tile_base + ADDR_W'(WGT_COL_BYTES);
+                        wgt_tile_base <= wgt_tile_base + wgt_ktile_step;
                     end
                 end
 
