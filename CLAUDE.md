@@ -16,14 +16,21 @@ branch reacted to. The `qat` branch settles it: with the quantizers in the graph
 training, the same kernel scores 100% exact-sequence. See
 [The int8 finding](#the-int8-finding-and-why-the-model-keeps-changing).
 
+**`model/` has since moved to int4 and `accel/` has not.** `adder_int4_vanilla` (`d=64`,
+`f=256`, `layers=4`) uses int4 weights *and* int4 activations, which the MXU — ternary
+weight × int8 activation — cannot run. This is a training experiment: the question is
+only whether the model fits at 4 bits. Everything under `accel/`, plus `model/quant.py`
+and `model/calibrate.py`, still describes the ternary/int8 model and is stale against
+`model/transformer.py` until someone reconciles them.
+
 ## Commands
 
 Python is a package rooted at the repo, so **run from the repo root** with `-m` so imports
 resolve (`import model.transformer`, etc.):
 
 ```bash
-python -m model.train --arch ternary_vanilla    # train (arch: vanilla | gqa | ternary_vanilla)
-python -m model.tests.test_inference --arch ternary --model-path model/saved/colab_ternary_mha_small.pt
+python -m model.train --arch int4_vanilla       # train (arch: vanilla | gqa | int4_vanilla)
+python -m model.tests.test_inference --arch int4 --model-path model/saved/colab_ternary_mha_small.pt
 python -m model.calibrate --model-path model/saved/colab_ternary_mha_small.pt   # int8 act scales
 python -m model.quant --model-path model/saved/ternary_mha.pt  # int8 accuracy bench
 python accel/cuda/tests/test_cuda_mha.py        # CUDA kernel vs. its own reference — needs a GPU
@@ -56,8 +63,10 @@ added to it.
 K/V, the removal of the positional encoding, the ternary output head and `layers=4`**. It
 no longer loads at all: `fc.weight` is an unexpected key against a `TernaryLinear` head, so
 `adder_export.load_model` raises instead of silently scoring a half-random network. **The
-model needs retraining** — `python -m model.train --arch ternary_vanilla` — before any
-accuracy number in this file or in `adder_kernel.md` means anything again.
+model needs retraining** before any accuracy number in this file or in `adder_kernel.md`
+means anything again — and there is currently **no ternary arch to retrain it with**:
+`adder_ternary_vanilla` was replaced by the int4 `adder_int4_vanilla`, so restoring the
+ternary/int8 path means restoring that factory (git history) first.
 The three `colab_ternary_mha_small*.pt` are committed but **deleted in the working tree**, so
 any command naming one fails with `FileNotFoundError` until it is restored from git; the old
 `colab_vanilla_mha.pt` / `colab_gqa.pt` / `colab_ternary_mha.pt` were deleted. `test_inference.py`
@@ -106,15 +115,12 @@ what is in the tree, not what `model/README.md` describes (that file is stale �
 - **ReLU attention, not softmax.** `P = relu(S + causal_mask)`, with the mask built as
   `triu(ones([T,T]) * -1e9, diagonal=1)`. There is no normalization over the source axis at
   all. (The comment in the code says "revert to softmax if training bad".)
-- **K and V are ternary activations; Q and the attention matrix are int8.** `q_kt`/`q_vt`
-  are `TernaryQuant` sites (an `ActQuant` with `qmax=1`, seeded from the absmean rather
-  than the absmax) applied *on top of* the int8 `q_k`/`q_v`. That is not a compression
-  choice — the MXU multiplies an int8 activation by a **ternary weight** and cannot
-  multiply int8 by int8 at all, so ternarizing exactly the operand that lands on the
-  weight side (K in `Q@K^T`, V in `P@V`) is what moved both attention matmuls off the
-  VPU's serial `vecmatmul` and onto the array. See `adder_kernel.md` §2.5. The two-stage
-  narrow is the hardware's: `matmul_t.rq` lands int8, then a `tquant` pass rounds onto
-  the trit grid, and V transposes between the two because the DMA moves bytes.
+- **Every activation is int4, K and V included.** The old `q_kt`/`q_vt` — a second narrow
+  rounding K and V onto `{-1,0,1}` on top of the int8 `q_k`/`q_v` — are **gone**, and so is
+  the `TernaryQuant` helper. They existed only because the MXU multiplies an int8 activation
+  by a ternary *weight* and cannot multiply int8 by int8, so the operand landing on the
+  weight side had to be a trit (`adder_kernel.md` §2.5). With weights and activations at the
+  same width the second rounding does nothing but lose precision.
 - **There is no positional encoding.** `Model.positional_encoding` is gone and
   `Model.forward` embeds and nothing else. The only position signal left is the causal
   mask; ReLU attention has no source-axis normalization, so the magnitude of `P @ V`
@@ -133,37 +139,40 @@ what is in the tree, not what `model/README.md` describes (that file is stale �
   so a reimplementation must reproduce it.
 - **The padding mask is threaded through and never applied.** `attn_mask` reaches
   `MultiHeadAttention.forward` and is unused; only the causal mask is applied.
-- **Ternary (BitNet-style) weights.** `TernaryLinear` quantizes weights to {-1,0,1} scaled by
-  absmean, with `RoundClip` providing a straight-through-estimator backward. Note the weight is
-  `[in_dim, out_dim]` with `x @ w` — the *transpose* of `nn.Linear`, so ternary and non-ternary
-  checkpoints are not interchangeable. `make_linear(..., use_ternary)` selects it — **including `Model.fc`**, so in a
-  ternary config every weight in the model is a trit and the output head runs on the MXU
-  as a `matmul_t` like any projection. That was the last `vecmatmul` in the shipped
-  kernel; `vecmatmul`/`vecdot` now have no caller in it at all. A non-ternary config
-  (`adder_vanilla`, `adder_gqa`) still gets an `nn.Linear` head, which is the only thing
-  `quantize_head` / `dynamic_fake_quant` still apply to. The head's output is never
-  requantized — an argmax does not care about scale — so unlike every other weight its
-  absmean never appears in a requant word.
-- **int8 activation quantization is now QAT, not post-hoc.** Every requant site is an
+- **int4 weights.** `Int4Linear` quantizes weights to `[-8, 7]` scaled by `absmax/7`, with
+  `RoundClip` (now taking explicit `qmin`/`qmax`) providing the straight-through-estimator
+  backward. The scale is **detached** — an absmax gradient lands entirely on one element —
+  unlike `TernaryLinear`, whose absmean averages over the tensor and can stay live. The
+  weight is `[in_dim, out_dim]` with `x @ w`, the *transpose* of `nn.Linear`, so int4 and
+  float checkpoints are not interchangeable. `make_linear(..., use_int4)` selects it —
+  **including `Model.fc`**. A float config (`adder_vanilla`, `adder_gqa`) still gets an
+  `nn.Linear` head, which is the only thing `quantize_head` / `dynamic_fake_quant` still
+  apply to. The head's output is never requantized — an argmax does not care about scale.
+  `TernaryLinear` is retained but **no config builds one**; it is what `model/quant.py` and
+  the `accel/` export path import.
+- **int4 activation quantization is QAT, not post-hoc.** Every requant site is an
   `ActQuant` module holding one per-tensor scale, learned by LSQ (`FakeQuant` implements the
   straight-through input gradient and the analytic scale gradient). Sites the hardware *pins*
   to another tensor's scale share one `ActQuant` **instance** — `q_o`/`q_xo` are the residual
   stream's `x_quant`, `q_p is q_s`, `q_hr is q_h` — so the sharing in `__init__` is load-bearing,
-  not a shorthand. DyT outputs are pinned to `fixed_scale=1/127` (`hardtanh` bounds them
-  analytically) with `qmin=-127`, because `vpu.sv`'s `dyt` clips symmetrically and hardtanh is
-  odd, and the two ternary sites use `qmin=-1, qmax=1`, which is `vpu.sv`'s `tquant`.
-  `set_quant_enabled(model, False)` turns them all off — **necessary to get a real float
-  baseline**, since they are live by default. `TernaryLinear.act_scale` is the *old* PTQ buffer
-  and is now vestigial (NaN in the QAT checkpoints); `model/calibrate.py` drives that dead path.
+  not a shorthand. The default grid is `INT4_QMIN, INT4_QMAX = -8, 7`. DyT outputs are pinned
+  to `fixed_scale=1/7` (`hardtanh` bounds them analytically) with `qmin=-7`, symmetric because
+  hardtanh is odd. `set_quant_enabled(model, False)` turns them all off — **necessary to get a
+  real float baseline**, since they are live by default. `TernaryLinear.act_scale` is the *old*
+  PTQ buffer and is vestigial; `model/calibrate.py` drives that dead path.
 - **MoE is gone** — the `use_moe` expert FFN was removed, along with the vanilla/GQA checkpoints.
-- **Named configs** at the bottom (`adder_vanilla`, `adder_gqa`, `adder_ternary_vanilla`) are
+- **Named configs** at the bottom (`adder_vanilla`, `adder_gqa`, `adder_int4_vanilla`) are
   the source of truth for hyperparameters and are wired to the `--arch` choices in `train.py`.
-  `adder_ternary_vanilla` is now `d=128, f=128, layers=4, q_heads=kv_heads=4, use_bias=False`
-  — `f` dropped from 512, and the biases are off because the TPU's VPU has no row-broadcast
-  operand (see the comment on that factory and `accel/tpulang/tpunn.md`). **Depth went 4 → 2
-  → 4**: the QAT retrain fitted at two layers, and then ternary K/V plus a ternary head cost
-  more accuracy than two layers could carry. The kernel follows automatically — `.equ LAYERS`
-  is the only thing that moves, and the instruction count does not change with it.
+  `adder_int4_vanilla` is `d=64, f=256, layers=4, q_heads=kv_heads=4` (so `head_dim=16`),
+  `use_int4=True, use_bias=False`. The biases are off because the TPU's VPU has no
+  row-broadcast operand (see the comment on that factory and `accel/tpulang/tpunn.md`).
+  It replaced `adder_ternary_vanilla` (`d=128, f=128`, ternary weights, int8 activations) —
+  **the `accel/` stack has not followed.** The MXU takes a ternary weight and an int8
+  activation, so the shipped kernel cannot run this model at all; `adder_export.py`,
+  `gen_adder_model.py`, `torch_ref.py`, `examples/adder_model.tpu` and `model/quant.py`
+  all still describe the ternary/int8 shape, and `adder_export.py` / `model/calibrate.py`
+  now fail on the missing `adder_ternary_vanilla` rather than exporting something wrong.
+  This is deliberate: int4 is a **training experiment**, not a hardware change.
 
 **`model/numbers_data.py`** — synthetic dataset. Non-obvious invariants:
 
@@ -332,8 +341,9 @@ When touching attention numerics, keep the implementations in sync: `model/trans
 > `model/saved/ternary_mha.pt` was fitted with int8 K and V, a positional encoding and
 > `vecmatmul` attention; it has no `q_kt`/`q_vt` and its weights never saw a ternary K,
 > so `adder_export.py` on it no longer measures the shipped kernel. **The model needs
-> retraining** (`python -m model.train --arch ternary_vanilla`) before rows 8-10 of
-> `adder_kernel.md` §7 can be repeated. `QATCalibration` now falls back to the
+> retraining** before rows 8-10 of `adder_kernel.md` §7 can be repeated, and the ternary
+> config that would train it no longer exists — see the note at the top of this file.
+> `QATCalibration` now falls back to the
 > calibration set for any site whose `ActQuant.initialized` flag is clear, so a stale
 > checkpoint degrades rather than silently quantizing with a scale of 1.0. Everything
 > below about *why* PTQ fails here is unaffected by the change.

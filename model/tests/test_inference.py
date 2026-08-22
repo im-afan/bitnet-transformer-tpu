@@ -21,7 +21,7 @@ def time_func(f, samples, *args, **kwargs):
 # choose architecture
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--arch', choices=['vanilla', 'gqa', 'ternary'], default='ternary', help='Which adder architecture to use')
+parser.add_argument('--arch', choices=['vanilla', 'gqa', 'int4'], default='int4', help='Which adder architecture to use')
 parser.add_argument('--model-path', type=str, default='saved/colab_ternary_mha_small.pt')
 args = parser.parse_args()
 
@@ -30,7 +30,7 @@ if args.arch == 'gqa':
 elif args.arch == 'vanilla':
 	model = transformer.adder_vanilla()
 else:
-	model = transformer.adder_ternary_vanilla()
+	model = transformer.adder_int4_vanilla()
 
 state = torch.load(args.model_path, map_location="cpu")
 model.load_state_dict(state)

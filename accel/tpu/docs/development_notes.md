@@ -1,0 +1,9 @@
+- 8/21: decided to keep hardware tiling due to cpu overhead
+- considering switching to int4 for both weight & activation (W4A4) for simplicity of shapes (I don't like having to either use vpu or requant to ternary for attention)
+    - also switch to both A and W matrices row-major for simplicity, transposing W in scratchpad is unneccessary for a square mxu (row by row vs col by col)
+    - mxu shouldn't take that much more space? it seemed like most LUT it came from resbuf and not the compute
+    - enough memory - at d=64, f=256, L=4, T=32, B=8, weights are 98 KB and KV cache is 131 KB
+    - need retrain & modify transformer.py
+    - challenge: SRAM read is 8 bit, how to do transposed DMA without throwing away bandwidth?
+- todo: look closer at how dma works for einsum
+- todo: overlapping compute & dma

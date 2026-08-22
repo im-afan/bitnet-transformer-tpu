@@ -114,7 +114,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--arch",
-        choices=["vanilla", "gqa", "ternary_vanilla"],
+        choices=["vanilla", "gqa", "int4_vanilla"],
         default="vanilla",
         help="Which adder architecture to use",
     )
@@ -145,9 +145,9 @@ if __name__ == "__main__":
         model = transformer.adder_gqa()
     elif args.arch == "vanilla":
         model = transformer.adder_vanilla()
-    # elif args.arch == "ternary_vanilla":
+    # elif args.arch == "int4_vanilla":
     else:
-        model = transformer.adder_ternary_vanilla()
+        model = transformer.adder_int4_vanilla()
 
     optim = Adam(model.parameters(), lr=1e-3)
     train(

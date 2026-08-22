@@ -15,28 +15,44 @@ if torch.cuda.is_available():
 
 
 
+# Symmetric int4 grid. -8 is representable, but no scale is ever derived from
+# it: every scale here is absmax/qmax with qmax = 7, which is what ActQuant's
+# absmax init already does and what keeps the grid symmetric about zero.
+INT4_QMIN, INT4_QMAX = -8, 7
+
+
 class RoundClip(torch.autograd.Function):
+    """``round(x).clip(qmin, qmax)`` with a straight-through-estimator backward.
+
+    The STE passes gradient only where the input was inside the clip, so a
+    weight driven off the grid stops receiving it. ``(-1, 1)`` is
+    :class:`TernaryLinear`'s grid, ``(-8, 7)`` is :class:`Int4Linear`'s.
+    """
+
     @staticmethod
-    def forward(input):
-        return input.round().clip(-1, 1)
+    def forward(input, qmin, qmax):
+        return input.round().clip(qmin, qmax)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        (input,) = inputs
+        input, qmin, qmax = inputs
         ctx.save_for_backward(input)
+        ctx.qmin, ctx.qmax = qmin, qmax
 
     @staticmethod
     def backward(ctx, grad_output):
         (input,) = ctx.saved_tensors
-        return grad_output * (input.abs() <= 1)
+        inside = (input >= ctx.qmin) & (input <= ctx.qmax)
+        return grad_output * inside, None, None
 
 
 class FakeQuant(torch.autograd.Function):
     """Symmetric per-tensor fake quantization: ``round(x/s).clip(qmin,qmax) * s``.
 
     Returns the *dequantized* value so the surrounding math stays in real units;
-    only the representable grid changes. ``qmin`` is -128 for a ``requant`` site
-    and -127 for a ``dyt`` site (vpu.sv clips hardtanh symmetrically).
+    only the representable grid changes. ``qmin`` is -8 for a ``requant`` site
+    and -7 for a ``dyt`` site (the hardtanh clip is symmetric because hardtanh
+    is odd).
 
     Backward is LSQ (arxiv 1902.08153): straight-through for the input, and the
     analytic derivative w.r.t. the scalar step size, summed over the tensor
@@ -72,10 +88,10 @@ def dynamic_fake_quant(x, qmin=-128, qmax=127):
     """Per-tensor int8 fake-quant with a scale taken from the current absmax.
 
     For weights the hardware stores as plain int8, where the host derives the
-    scale at export time rather than learning it. The ternary configs no longer
-    have any: the output head became a :class:`TernaryLinear` too, so every
-    weight in `adder_ternary_vanilla` is a trit and this path is reached only by
-    the float `adder_vanilla` / `adder_gqa` configs (see `Model.forward`).
+    scale at export time rather than learning it. `adder_int4_vanilla` has none:
+    the output head is an :class:`Int4Linear` too, so every weight in it is int4
+    and this path is reached only by the float `adder_vanilla` / `adder_gqa`
+    configs (see `Model.forward`).
     """
     scale = (x.detach().abs().max() / qmax).clamp_min(1e-8)
     return FakeQuant.apply(x, scale, qmin, qmax, 0.0)
@@ -89,20 +105,18 @@ class ActQuant(nn.Module):
     sharing the same ``ActQuant`` instance, or by pinning ``fixed_scale``.
 
     ``fixed_scale=None`` learns the scale (LSQ), initialized from the absmax of
-    the first tensor that flows through. DyT outputs are pinned to ``1/127``
+    the first tensor that flows through. DyT outputs are pinned to ``1/7``
     instead: ``hardtanh`` bounds them to ``[-1, 1]`` analytically, so no
     calibration set is involved (``adder_kernel.md`` §4).
 
-    ``qmax=1`` makes the site **ternary** rather than int8 — the same symmetric
-    rounding onto ``{-1, 0, 1}`` that ``TernaryLinear`` does to a weight, and
-    the device op is ``tquant`` rather than ``requant``. A ternary site seeds
-    its scale from the **absmean**, not the absmax: with one nonzero level per
-    sign, an absmax seed rounds all but the single largest element to zero and
-    leaves LSQ climbing out of a dead gradient. Absmean is BitNet's rule and
-    the one ``TernaryLinear.forward`` already applies to a weight.
+    The default grid is symmetric **int4** (``[-8, 7]``). ``init="absmean"``
+    seeds from the absmean instead of the absmax, which is what a grid with
+    very few levels wants — an absmax seed rounds most of the tensor to zero
+    and leaves LSQ climbing out of a dead gradient.
     """
 
-    def __init__(self, qmin=-128, qmax=127, fixed_scale=None, init="absmax"):
+    def __init__(self, qmin=INT4_QMIN, qmax=INT4_QMAX, fixed_scale=None,
+                 init="absmax"):
         super().__init__()
         self.qmin = qmin
         self.qmax = qmax
@@ -121,7 +135,7 @@ class ActQuant(nn.Module):
 
         Exposed so a site can be seeded from a tensor other than the one it
         quantizes — ``RQ_S`` is seeded from the *post-mask, post-ReLU* scores,
-        because a large negative score clips to -128 and ReLU takes it to
+        because a large negative score clips to -8 and ReLU takes it to
         exactly zero, so spending range on it is pure waste.
         """
         if bool(self.initialized):
@@ -147,18 +161,6 @@ class ActQuant(nn.Module):
         return f"qmin={self.qmin}, qmax={self.qmax}, {kind}"
 
 
-def TernaryQuant():
-    """An :class:`ActQuant` that rounds onto ``{-1, 0, 1}`` — the device's ``tquant``.
-
-    Exists so a ternary *activation* site reads as what it is at the call site.
-    A ternary tensor is the operand the MXU takes as a **weight**, so
-    ternarizing K and V is what moves ``Q@K^T`` and ``P@V`` off the VPU's
-    ``vecmatmul`` — which runs one int8 dot product per output element, serially
-    — and onto the systolic array. See ``accel/tpulang/adder_kernel.md`` §2.5.
-    """
-    return ActQuant(qmin=-1, qmax=1, init="absmean")
-
-
 def set_quant_enabled(module, enabled):
     """Turn every quantization site on/off (float baseline vs. QAT)."""
     for m in module.modules():
@@ -169,6 +171,10 @@ def set_quant_enabled(module, enabled):
 
 class TernaryLinear(nn.Module):
     """Linear layer with 1.58-bit (ternary {-1, 0, 1}) weights, BitNet-style.
+
+    **No config builds one any more** — `adder_int4_vanilla` uses
+    :class:`Int4Linear`. It is kept because `model/quant.py` and the `accel/`
+    export path still model a ternary weight, and both import it.
 
     Weights are scaled by their absmean and rounded/clipped to {-1, 0, 1}.
     RoundClip provides a straight-through estimator for the backward pass.
@@ -204,16 +210,59 @@ class TernaryLinear(nn.Module):
         # here: on the TPU every input to a matmul is already an int8 tensor
         # left behind by the previous op's requant.
         scale = self.w.abs().mean() + self.eps
-        w_quant = RoundClip.apply(self.w / scale) * self.w.abs().mean()
+        w_quant = RoundClip.apply(self.w / scale, -1, 1) * self.w.abs().mean()
         out = x @ w_quant
         if self.bias is not None:
             out = out + self.bias
         return out
 
 
-def make_linear(in_dim, out_dim, use_ternary=False, bias=True):
-    if use_ternary:
-        return TernaryLinear(in_dim, out_dim, bias=bias)
+class Int4Linear(nn.Module):
+    """Linear layer with symmetric per-tensor int4 weights.
+
+    The int4 analogue of :class:`TernaryLinear`: one scale derived from the
+    weight itself, :class:`RoundClip` giving the straight-through backward, no
+    extra parameter and no calibration. Two differences from the ternary case:
+
+    - the scale is ``absmax / 7``, not the absmean. Absmean is BitNet's rule for
+      a grid with one nonzero level per sign; on 15 levels it puts most of the
+      grid past the end of the weight distribution.
+    - the scale is **detached**. ``absmax`` has a gradient that lands entirely
+      on one element, which is a spike, not a signal; ``TernaryLinear`` gets
+      away with a live scale because an absmean averages over the whole tensor.
+
+    The weight is ``[in_dim, out_dim]`` with ``x @ w`` — the *transpose* of
+    ``nn.Linear``, same as ``TernaryLinear``, so checkpoints are not
+    interchangeable with a float config.
+    """
+
+    def __init__(self, in_dim, out_dim, bias=True, eps=1e-5):
+        super().__init__()
+        self.w = nn.Parameter(torch.empty(in_dim, out_dim))
+        self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
+        self.eps = eps
+
+        nn.init.kaiming_uniform_(self.w, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.w)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Activations are quantized by the ActQuant site that *produced* x, not
+        # here — every input to a matmul is already an int4 tensor left behind
+        # by the previous op's requant.
+        scale = (self.w.detach().abs().max() / INT4_QMAX).clamp_min(self.eps)
+        w_quant = RoundClip.apply(self.w / scale, INT4_QMIN, INT4_QMAX) * scale
+        out = x @ w_quant
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
+def make_linear(in_dim, out_dim, use_int4=False, bias=True):
+    if use_int4:
+        return Int4Linear(in_dim, out_dim, bias=bias)
     return nn.Linear(in_dim, out_dim, bias=bias)
 
 
@@ -230,33 +279,23 @@ class DyT(nn.Module):
 class MultiHeadAttention(nn.Module):
     """Quantization sites, in ``adder_kernel.md`` §4 block order:
 
-    ``RQ_Q``/``RQ_K``/``RQ_V`` (separate — each projection has its own absmean),
-    ``RQ_KT``/``RQ_VT`` (the ternary narrows below), ``RQ_S`` (with
-    ``1/sqrt(head_dim)`` folded in, so quantize *after* the divide), ``RQ_P``
-    and ``RQ_XO`` are the ``{1,0}`` identities and so share their producer's
-    site, and ``RQ_A``. ``RQ_O`` is pinned to ``s_x`` because ``vecadd`` takes
-    both residual operands at one scale — that is the site the clipping shows
-    up at, so it deliberately keeps the *tight* ``s_x`` rather than widening to
-    cover ``O``.
+    ``RQ_Q``/``RQ_K``/``RQ_V`` (separate — each projection has its own scale),
+    ``RQ_S`` (with ``1/sqrt(head_dim)`` folded in, so quantize *after* the
+    divide), ``RQ_P`` and ``RQ_XO`` are the ``{1,0}`` identities and so share
+    their producer's site, and ``RQ_A``. ``RQ_O`` is pinned to ``s_x`` because
+    ``vecadd`` takes both residual operands at one scale — that is the site the
+    clipping shows up at, so it deliberately keeps the *tight* ``s_x`` rather
+    than widening to cover ``O``.
 
-    **K and V are ternary, Q and the attention matrix are int8.** The MXU
-    multiplies an int8 activation by a ternary weight, so ternarizing exactly
-    the two tensors that appear on the *weight* side — K in ``Q @ K^T`` and V in
-    ``P @ V`` — is what lets both attention matmuls run on the array instead of
-    on ``vecmatmul``, which issues one serial int8 dot product per output
-    element and dominated the run. Q and P stay int8 because they are the
-    activation operands, which the MXU takes at full int8 either way.
-
-    Both are two narrows, not one, because that is what the device does: the
-    projection's ``matmul_t.rq`` lands int8 (``RQ_K``), and a separate ``tquant``
-    pass rounds that onto ``{-1, 0, 1}`` (``RQ_KT``) into the 2-bit packed layout
-    the array reads. V additionally transposes between the two — the packed
-    weight column of ``P @ V`` is a column of V, and the DMA can only transpose
-    bytes — which is why the int8 stage is not avoidable by fusing.
+    Every tensor here is int4, K and V included. The old ``RQ_KT``/``RQ_VT``
+    pair — a second narrow rounding K and V onto ``{-1, 0, 1}`` — is gone: it
+    existed only because the MXU could not multiply an int8 activation by an
+    int8 weight, so the operand landing on the weight side had to be a trit. At
+    equal width there is nothing left for it to do but round twice.
     """
 
     def __init__(self, d, q_heads, kv_heads, head_dim, x_quant,
-                 use_ternary=False, use_bias=True):
+                 use_int4=False, use_bias=True):
         super().__init__()
 
         assert q_heads % kv_heads == 0
@@ -267,16 +306,14 @@ class MultiHeadAttention(nn.Module):
         self.heads_per_q = q_heads // kv_heads
         self.head_dim = head_dim
 
-        self.Wq = make_linear(d, q_heads * self.head_dim, use_ternary, bias=use_bias)
-        self.Wk = make_linear(d, kv_heads * self.head_dim, use_ternary, bias=use_bias)
-        self.Wv = make_linear(d, kv_heads * self.head_dim, use_ternary, bias=use_bias)
-        self.Wo = make_linear(q_heads * self.head_dim, d, use_ternary, bias=use_bias)
+        self.Wq = make_linear(d, q_heads * self.head_dim, use_int4, bias=use_bias)
+        self.Wk = make_linear(d, kv_heads * self.head_dim, use_int4, bias=use_bias)
+        self.Wv = make_linear(d, kv_heads * self.head_dim, use_int4, bias=use_bias)
+        self.Wo = make_linear(q_heads * self.head_dim, d, use_int4, bias=use_bias)
 
-        self.q_q = ActQuant()       # RQ_Q
-        self.q_k = ActQuant()       # RQ_K   int8, straight off the projection
-        self.q_v = ActQuant()       # RQ_V
-        self.q_kt = TernaryQuant()  # RQ_KT  int8 -> {-1,0,1}: the MXU's weight
-        self.q_vt = TernaryQuant()  # RQ_VT
+        self.q_q = ActQuant()   # RQ_Q
+        self.q_k = ActQuant()   # RQ_K
+        self.q_v = ActQuant()   # RQ_V
         # RQ_S: calibrated on the scores that *survive* the mask+ReLU, which is
         # what makes RQ_P the {1,0} identity. Learning the scale finds that on
         # its own: clipped-away negatives contribute nothing to the loss.
@@ -291,10 +328,8 @@ class MultiHeadAttention(nn.Module):
         n_tokens = X.shape[1]
 
         Q = self.q_q(self.Wq(X))
-        # K and V go int8 -> ternary; the second narrow is the device's `tquant`
-        # and its output is what the MXU reads as a weight.
-        K = self.q_kt(self.q_k(self.Wk(X)))
-        V = self.q_vt(self.q_v(self.Wv(X)))
+        K = self.q_k(self.Wk(X))
+        V = self.q_v(self.Wv(X))
 
         Q = torch.reshape(
             Q, [batch_size, n_tokens, self.kv_heads, self.heads_per_q, self.head_dim]
@@ -334,38 +369,38 @@ class Transformer(nn.Module):
         kv_heads,
         head_dim,
         x_quant,
-        use_ternary=False,
+        use_int4=False,
         use_bias=True,
     ):
         super().__init__()
 
-        self.use_ternary = use_ternary
+        self.use_int4 = use_int4
 
         self.attention = MultiHeadAttention(
             d, q_heads, kv_heads, head_dim, x_quant,
-            use_ternary=use_ternary, use_bias=use_bias,
+            use_int4=use_int4, use_bias=use_bias,
         )
         self.norm1 = DyT(d)
 
         self.ff = nn.Sequential(
-            make_linear(d, f, use_ternary, bias=use_bias),
+            make_linear(d, f, use_int4, bias=use_bias),
             nn.ReLU(),
-            make_linear(f, d, use_ternary, bias=use_bias),
+            make_linear(f, d, use_int4, bias=use_bias),
         )
 
         self.norm2 = DyT(d)
         self.dropout = nn.Dropout(p=0.1)
 
         # RQ_X1 / RQ_X2 are `dyt` ops: hardtanh bounds them to [-1, 1], so their
-        # scale is analytic (1/127) rather than calibrated, and the clip is
-        # symmetric at -127 because hardtanh is odd (vpu.sv dyt8).
-        self.q_x1 = ActQuant(qmin=-127, fixed_scale=1.0 / 127)
+        # scale is analytic (1/7) rather than calibrated, and the clip is
+        # symmetric at -7 because hardtanh is odd.
+        self.q_x1 = ActQuant(qmin=-INT4_QMAX, fixed_scale=1.0 / INT4_QMAX)
         self.q_h = ActQuant()                       # RQ_H
         self.q_hr = self.q_h                        # RQ_HR {1,0}: s_hr = s_h
         # RQ_F is pinned to s_x1 by the second residual add, but it is a
-        # `requant`, so it clips at -128 rather than -127.
-        self.q_f = ActQuant(fixed_scale=1.0 / 127)
-        self.q_x2 = ActQuant(qmin=-127, fixed_scale=1.0 / 127)
+        # `requant`, so it clips at -8 rather than -7.
+        self.q_f = ActQuant(fixed_scale=1.0 / INT4_QMAX)
+        self.q_x2 = ActQuant(qmin=-INT4_QMAX, fixed_scale=1.0 / INT4_QMAX)
 
     def forward(self, X, attn_mask, use_custom_attention=False):
         # The attention residual is 2X + O: MultiHeadAttention already returned
@@ -391,7 +426,7 @@ class Model(nn.Module):
         q_heads=8,
         kv_heads=8,
         head_dim=None,
-        use_ternary=False,
+        use_int4=False,
         use_bias=True,
     ):
         super().__init__()
@@ -412,7 +447,7 @@ class Model(nn.Module):
 
         # The s_x chain. Layer 0 enters from the embedding and needs a
         # calibrated scale; every later layer enters on the previous
-        # layer's DyT output, which is analytically 1/127, so its s_x *is* that
+        # layer's DyT output, which is analytically 1/7, so its s_x *is* that
         # site. Sharing the module is what makes RQ_O / RQ_XO land on s_x.
         self.q_embed = ActQuant()
 
@@ -426,19 +461,14 @@ class Model(nn.Module):
                 self.kv_heads,
                 self.head_dim,
                 x_quant,
-                use_ternary=use_ternary,
+                use_int4=use_int4,
                 use_bias=use_bias,
             )
             blocks.append(block)
             x_quant = block.q_x2
         self.layers = nn.ModuleList(blocks)
-        # The output head is ternary like every other projection. That is what
-        # puts it on the MXU as a `matmul_t`: the array multiplies an int8
-        # activation by a ternary weight, and `X` arriving from DyT at 1/127 is
-        # already the activation operand. It was the last `vecmatmul` in the
-        # shipped kernel — int8 `X` against an int8 `fc.weight`, which only the
-        # VPU can do — so the whole model now runs on the array.
-        self.fc = make_linear(self.d, self.vocab_size, use_ternary, bias=use_bias)
+        # The output head is int4 like every other projection.
+        self.fc = make_linear(self.d, self.vocab_size, use_int4, bias=use_bias)
         self.quantize_head = True
         self.dropout = nn.Dropout(p=0.1)
 
@@ -457,12 +487,12 @@ class Model(nn.Module):
         # The head's output scale is irrelevant to an argmax, so the logits are
         # never requantized: the device spills the raw int32 accumulator.
         #
-        # A ternary head carries its own weight quantization (TernaryLinear's
-        # absmean + RoundClip), exactly as the projections do, so there is
+        # An int4 head carries its own weight quantization (Int4Linear's
+        # absmax + RoundClip), exactly as the projections do, so there is
         # nothing here for `quantize_head` to switch — it and
         # `dynamic_fake_quant` now only reach the int8 `nn.Linear` head that a
-        # non-ternary config still gets.
-        if isinstance(self.fc, TernaryLinear):
+        # float config still gets.
+        if isinstance(self.fc, (TernaryLinear, Int4Linear)):
             return self.fc(X)
         w = self.fc.weight
         if self.quantize_head:
@@ -501,19 +531,24 @@ def adder_gqa():
     return model
 
 
-def adder_ternary_vanilla():
+def adder_int4_vanilla():
+    # int4 weights and int4 activations throughout, same QAT scheme as the
+    # ternary config it replaces: every requant site is an LSQ-learned
+    # ActQuant, the residual/identity sites share instances, the DyT sites are
+    # pinned to 1/7. head_dim = d // q_heads = 16.
+    #
     # use_bias=False: the TPU's VPU has no row-broadcast operand, so a [N] bias
     # over [T, N] costs a T-iteration vecadd/requant loop per linear (~5 per
     # layer). Dropping the biases keeps a hand-written tpulang layer
     # straight-line. See accel/tpulang/tpunn.md.
     model = Model(
         len(numbers_data.VOCAB),
-        d=128,
-        f=128,
+        d=64,
+        f=256,
         layers=4,
         q_heads=4,
         kv_heads=4,
-        use_ternary=True,
+        use_int4=True,
         use_bias=False,
     )
     return model
